@@ -61,11 +61,11 @@ for cmd in ohpm hvigor hdc git cmake ninja; do
   fi
 done
 
-if [[ ! -d /home/user/libghostty-ohos/libghostty_ohos ]]; then
-  echo 'renderer=missing /home/user/libghostty-ohos/libghostty_ohos'
+if [[ ! -d libghostty_ohos ]]; then
+  echo 'renderer=missing ./libghostty_ohos'
   missing=1
 else
-  echo 'renderer=ok /home/user/libghostty-ohos/libghostty_ohos'
+  echo 'renderer=ok ./libghostty_ohos'
 fi
 
 if [[ ! -d third_party/libssh2 || ! -d third_party/mbedtls ]]; then

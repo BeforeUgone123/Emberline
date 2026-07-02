@@ -6,7 +6,6 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "libghostty-ohos": "file:/home/user/libghostty-ohos/libghostty_ohos"
+    "libghostty-ohos": "file:../libghostty_ohos"
   }
 }
-

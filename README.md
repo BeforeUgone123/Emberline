@@ -17,15 +17,14 @@ PTY and Fusion Development Engine Linux VM SSH sessions.
 
 ## Local Dependency
 
-The app depends on the local renderer library:
+The app vendors the renderer HAR module inside this project:
 
 ```json5
-"libghostty-ohos": "file:/home/user/libghostty-ohos/libghostty_ohos"
+"libghostty-ohos": "file:../libghostty_ohos"
 ```
 
-If this project is moved to another machine, update
-`entry/oh-package.json5` to point at the local `libghostty_ohos` HAR module or
-replace it with an OHPM package version.
+This keeps DevEco sync self-contained when the project is copied to
+`/storage/Users/currentUser/Desktop/preview/harmony-advanced-terminal`.
 
 ## Third-Party Native Dependencies
 

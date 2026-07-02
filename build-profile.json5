@@ -34,6 +34,18 @@
           ]
         }
       ]
+    },
+    {
+      "name": "libghostty_ohos",
+      "srcPath": "./libghostty_ohos",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
     }
   ]
 }

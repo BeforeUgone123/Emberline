@@ -3,7 +3,11 @@
 .bitfun/
 build/
 entry/build/
+entry/.cxx/
 entry/oh_modules/
+libghostty_ohos/.hvigor/
+libghostty_ohos/build/
+libghostty_ohos/oh_modules/
 oh_modules/
 *.hap
 *.app
