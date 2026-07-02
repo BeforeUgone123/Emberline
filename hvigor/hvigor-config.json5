@@ -1,5 +1,5 @@
 {
-  "modelVersion": "5.0.0",
+  "modelVersion": "6.0.1",
   "dependencies": {},
   "execution": {
     "daemon": true,
@@ -17,4 +17,3 @@
     "maxOldSpaceSize": 8192
   }
 }
-
