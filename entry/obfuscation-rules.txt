@@ -1,0 +1,4 @@
+# Keep native module bridge names stable for N-API imports.
+-keep-global-name
+-keep-property-name
+

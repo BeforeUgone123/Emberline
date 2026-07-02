@@ -1,0 +1,21 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "FusionTerm"
+    },
+    {
+      "name": "module_desc",
+      "value": "Advanced terminal emulator"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "FusionTerm"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "FusionTerm"
+    }
+  ]
+}
+

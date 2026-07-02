@@ -1,0 +1,15 @@
+.hvigor/
+.idea/
+build/
+entry/build/
+entry/oh_modules/
+oh_modules/
+*.hap
+*.app
+*.har
+*.hsp
+local.properties
+entry/.preview/
+third_party/libssh2/
+third_party/mbedtls/
+

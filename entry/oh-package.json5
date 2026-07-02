@@ -1,0 +1,12 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "FusionTerm entry module",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "libghostty-ohos": "file:/home/user/libghostty-ohos/libghostty_ohos"
+  }
+}
+
