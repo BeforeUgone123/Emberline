@@ -1,5 +1,6 @@
 .hvigor/
 .idea/
+.bitfun/
 build/
 entry/build/
 entry/oh_modules/
@@ -12,4 +13,3 @@ local.properties
 entry/.preview/
 third_party/libssh2/
 third_party/mbedtls/
-
