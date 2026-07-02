@@ -51,9 +51,23 @@ hvigorw assembleHap --mode module -p product=default -p module=entry@default --n
 Add signing material in root `build-profile.json5` before packaging for a
 device.
 
+## DevEco Sync Notes
+
+The root `build-profile.json5` uses Huawei HarmonyOS SDK version strings:
+
+```json5
+"compatibleSdkVersion": "5.0.0(12)",
+"targetSdkVersion": "5.0.0(12)",
+"runtimeOS": "HarmonyOS"
+```
+
+`compileSdkVersion` is intentionally omitted so DevEco can use the installed
+SDK. If sync reports an invalid SDK value again, install the matching HarmonyOS
+SDK in DevEco or change `compatibleSdkVersion` and `targetSdkVersion` to values
+shown in DevEco's SDK Manager.
+
 ## Security Notes
 
 This first native SSH path supports password authentication and does not yet
 perform host-key pinning. Treat it as a working prototype for the Fusion Linux
 VM target; add known-host verification before using it as a general SSH client.
-
