@@ -27,7 +27,13 @@ set(MBEDTLS_INCLUDE_DIR
     ${THIRD_PARTY_DIR}/mbedtls/include
     CACHE PATH ""
     FORCE)
-set(MBEDCRYPTO_LIBRARY mbedcrypto CACHE STRING "" FORCE)
+# libssh2's CMake export step cannot export a target dependency from the
+# parent mbedTLS subproject. Give FindMbedTLS the static archive path while the
+# final app target still links the real mbedcrypto target below.
+set(MBEDCRYPTO_LIBRARY
+    ${CMAKE_CURRENT_BINARY_DIR}/mbedtls/library/libmbedcrypto.a
+    CACHE FILEPATH ""
+    FORCE)
 set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -58,4 +64,3 @@ target_link_libraries(fusion_terminal_driver PRIVATE
     ${hilog-lib}
     ${napi-lib}
 )
-
