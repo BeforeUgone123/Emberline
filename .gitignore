@@ -4,6 +4,7 @@
 build/
 entry/build/
 entry/.cxx/
+libghostty_ohos/.cxx/
 entry/oh_modules/
 libghostty_ohos/.hvigor/
 libghostty_ohos/build/
