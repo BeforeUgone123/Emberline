@@ -1,6 +1,7 @@
 .hvigor/
 .idea/
 .bitfun/
+.worktrees/
 build/
 entry/build/
 entry/.cxx/
