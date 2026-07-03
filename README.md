@@ -4,6 +4,27 @@ FusionTerm is a HarmonyOS Stage app scaffold for an advanced terminal emulator.
 It embeds `libghostty-ohos` for rendering and owns the session layer for local
 PTY and Fusion Development Engine Linux VM SSH sessions.
 
+This repository is published as `HMG`; the current app/product codename remains
+`FusionTerm` in source files and UI labels.
+
+## Product Positioning
+
+FusionTerm is positioned as a developer terminal for HarmonyOS NEXT / 2-in-1
+devices, focused first on making the Fusion Development Engine Linux VM feel
+like a native terminal workspace. It is not a direct Ghostty GUI port. The
+product reuses the HarmonyOS `libghostty-ohos` renderer and keeps app-specific
+session orchestration in this project.
+
+Primary goal: open the app and quickly connect to the Fusion Linux VM, normally
+host `bruce`, through SSH remote PTY with truecolor-friendly terminal settings.
+
+Secondary goal: keep a local PTY path for devices or runtimes that allow local
+shell execution, without making that the first product promise.
+
+Non-goals for this milestone: general SSH client breadth, SFTP, key-agent
+management, AI note workflows, full desktop Ghostty feature parity, and
+rewriting terminal rendering from scratch.
+
 ## What Is In This Project
 
 - `entry/src/main/ets/pages/Index.ets`: first-screen terminal workspace.
@@ -14,6 +35,9 @@ PTY and Fusion Development Engine Linux VM SSH sessions.
 - `entry/src/main/cpp/ssh`: libssh2 remote PTY helper.
 - `docs/superpowers/specs`: the approved product design.
 - `docs/superpowers/plans`: the implementation plan used for this scaffold.
+- `docs/product-positioning.md`: product goals, audience, and non-goals.
+- `docs/handoff.md`: current state, source thread, and next handoff steps.
+- `AGENTS.md`: project-specific instructions for future agent sessions.
 
 ## Local Dependency
 
@@ -70,3 +94,10 @@ shown in DevEco's SDK Manager.
 This first native SSH path supports password authentication and does not yet
 perform host-key pinning. Treat it as a working prototype for the Fusion Linux
 VM target; add known-host verification before using it as a general SSH client.
+
+## Agent Handoff
+
+Future agents should start with `AGENTS.md`, then read
+`docs/product-positioning.md` and `docs/handoff.md` before changing code. The
+original product discussion thread is recorded in `docs/handoff.md` so the next
+agent can recover the decision context without guessing from code alone.
