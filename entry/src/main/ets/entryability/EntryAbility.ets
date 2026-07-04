@@ -5,8 +5,11 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 
 const DOMAIN = 0x0001;
 const TAG = 'FusionTermAbility';
+const FOREGROUND_FOCUS_EVENT: string = 'fusionTermForeground';
 
 export default class EntryAbility extends UIAbility {
+  private wasBackgrounded: boolean = false;
+
   onCreate(_want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -22,5 +25,16 @@ export default class EntryAbility extends UIAbility {
       }
     });
   }
-}
 
+  onForeground(): void {
+    if (!this.wasBackgrounded) {
+      return;
+    }
+    this.wasBackgrounded = false;
+    this.context.eventHub.emit(FOREGROUND_FOCUS_EVENT);
+  }
+
+  onBackground(): void {
+    this.wasBackgrounded = true;
+  }
+}

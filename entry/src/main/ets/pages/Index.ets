@@ -31,13 +31,11 @@ const COLOR_PANEL_BORDER: string = '#273042';
 const COLOR_FIELD_BG: string = '#171D28';
 const COLOR_STATUS_ON: string = '#A6E3A1';
 const COLOR_STATUS_OFF: string = '#6C7086';
-// Ghostty-style window padding around the terminal surface.
-const TERMINAL_PADDING_X: number = 14;
-const TERMINAL_PADDING_Y: number = 12;
 const MIN_TERMINAL_FONT_SIZE: number = 10;
 const MAX_TERMINAL_FONT_SIZE: number = 26;
 const MIN_BACKGROUND_OPACITY_PCT: number = 0;
 const MAX_BACKGROUND_BLUR: number = 60;
+const FOREGROUND_FOCUS_EVENT: string = 'fusionTermForeground';
 
 // One in-app terminal tab: its renderer controller, transports, and status.
 // @Observed so tab chips (@ObjectLink) re-render on title/connection changes.
@@ -94,6 +92,7 @@ struct TerminalTabChip {
     .padding({ left: 10, right: 6 })
     .borderRadius(8)
     .backgroundColor(this.active ? COLOR_KEY_BG : '#00000000')
+    .focusable(false)
     .onClick(() => {
       this.onSelect();
     })
@@ -129,20 +128,26 @@ struct Index {
   @State private backgroundImagePath: string = '';
   @State private backgroundOpacity: number = DEFAULT_APPEARANCE.backgroundOpacity;
   @State private backgroundBlur: number = DEFAULT_APPEARANCE.backgroundBlur;
+  @State private foregroundFocusEpoch: number = 0;
   private appearanceStore: AppearanceStore = new AppearanceStore();
   private connectionStore: ConnectionStore = new ConnectionStore();
   private demoRendered: boolean = false;
+  private foregroundFocusListener: () => void = (): void => {
+    this.foregroundFocusEpoch += 1;
+  };
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.context.eventHub.on(FOREGROUND_FOCUS_EVENT, this.foregroundFocusListener);
     this.addSession();
     void this.loadAppearance();
   }
 
   aboutToDisappear(): void {
+    this.context?.eventHub.off(FOREGROUND_FOCUS_EVENT, this.foregroundFocusListener);
     for (const session of this.sessions) {
       session.controller.setAttachmentListener(null);
-      session.agentDriver.detach();
+      session.agentDriver.terminate();
       session.driver.detach();
     }
   }
@@ -156,7 +161,7 @@ struct Index {
     return this.sessions[0];
   }
 
-  private addSession(): void {
+  private addSession(refocus: boolean = false): void {
     const session = new TerminalSessionHandle(this.nextSessionId);
     this.nextSessionId += 1;
     session.controller.setConfig({
@@ -193,7 +198,7 @@ struct Index {
       }
     });
     this.sessions.push(session);
-    this.activateSession(session.id);
+    this.activateSession(session.id, refocus);
   }
 
   private closeSession(id: number): void {
@@ -204,21 +209,47 @@ struct Index {
     const session = this.sessions[index];
     session.controller.setTitleListener(null);
     session.controller.setAttachmentListener(null);
-    session.agentDriver.detach();
+    session.agentDriver.terminate();
     session.driver.detach();
     this.sessions.splice(index, 1);
     if (this.sessions.length === 0) {
-      this.addSession();
+      this.addSession(true);
       return;
     }
     if (this.activeSessionId === id) {
       const fallback = this.sessions[Math.min(index, this.sessions.length - 1)];
-      this.activateSession(fallback.id);
+      this.activateSession(fallback.id, true);
     }
   }
 
-  private activateSession(id: number): void {
+  private activateSession(id: number, refocus: boolean = false): void {
     this.activeSessionId = id;
+    if (refocus) {
+      this.focusActiveTerminalSoon();
+    }
+  }
+
+  private terminalInputActive(): boolean {
+    return this.sessions.length > 0 &&
+      !this.connectPanelOpen &&
+      !this.settingsPanelOpen &&
+      !this.themePanelOpen;
+  }
+
+  private focusActiveTerminalSoon(): void {
+    const sessionId = this.activeSessionId;
+    setTimeout(() => {
+      if (sessionId !== this.activeSessionId || !this.terminalInputActive()) {
+        return;
+      }
+      try {
+        focusControl.requestFocus(`fusionTermSurface-${sessionId}`);
+      } catch (err) {
+        console.error('Failed to restore terminal focus: ' + JSON.stringify(err));
+      }
+      const session = this.activeSession();
+      session.controller.setImeActive(true);
+    }, 80);
   }
 
   // Desktop-terminal tab title: cwd basename when connected, transport name
@@ -262,33 +293,7 @@ struct Index {
 
       Column() {
         this.buildTabBar();
-        Stack() {
-          ForEach(this.sessions, (session: TerminalSessionHandle) => {
-            Stack() {
-              TerminalSurface({
-                controller: session.controller,
-                surfaceId: `fusionTermSurface-${session.id}`,
-                imeInputId: `fusionTermIme-${session.id}`,
-                searchInputId: `fusionTermSearch-${session.id}`,
-                surfaceColor: this.surfaceBackdropColor(),
-                imeInputInterceptor: (value: string): string => this.transformImeInput(value)
-              })
-            }
-            .width('100%')
-            .height('100%')
-            .visibility(session.id === this.activeSessionId ? Visibility.Visible : Visibility.Hidden)
-          }, (session: TerminalSessionHandle) => String(session.id))
-        }
-        .layoutWeight(1)
-        .width('100%')
-        .padding({
-          left: TERMINAL_PADDING_X,
-          right: TERMINAL_PADDING_X,
-          top: TERMINAL_PADDING_Y,
-          bottom: TERMINAL_PADDING_Y
-        })
-        .backgroundColor(this.surfaceBackdropColor())
-
+        this.buildTerminalLayer();
         if (this.accessoryVisible) {
           this.buildAccessoryBar();
         }
@@ -318,6 +323,33 @@ struct Index {
   }
 
   @Builder
+  private buildTerminalLayer() {
+    Stack() {
+      ForEach(this.sessions, (session: TerminalSessionHandle) => {
+        Stack() {
+          TerminalSurface({
+            controller: session.controller,
+            surfaceId: `fusionTermSurface-${session.id}`,
+            searchInputId: `fusionTermSearch-${session.id}`,
+            surfaceColor: this.surfaceBackdropColor(),
+            active: session.id === this.activeSessionId &&
+              !this.connectPanelOpen &&
+              !this.settingsPanelOpen &&
+              !this.themePanelOpen,
+            foregroundFocusEpoch: this.foregroundFocusEpoch
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .visibility(session.id === this.activeSessionId ? Visibility.Visible : Visibility.Hidden)
+      }, (session: TerminalSessionHandle) => String(session.id))
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .backgroundColor(this.surfaceBackdropColor())
+  }
+
+  @Builder
   private buildTabBar() {
     Row({ space: 8 }) {
       Scroll() {
@@ -327,7 +359,7 @@ struct Index {
               session: session,
               active: session.id === this.activeSessionId,
               onSelect: (): void => {
-                this.activateSession(session.id);
+                this.activateSession(session.id, true);
               },
               onClose: (): void => {
                 this.closeSession(session.id);
@@ -341,8 +373,9 @@ struct Index {
             .backgroundColor('#00000000')
             .fontColor(COLOR_KEY_TEXT)
             .borderRadius(8)
+            .focusable(false)
             .onClick(() => {
-              this.addSession();
+              this.addSession(true);
             })
         }
       }
@@ -357,8 +390,10 @@ struct Index {
         .backgroundColor(this.accessoryVisible ? COLOR_ACCENT : COLOR_KEY_BG)
         .fontColor(this.accessoryVisible ? '#FFFFFF' : COLOR_KEY_TEXT)
         .borderRadius(8)
+        .focusable(false)
         .onClick(() => {
           this.accessoryVisible = !this.accessoryVisible;
+          this.focusActiveTerminalSoon();
         })
 
       Button('连接')
@@ -367,6 +402,7 @@ struct Index {
         .backgroundColor(COLOR_KEY_BG)
         .fontColor(COLOR_KEY_TEXT)
         .borderRadius(8)
+        .focusable(false)
         .onClick(() => {
           this.connectPanelOpen = true;
         })
@@ -377,6 +413,7 @@ struct Index {
         .backgroundColor(COLOR_KEY_BG)
         .fontColor(COLOR_KEY_TEXT)
         .borderRadius(8)
+        .focusable(false)
         .onClick(() => {
           this.settingsPanelOpen = true;
         })
@@ -396,6 +433,7 @@ struct Index {
       .backgroundColor('#A6000000')
       .onClick(() => {
         this.connectPanelOpen = false;
+        this.focusActiveTerminalSoon();
       })
   }
 
@@ -407,6 +445,7 @@ struct Index {
       .backgroundColor('#A6000000')
       .onClick(() => {
         this.settingsPanelOpen = false;
+        this.focusActiveTerminalSoon();
       })
   }
 
@@ -425,8 +464,10 @@ struct Index {
           .backgroundColor(COLOR_KEY_BG)
           .fontColor(COLOR_KEY_TEXT)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.settingsPanelOpen = false;
+            this.focusActiveTerminalSoon();
           })
       }
       .width('100%')
@@ -445,6 +486,7 @@ struct Index {
           .backgroundColor(COLOR_ACCENT)
           .fontColor('#FFFFFF')
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             void this.pickCustomFont();
           })
@@ -455,6 +497,7 @@ struct Index {
             .backgroundColor(COLOR_KEY_BG)
             .fontColor(COLOR_KEY_TEXT)
             .borderRadius(8)
+            .focusable(false)
             .onClick(() => {
               this.clearCustomFont();
             })
@@ -476,6 +519,7 @@ struct Index {
           .backgroundColor(COLOR_ACCENT)
           .fontColor('#FFFFFF')
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             void this.pickBackgroundImage();
           })
@@ -486,6 +530,7 @@ struct Index {
             .backgroundColor(COLOR_KEY_BG)
             .fontColor(COLOR_KEY_TEXT)
             .borderRadius(8)
+            .focusable(false)
             .onClick(() => {
               this.clearBackgroundImage();
             })
@@ -553,6 +598,7 @@ struct Index {
             .backgroundColor(this.cursorStyle === style ? COLOR_ACCENT : COLOR_KEY_BG)
             .fontColor(this.cursorStyle === style ? '#FFFFFF' : COLOR_KEY_TEXT)
             .borderRadius(8)
+            .focusable(false)
             .onClick(() => {
               this.cursorStyle = style;
               this.applyCursorConfig();
@@ -579,6 +625,7 @@ struct Index {
           .backgroundColor(COLOR_KEY_BG)
           .fontColor(COLOR_KEY_TEXT)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.openThemePanel();
           })
@@ -619,8 +666,10 @@ struct Index {
           .backgroundColor(COLOR_KEY_BG)
           .fontColor(COLOR_KEY_TEXT)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.connectPanelOpen = false;
+            this.focusActiveTerminalSoon();
           })
       }
       .width('100%')
@@ -708,6 +757,7 @@ struct Index {
           .fontColor('#FFFFFF')
           .backgroundColor(COLOR_ACCENT)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.connectFusionAgent();
           })
@@ -719,6 +769,7 @@ struct Index {
           .fontColor(COLOR_KEY_TEXT)
           .backgroundColor(COLOR_KEY_BG)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.connectFusionVm();
           })
@@ -730,9 +781,11 @@ struct Index {
           .fontColor(COLOR_KEY_TEXT)
           .backgroundColor(COLOR_KEY_BG)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.connectPanelOpen = false;
             this.startLocalSession();
+            this.focusActiveTerminalSoon();
           })
       }
       .width('100%')
@@ -756,6 +809,7 @@ struct Index {
       this.draftPassword
     );
     this.connectPanelOpen = false;
+    this.focusActiveTerminalSoon();
     this.persistConnection();
     session.agentDriver.disconnect();
     this.ensureDriverAttached(session);
@@ -768,6 +822,7 @@ struct Index {
     const port = Number(this.draftPort);
     const size = session.controller.getTerminalSize();
     this.connectPanelOpen = false;
+    this.focusActiveTerminalSoon();
     this.persistConnection();
     session.driver.detach();
     session.agentDriver.attach(session.controller);
@@ -825,35 +880,45 @@ struct Index {
           Button('Esc')
             .height(32).fontSize(12).borderRadius(8)
             .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
+            .focusable(false)
             .onClick(() => {
               this.activeSession().controller.write('\u001b');
+              this.focusActiveTerminalSoon();
             })
           Button('Tab')
             .height(32).fontSize(12).borderRadius(8)
             .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
+            .focusable(false)
             .onClick(() => {
               this.activeSession().controller.write('\t');
+              this.focusActiveTerminalSoon();
             })
           Button('Ctrl')
             .height(32).fontSize(12).borderRadius(8)
             .backgroundColor(this.ctrlArmed ? COLOR_ACCENT : COLOR_KEY_BG)
             .fontColor(this.ctrlArmed ? '#FFFFFF' : COLOR_KEY_TEXT)
+            .focusable(false)
             .onClick(() => {
               this.ctrlArmed = !this.ctrlArmed;
+              this.focusActiveTerminalSoon();
             })
           Button('Alt')
             .height(32).fontSize(12).borderRadius(8)
             .backgroundColor(this.altArmed ? COLOR_ACCENT : COLOR_KEY_BG)
             .fontColor(this.altArmed ? '#FFFFFF' : COLOR_KEY_TEXT)
+            .focusable(false)
             .onClick(() => {
               this.altArmed = !this.altArmed;
+              this.focusActiveTerminalSoon();
             })
           ForEach(['←', '↑', '↓', '→', 'PgUp', 'PgDn'] as string[], (key: string) => {
             Button(key)
               .height(32).fontSize(12).borderRadius(8)
               .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
+              .focusable(false)
               .onClick(() => {
                 this.sendAccessoryKey(key);
+                this.focusActiveTerminalSoon();
               })
           }, (key: string) => `acc-${key}`)
         }
@@ -878,6 +943,7 @@ struct Index {
       .backgroundColor('#A6000000')
       .onClick(() => {
         this.themePanelOpen = false;
+        this.focusActiveTerminalSoon();
       })
   }
 
@@ -896,8 +962,10 @@ struct Index {
           .backgroundColor(COLOR_KEY_BG)
           .fontColor(COLOR_KEY_TEXT)
           .borderRadius(8)
+          .focusable(false)
           .onClick(() => {
             this.themePanelOpen = false;
+            this.focusActiveTerminalSoon();
           })
       }
       .width('100%')

@@ -30,8 +30,8 @@ known Fusion VM feel native and low-friction.
 
 - WebSocket endpoint creates one PTY session per terminal connection.
 - Binary frames carry terminal input and output bytes.
-- Text frames carry JSON control messages such as resize, cwd, fork, ping, and
-  errors.
+- Text frames carry JSON control messages such as resize, cwd, fork, terminate
+  (when advertised by a hardened agent), ping, and errors.
 - The PTY environment advertises `TERM=xterm-256color` and
   `COLORTERM=truecolor`.
 
@@ -185,6 +185,23 @@ with the same `type` and timestamp. A future project fork may also introduce
 
 The app should consider the connection stale after two missed heartbeat
 intervals.
+
+### Terminate
+
+App to hardened agent, only when the agent advertises a terminate capability in
+its `ready.capabilities` list:
+
+```json
+{
+  "type": "terminate"
+}
+```
+
+The agent should terminate the PTY process group, flush remaining output, emit
+`exit` when possible, and close the WebSocket. FusionTerm does not send this
+JSON control to stock `wand-agent` because unknown text frames may be forwarded
+to the PTY. For stock compatibility, closing a tab sends terminal bytes for
+Ctrl-C followed by `exit` before closing the socket.
 
 ### Exit
 

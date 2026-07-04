@@ -21,9 +21,9 @@
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:EntryAbility_desc",
-        "icon": "$media:layered_image",
+        "icon": "$media:fusionterm_icon",
         "label": "$string:EntryAbility_label",
-        "startWindowIcon": "$media:startIcon",
+        "startWindowIcon": "$media:fusionterm_start_icon",
         "startWindowBackground": "$color:start_window_background",
         "launchType": "multiton",
         "orientation": "follow_desktop",
@@ -49,4 +49,3 @@
     ]
   }
 }
-

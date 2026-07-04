@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -59,6 +60,8 @@ ExampleDriverWriteInputFn ResolveExampleDriverWriteInput()
 
 std::mutex g_imeProxyHostsMutex;
 std::unordered_map<InputMethod_TextEditorProxy*, TerminalHost*> g_imeProxyHosts;
+std::mutex g_processImeHostMutex;
+TerminalHost* g_processImeHost = nullptr;
 
 TerminalHost* FindImeHost(InputMethod_TextEditorProxy* proxy)
 {
@@ -352,6 +355,11 @@ int LinuxLetterOffset(OH_NativeXComponent_KeyCode code)
     }
 }
 
+bool IsTerminalLetterKey(OH_NativeXComponent_KeyCode code)
+{
+    return LinuxLetterOffset(code) >= 0 || (code >= KEY_A && code <= KEY_Z);
+}
+
 bool AppendPrintableKey(OH_NativeXComponent_KeyCode code, bool shift, bool capsLock, std::string& out)
 {
     const int linuxLetter = LinuxLetterOffset(code);
@@ -621,6 +629,22 @@ bool BuildKeySequence(
     return true;
 }
 
+bool ShouldLetImeHandlePrintableKey(OH_NativeXComponent_KeyCode code, uint64_t modifiers, bool imePreviewActive)
+{
+    if (IsCtrlPressed(modifiers) || IsAltPressed(modifiers)) {
+        return false;
+    }
+
+    std::string printable;
+    if (!AppendPrintableKey(code, IsShiftPressed(modifiers), false, printable)) {
+        return false;
+    }
+    if (imePreviewActive) {
+        return true;
+    }
+    return IsTerminalLetterKey(code);
+}
+
 void RetainNativeWindowLocked(OHNativeWindow* window) {
     if (!window) {
         return;
@@ -643,20 +667,35 @@ void ReleaseNativeWindowLocked(OHNativeWindow* window) {
 
 class TerminalHost {
 public:
-    explicit TerminalHost(OH_NativeXComponent* component)
-        : m_component(component) {}
+    TerminalHost(std::string id, OH_NativeXComponent* component)
+        : m_id(std::move(id)), m_component(component) {}
 
     ~TerminalHost() {
         StopRenderLoop();
         ClearInputCallback();
-        std::lock_guard<std::mutex> lock(m_surfaceMutex);
         DetachImeLocked();
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         CleanupSurfaceLocked();
         if (m_terminal) {
             m_terminal->stop();
             delete m_terminal;
             m_terminal = nullptr;
         }
+    }
+
+    void BindComponent(OH_NativeXComponent* component)
+    {
+        m_component = component;
+    }
+
+    const std::string& Id() const
+    {
+        return m_id;
+    }
+
+    OH_NativeXComponent* Component() const
+    {
+        return m_component;
     }
 
     void OnSurfaceCreated(OH_NativeXComponent* component, void* window) {
@@ -669,7 +708,7 @@ public:
         }
 
         {
-            std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+            std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
             auto* newWindow = static_cast<OHNativeWindow*>(window);
             if (m_nativeWindow != newWindow) {
                 ReleaseNativeWindowLocked(m_nativeWindow);
@@ -715,7 +754,7 @@ public:
         }
 
         {
-            std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+            std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
             m_windowWidth = static_cast<uint32_t>(width);
             m_windowHeight = static_cast<uint32_t>(height);
         }
@@ -733,13 +772,14 @@ public:
     void OnSurfaceShow(OH_NativeXComponent* component, void* window) {
         uint64_t width = 0;
         uint64_t height = 0;
+        bool shouldRestoreIme = false;
         if (OH_NativeXComponent_GetXComponentSize(component, window, &width, &height) !=
             OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             OH_LOG_WARN(LOG_APP, "OnSurfaceShow failed to get XComponent size");
         }
 
         {
-            std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+            std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
             auto* shownWindow = static_cast<OHNativeWindow*>(window);
             if (m_nativeWindow != shownWindow) {
                 ReleaseNativeWindowLocked(m_nativeWindow);
@@ -762,21 +802,21 @@ public:
             if (m_terminal && m_rendererReady) {
                 m_terminal->setRenderer(m_renderer);
             }
-            if (m_wantsIme) {
-                ShowImeLocked(IME_REQUEST_REASON_OTHER);
-                NotifyImeStateLocked();
-            }
+            shouldRestoreIme = m_wantsIme && m_imeActive.load(std::memory_order_relaxed);
         }
 
         StartRenderLoop();
         RequestRender();
+        if (shouldRestoreIme) {
+            RequestIme();
+        }
     }
 
     void OnSurfaceHide() {
         {
-            std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+            std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
             m_surfaceReady = false;
-            HideImeLocked();
+            m_imeVisible = false;
         }
         {
             std::lock_guard<std::mutex> lock(m_renderMutex);
@@ -786,20 +826,32 @@ public:
 
     void OnSurfaceDestroyed() {
         StopRenderLoop();
+        DetachImeLocked();
 
-        std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         m_surfaceReady = false;
         m_surfaceFrameOriginKnown = false;
         m_surfaceScreenOriginKnown = false;
         m_windowScreenOriginKnown = false;
         m_lastImeBaseKnown = false;
-        HideImeLocked();
         if (m_terminal) {
             m_terminal->setRenderer(nullptr);
         }
-        DetachImeLocked();
         CleanupSurfaceLocked();
         m_rendererReady = false;
+    }
+
+    void OnFocusEvent()
+    {
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        ShowImeLocked(IME_REQUEST_REASON_OTHER);
+        NotifyImeStateLocked();
+    }
+
+    void OnBlurEvent()
+    {
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        m_imeVisible = false;
     }
 
     bool DispatchKeyEvent(OH_NativeXComponent* component) {
@@ -828,10 +880,11 @@ public:
         bool capsLock = false;
         OH_NativeXComponent_GetKeyEventCapsLockState(keyEvent, &capsLock);
 
-        if (m_wantsIme && !m_imeVisible) {
-            std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
-            ShowImeLocked(IME_REQUEST_REASON_OTHER);
-            NotifyImeStateLocked();
+        {
+            std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+            if (m_wantsIme && ShouldLetImeHandlePrintableKey(code, modifiers, m_imePreviewActive)) {
+                return false;
+            }
         }
 
         const bool appCursorKeys = m_terminal->cursorKeysApplicationMode();
@@ -969,6 +1022,7 @@ public:
                                             touchEvent.x, touchEvent.y, true, cellWidth, cellHeight);
                         SendTouchMouseEvent(TerminalMouseAction::Release,
                                             touchEvent.x, touchEvent.y, false, cellWidth, cellHeight);
+                        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
                         NotifyImeStateLocked();
                     }
@@ -994,6 +1048,7 @@ public:
                         m_terminal->startSelection(row, col);
                         m_terminal->updateSelection(row, col);
                     } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP && moveDistance < MOVE_THRESHOLD) {
+                        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
                         NotifyImeStateLocked();
                         QueueLinkActivationAtPoint(touchEvent.x, touchEvent.y, cellWidth, cellHeight);
@@ -1081,6 +1136,7 @@ public:
                 } else if (mouseEvent.button == OH_NATIVEXCOMPONENT_RIGHT_BUTTON) {
                     QueueContextMenuRequest(mouseEvent.x, mouseEvent.y);
                 } else if (m_isMousePressed && mouseEvent.button == OH_NATIVEXCOMPONENT_LEFT_BUTTON) {
+                    std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                     ShowImeLocked(IME_REQUEST_REASON_MOUSE);
                     NotifyImeStateLocked();
                     const bool sameCell = row == m_mousePressRow && col == m_mousePressCol;
@@ -1179,7 +1235,7 @@ public:
 
     void SetResourceManager(napi_env env, napi_value value) {
         m_resourceManager = OH_ResourceManager_InitNativeResourceManager(env, value);
-        std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         LoadFontsIfPossibleLocked();
         TryInitializeTerminalLocked();
     }
@@ -1203,7 +1259,7 @@ public:
     }
 
     void SetWindowInfo(int32_t windowId, double left, double top) {
-        std::lock_guard<std::mutex> lock(m_surfaceMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         m_windowId = windowId;
         if (std::isfinite(left) && std::isfinite(top)) {
             m_windowScreenOriginKnown = true;
@@ -1213,7 +1269,7 @@ public:
     }
 
     void SetSurfaceOrigin(double left, double top) {
-        std::lock_guard<std::mutex> lock(m_surfaceMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         if (m_surfaceFrameOriginKnown) {
             return;
         }
@@ -1229,7 +1285,7 @@ public:
         uint32_t pendingHeight = 0;
         bool shouldQueueResize = false;
         {
-            std::lock_guard<std::mutex> lock(m_surfaceMutex);
+            std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
             if (std::isfinite(left) && std::isfinite(top)) {
                 m_surfaceFrameOriginKnown = true;
                 m_surfaceScreenOriginKnown = true;
@@ -1271,6 +1327,25 @@ public:
     void PasteText(const std::string& data) {
         if (m_terminal && !data.empty()) {
             m_terminal->pasteText(data);
+        }
+    }
+
+    void RequestIme()
+    {
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        ShowImeLocked(IME_REQUEST_REASON_OTHER);
+        NotifyImeStateLocked();
+    }
+
+    void SetImeActive(bool active)
+    {
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        m_imeActive.store(active, std::memory_order_relaxed);
+        if (!m_imeActive.load(std::memory_order_relaxed)) {
+            m_wantsIme = false;
+            m_imeVisible = false;
+            m_imePreviewActive = false;
+            return;
         }
     }
 
@@ -1596,87 +1671,98 @@ public:
         return m_rendererError;
     }
 
+    bool CanAcceptImeCallbacks() const
+    {
+        return m_imeActive.load(std::memory_order_relaxed);
+    }
+
 private:
+    static TerminalHost* FindActiveImeHost(InputMethod_TextEditorProxy* proxy)
+    {
+        TerminalHost* host = FindImeHost(proxy);
+        return host != nullptr && host->CanAcceptImeCallbacks() ? host : nullptr;
+    }
+
     static void HandleImeGetTextConfig(InputMethod_TextEditorProxy* proxy, InputMethod_TextConfig* config)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->FillImeTextConfig(config);
         }
     }
 
     static void HandleImeInsertText(InputMethod_TextEditorProxy* proxy, const char16_t* text, size_t length)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->InsertImeText(text, length);
         }
     }
 
     static void HandleImeDeleteForward(InputMethod_TextEditorProxy* proxy, int32_t length)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->DeleteImeForward(length);
         }
     }
 
     static void HandleImeDeleteBackward(InputMethod_TextEditorProxy* proxy, int32_t length)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->DeleteImeBackward(length);
         }
     }
 
     static void HandleImeKeyboardStatus(InputMethod_TextEditorProxy* proxy, InputMethod_KeyboardStatus keyboardStatus)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeKeyboardStatus(keyboardStatus);
         }
     }
 
     static void HandleImeEnterKey(InputMethod_TextEditorProxy* proxy, InputMethod_EnterKeyType enterKeyType)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeEnterKey(enterKeyType);
         }
     }
 
     static void HandleImeMoveCursor(InputMethod_TextEditorProxy* proxy, InputMethod_Direction direction)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeMoveCursor(direction);
         }
     }
 
     static void HandleImeSetSelection(InputMethod_TextEditorProxy* proxy, int32_t start, int32_t end)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeSetSelection(start, end);
         }
     }
 
     static void HandleImeExtendAction(InputMethod_TextEditorProxy* proxy, InputMethod_ExtendAction action)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeExtendAction(action);
         }
     }
 
     static void HandleImeGetLeftText(InputMethod_TextEditorProxy* proxy, int32_t number, char16_t text[], size_t* length)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->GetImeLeftText(number, text, length);
         }
     }
 
     static void HandleImeGetRightText(InputMethod_TextEditorProxy* proxy, int32_t number, char16_t text[], size_t* length)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->GetImeRightText(number, text, length);
         }
     }
 
     static int32_t HandleImeGetTextIndexAtCursor(InputMethod_TextEditorProxy* proxy)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             return host->GetImeTextIndexAtCursor();
         }
         return 0;
@@ -1685,7 +1771,7 @@ private:
     static int32_t HandleImePrivateCommand(
         InputMethod_TextEditorProxy* proxy, InputMethod_PrivateCommand* privateCommand[], size_t size)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             return host->HandleImePrivateCommand(privateCommand, size);
         }
         return 0;
@@ -1694,7 +1780,7 @@ private:
     static int32_t HandleImeSetPreviewText(
         InputMethod_TextEditorProxy* proxy, const char16_t text[], size_t length, int32_t start, int32_t end)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             return host->HandleImeSetPreviewText(text, length, start, end);
         }
         return 0;
@@ -1702,7 +1788,7 @@ private:
 
     static void HandleImeFinishPreview(InputMethod_TextEditorProxy* proxy)
     {
-        if (TerminalHost* host = FindImeHost(proxy)) {
+        if (TerminalHost* host = FindActiveImeHost(proxy)) {
             host->HandleImeFinishPreview();
         }
     }
@@ -1748,7 +1834,7 @@ private:
                 lock.unlock();
 
                 {
-                    std::lock_guard<std::mutex> surfaceLock(m_surfaceMutex);
+                    std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                     if (m_renderer && shouldResize) {
                         m_renderer->resize(resizeWidth, resizeHeight);
                         if (m_terminal && resizeWidth > 0 && resizeHeight > 0) {
@@ -2076,11 +2162,9 @@ private:
                 EmitInput(data);
             });
             m_terminal->start();
-            AttachImeLocked();
             NotifyImeStateLocked();
         } else if (m_renderer) {
             m_terminal->setRenderer(m_renderer);
-            AttachImeLocked();
         }
     }
 
@@ -2136,17 +2220,18 @@ private:
         }
     }
 
-    void AttachImeLocked()
+    bool AttachImeLocked(bool showKeyboard, InputMethod_RequestKeyboardReason reason)
     {
+        ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy != nullptr) {
-            return;
+            return true;
         }
 
         if (m_imeTextEditorProxy == nullptr) {
             m_imeTextEditorProxy = OH_TextEditorProxy_Create();
             if (m_imeTextEditorProxy == nullptr) {
                 OH_LOG_ERROR(LOG_APP, "Failed to create IME text editor proxy");
-                return;
+                return false;
             }
 
             RegisterImeHost(m_imeTextEditorProxy, this);
@@ -2167,10 +2252,11 @@ private:
             OH_TextEditorProxy_SetFinishTextPreviewFunc(m_imeTextEditorProxy, HandleImeFinishPreview);
         }
 
-        InputMethod_AttachOptions* options = OH_AttachOptions_Create(false);
+        InputMethod_AttachOptions* options =
+            OH_AttachOptions_CreateWithRequestKeyboardReason(showKeyboard, reason);
         if (options == nullptr) {
             OH_LOG_ERROR(LOG_APP, "Failed to create IME attach options");
-            return;
+            return false;
         }
 
         InputMethod_ErrorCode rc =
@@ -2179,15 +2265,23 @@ private:
         if (rc != IME_ERR_OK) {
             OH_LOG_ERROR(LOG_APP, "Failed to attach IME: %{public}d", static_cast<int>(rc));
             m_imeInputMethodProxy = nullptr;
+            m_imeVisible = false;
+            return false;
         }
+
+        MarkProcessImeOwnerLocked();
+        m_imeVisible = showKeyboard;
+        return true;
     }
 
     void DetachImeLocked()
     {
+        ForgetStaleImeProxyLocked();
         HideImeLocked();
         if (m_imeInputMethodProxy != nullptr) {
             OH_InputMethodController_Detach(m_imeInputMethodProxy);
             m_imeInputMethodProxy = nullptr;
+            ForgetProcessImeOwnerLocked();
         }
         if (m_imeTextEditorProxy != nullptr) {
             UnregisterImeHost(m_imeTextEditorProxy);
@@ -2195,15 +2289,40 @@ private:
             m_imeTextEditorProxy = nullptr;
         }
         m_wantsIme = false;
+        m_imePreviewActive = false;
+    }
+
+    void ResetImeSessionLocked()
+    {
+        ForgetStaleImeProxyLocked();
+        if (m_imeInputMethodProxy != nullptr) {
+            if (m_imeVisible) {
+                OH_InputMethodProxy_HideKeyboard(m_imeInputMethodProxy);
+            }
+            OH_InputMethodController_Detach(m_imeInputMethodProxy);
+            m_imeInputMethodProxy = nullptr;
+            ForgetProcessImeOwnerLocked();
+        }
+        if (m_imeTextEditorProxy != nullptr) {
+            UnregisterImeHost(m_imeTextEditorProxy);
+            OH_TextEditorProxy_Destroy(m_imeTextEditorProxy);
+            m_imeTextEditorProxy = nullptr;
+        }
+        m_imeVisible = false;
+        m_imePreviewActive = false;
     }
 
     void ShowImeLocked(InputMethod_RequestKeyboardReason reason)
     {
         m_wantsIme = true;
-        if (m_imeInputMethodProxy == nullptr) {
-            AttachImeLocked();
+        if (!m_imeActive.load(std::memory_order_relaxed)) {
+            return;
         }
+        ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr) {
+            if (!AttachImeLocked(true, reason)) {
+                return;
+            }
             return;
         }
 
@@ -2216,6 +2335,12 @@ private:
         OH_AttachOptions_Destroy(options);
         if (rc == IME_ERR_OK) {
             m_imeVisible = true;
+        } else if (rc == IME_ERR_DETACHED) {
+            ResetImeSessionLocked();
+            if (!AttachImeLocked(true, reason)) {
+                return;
+            }
+            m_imeVisible = true;
         } else {
             OH_LOG_WARN(LOG_APP, "Failed to show IME: %{public}d", static_cast<int>(rc));
         }
@@ -2223,11 +2348,13 @@ private:
 
     void HideImeLocked()
     {
+        ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr || !m_imeVisible) {
             return;
         }
         OH_InputMethodProxy_HideKeyboard(m_imeInputMethodProxy);
         m_imeVisible = false;
+        m_imePreviewActive = false;
     }
 
     void FillImeTextConfig(InputMethod_TextConfig* config)
@@ -2284,8 +2411,11 @@ private:
 
     void HandleImeKeyboardStatus(InputMethod_KeyboardStatus keyboardStatus)
     {
-        std::lock_guard<std::mutex> lock(m_surfaceMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         m_imeVisible = keyboardStatus == IME_KEYBOARD_STATUS_SHOW;
+        if (!m_imeVisible) {
+            m_imePreviewActive = false;
+        }
     }
 
     void HandleImeEnterKey(InputMethod_EnterKeyType)
@@ -2375,13 +2505,17 @@ private:
         return 0;
     }
 
-    int32_t HandleImeSetPreviewText(const char16_t[], size_t, int32_t, int32_t)
+    int32_t HandleImeSetPreviewText(const char16_t[], size_t length, int32_t, int32_t)
     {
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
+        m_imePreviewActive = length > 0;
         return 0;
     }
 
     void HandleImeFinishPreview()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
+        m_imePreviewActive = false;
     }
 
     void FillImeTextSlice(int32_t number, bool left, char16_t text[], size_t* length)
@@ -2445,6 +2579,7 @@ private:
 
     void NotifyImeStateLocked()
     {
+        ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr || m_terminal == nullptr || !m_surfaceReady) {
             return;
         }
@@ -2601,6 +2736,36 @@ private:
         }
     }
 
+    bool OwnsProcessImeProxyLocked() const
+    {
+        std::lock_guard<std::mutex> lock(g_processImeHostMutex);
+        return g_processImeHost == this;
+    }
+
+    void MarkProcessImeOwnerLocked()
+    {
+        std::lock_guard<std::mutex> lock(g_processImeHostMutex);
+        g_processImeHost = this;
+    }
+
+    void ForgetProcessImeOwnerLocked()
+    {
+        std::lock_guard<std::mutex> lock(g_processImeHostMutex);
+        if (g_processImeHost == this) {
+            g_processImeHost = nullptr;
+        }
+    }
+
+    void ForgetStaleImeProxyLocked()
+    {
+        if (m_imeInputMethodProxy == nullptr || OwnsProcessImeProxyLocked()) {
+            return;
+        }
+        m_imeInputMethodProxy = nullptr;
+        m_imeVisible = false;
+    }
+
+    std::string m_id;
     OH_NativeXComponent* m_component = nullptr;
     Terminal* m_terminal = nullptr;
     Renderer* m_renderer = nullptr;
@@ -2668,13 +2833,15 @@ private:
     napi_threadsafe_function m_inputTsfn = nullptr;
     InputMethod_TextEditorProxy* m_imeTextEditorProxy = nullptr;
     InputMethod_InputMethodProxy* m_imeInputMethodProxy = nullptr;
+    std::atomic<bool> m_imeActive { true };
     bool m_imeVisible = false;
     bool m_wantsIme = false;
+    bool m_imePreviewActive = false;
 
     std::thread m_renderThread;
     std::mutex m_renderMutex;
     std::condition_variable m_renderCv;
-    std::mutex m_surfaceMutex;
+    std::recursive_mutex m_surfaceMutex;
     bool m_renderThreadRunning = false;
     bool m_renderDirty = false;
     bool m_resizePending = false;
@@ -2683,27 +2850,119 @@ private:
 };
 
 std::mutex g_hostsMutex;
-std::unordered_map<OH_NativeXComponent*, std::unique_ptr<TerminalHost>> g_hosts;
+std::unordered_map<std::string, std::unique_ptr<TerminalHost>> g_hostsById;
+std::unordered_map<OH_NativeXComponent*, TerminalHost*> g_hostsByComponent;
 
-TerminalHost* EnsureHost(OH_NativeXComponent* component) {
-    std::lock_guard<std::mutex> lock(g_hostsMutex);
-    std::unique_ptr<TerminalHost>& host = g_hosts[component];
-    if (!host) {
-        host = std::make_unique<TerminalHost>(component);
+std::string GetNativeXComponentId(OH_NativeXComponent* component)
+{
+    if (component == nullptr) {
+        return std::string();
     }
+
+    char idStr[OH_XCOMPONENT_ID_LEN_MAX + 1] = {'\0'};
+    uint64_t idSize = OH_XCOMPONENT_ID_LEN_MAX + 1;
+    if (OH_NativeXComponent_GetXComponentId(component, idStr, &idSize) !=
+        OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+        OH_LOG_ERROR(LOG_APP, "Failed to get XComponent id");
+        return std::string();
+    }
+    return std::string(idStr);
+}
+
+TerminalHost* EnsureHost(OH_NativeXComponent* component, const std::string& id) {
+    if (component == nullptr || id.empty()) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_hostsMutex);
+    std::unique_ptr<TerminalHost>& host = g_hostsById[id];
+    if (!host) {
+        host = std::make_unique<TerminalHost>(id, component);
+    } else {
+        if (host->Component() != nullptr && host->Component() != component) {
+            g_hostsByComponent.erase(host->Component());
+        }
+        host->BindComponent(component);
+    }
+    g_hostsByComponent[component] = host.get();
     return host.get();
 }
 
 TerminalHost* FindHost(OH_NativeXComponent* component) {
     std::lock_guard<std::mutex> lock(g_hostsMutex);
-    auto it = g_hosts.find(component);
-    return it == g_hosts.end() ? nullptr : it->second.get();
+    auto it = g_hostsByComponent.find(component);
+    return it == g_hostsByComponent.end() ? nullptr : it->second;
+}
+
+TerminalHost* FindHostById(const std::string& id)
+{
+    std::lock_guard<std::mutex> lock(g_hostsMutex);
+    auto it = g_hostsById.find(id);
+    return it == g_hostsById.end() ? nullptr : it->second.get();
+}
+
+bool TryReadStringArg(napi_env env, napi_value value, std::string& out)
+{
+    if (env == nullptr || value == nullptr) {
+        return false;
+    }
+    napi_valuetype valueType = napi_undefined;
+    if (napi_typeof(env, value, &valueType) != napi_ok || valueType != napi_string) {
+        return false;
+    }
+
+    size_t strLen = 0;
+    if (napi_get_value_string_utf8(env, value, nullptr, 0, &strLen) != napi_ok) {
+        return false;
+    }
+    std::vector<char> buffer(strLen + 1, '\0');
+    if (napi_get_value_string_utf8(env, value, buffer.data(), buffer.size(), &strLen) != napi_ok) {
+        return false;
+    }
+    out.assign(buffer.data(), strLen);
+    return true;
+}
+
+bool LooksLikeTerminalSurfaceId(const std::string& id)
+{
+    return id == "terminalSurface" || id.rfind("fusionTermSurface-", 0) == 0;
 }
 
 TerminalHost* GetHostFromCallback(napi_env env, napi_callback_info info, size_t* argc, napi_value* args) {
+    constexpr size_t MAX_CALLBACK_ARGS = 8;
+    napi_value rawArgs[MAX_CALLBACK_ARGS] = {nullptr};
+    size_t rawArgc = MAX_CALLBACK_ARGS;
     void* data = nullptr;
-    napi_get_cb_info(env, info, argc, args, nullptr, &data);
-    return static_cast<TerminalHost*>(data);
+    napi_get_cb_info(env, info, &rawArgc, rawArgs, nullptr, &data);
+    TerminalHost* host = static_cast<TerminalHost*>(data);
+
+    size_t sourceOffset = 0;
+    std::string id;
+    if (rawArgc > 0 && TryReadStringArg(env, rawArgs[0], id)) {
+        if (TerminalHost* idHost = FindHostById(id)) {
+            host = idHost;
+            sourceOffset = 1;
+        } else if (LooksLikeTerminalSurfaceId(id)) {
+            host = nullptr;
+            sourceOffset = 1;
+        }
+    }
+
+    const size_t shiftedArgc = rawArgc > sourceOffset ? rawArgc - sourceOffset : 0;
+    const size_t capacity = argc != nullptr ? *argc : 0;
+    if (args != nullptr && capacity > 0) {
+        const size_t copyCount = std::min(capacity, shiftedArgc);
+        for (size_t i = 0; i < copyCount; ++i) {
+            args[i] = rawArgs[sourceOffset + i];
+        }
+        for (size_t i = copyCount; i < capacity; ++i) {
+            args[i] = nullptr;
+        }
+    }
+    if (argc != nullptr) {
+        *argc = shiftedArgc;
+    }
+    return host;
 }
 
 void OnSurfaceCreatedCB(OH_NativeXComponent* component, void* window) {
@@ -2735,6 +2994,20 @@ void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
     (void)window;
     if (TerminalHost* host = FindHost(component)) {
         host->OnSurfaceDestroyed();
+    }
+}
+
+void OnFocusEventCB(OH_NativeXComponent* component, void* window) {
+    (void)window;
+    if (TerminalHost* host = FindHost(component)) {
+        host->OnFocusEvent();
+    }
+}
+
+void OnBlurEventCB(OH_NativeXComponent* component, void* window) {
+    (void)window;
+    if (TerminalHost* host = FindHost(component)) {
+        host->OnBlurEvent();
     }
 }
 
@@ -2828,6 +3101,29 @@ static napi_value PasteText(napi_env env, napi_callback_info info) {
     std::vector<char> buffer(strLen + 1, '\0');
     napi_get_value_string_utf8(env, args[0], buffer.data(), buffer.size(), &strLen);
     host->PasteText(std::string(buffer.data(), strLen));
+    return nullptr;
+}
+
+static napi_value RequestIme(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    if (host) {
+        host->RequestIme();
+    }
+    return nullptr;
+}
+
+static napi_value SetImeActive(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, args);
+    if (!host || argc < 1) {
+        return nullptr;
+    }
+
+    bool active = false;
+    napi_get_value_bool(env, args[0], &active);
+    host->SetImeActive(active);
     return nullptr;
 }
 
@@ -3333,9 +3629,12 @@ static napi_value Init(napi_env env, napi_value exports) {
         }
     }
 
-    TerminalHost* host = nativeXComponent ? EnsureHost(nativeXComponent) : nullptr;
+    const std::string xcomponentId = GetNativeXComponentId(nativeXComponent);
+    TerminalHost* host = nativeXComponent ? EnsureHost(nativeXComponent, xcomponentId) : nullptr;
 
     if (nativeXComponent) {
+        OH_NativeXComponent_SetNeedSoftKeyboard(nativeXComponent, true);
+
         static OH_NativeXComponent_Callback callback;
         callback.OnSurfaceCreated = OnSurfaceCreatedCB;
         callback.OnSurfaceChanged = OnSurfaceChangedCB;
@@ -3354,12 +3653,16 @@ static napi_value Init(napi_env env, napi_value exports) {
             nativeXComponent,
             DispatchAxisEventCB,
             ARKUI_UIINPUTEVENT_TYPE_AXIS);
+        OH_NativeXComponent_RegisterFocusEventCallback(nativeXComponent, OnFocusEventCB);
+        OH_NativeXComponent_RegisterBlurEventCallback(nativeXComponent, OnBlurEventCB);
         OH_NativeXComponent_RegisterKeyEventCallbackWithResult(nativeXComponent, DispatchKeyEventCB);
     }
 
     napi_property_descriptor desc[] = {
         {"writeInput", nullptr, WriteInput, nullptr, nullptr, nullptr, napi_default, host},
         {"pasteText", nullptr, PasteText, nullptr, nullptr, nullptr, napi_default, host},
+        {"requestIme", nullptr, RequestIme, nullptr, nullptr, nullptr, napi_default, host},
+        {"setImeActive", nullptr, SetImeActive, nullptr, nullptr, nullptr, napi_default, host},
         {"registerCustomFont", nullptr, RegisterCustomFont, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingTitle", nullptr, DrainPendingTitle, nullptr, nullptr, nullptr, napi_default, host},
         {"feedOutput", nullptr, FeedOutput, nullptr, nullptr, nullptr, napi_default, host},

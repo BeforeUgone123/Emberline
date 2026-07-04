@@ -6,6 +6,7 @@ import {
   createForkMessage,
   createPingMessage,
   createResizeMessage,
+  createTerminateMessage,
   DEFAULT_AGENT_COLS,
   DEFAULT_AGENT_ROWS,
   DEFAULT_FUSION_AGENT_HOST,
@@ -36,6 +37,8 @@ export class FusionAgentDriver {
   private currentEndpointLabel: string = DEFAULT_FUSION_ENGINE_VM_LABEL;
   private connected: boolean = false;
   private ready: boolean = false;
+  private supportsTerminateControl: boolean = false;
+  private terminateCloseTimer: number = -1;
   // PTY output arrives in arbitrary WebSocket frame chunks, so a multi-byte
   // UTF-8 sequence can be split across frames; the incomplete tail is kept
   // here until the next frame arrives.
@@ -72,11 +75,15 @@ export class FusionAgentDriver {
   }
 
   detach(): void {
+    this.terminate();
+  }
+
+  terminate(): void {
     if (this.controller) {
       this.controller.setInputListener(null);
       this.controller.setSizeListener(null);
     }
-    this.disconnect();
+    this.closeConnection(true, 80);
     this.controller = null;
   }
 
@@ -86,7 +93,7 @@ export class FusionAgentDriver {
   }
 
   connect(endpoint: FusionAgentEndpoint): void {
-    this.disconnect();
+    this.closeConnection(true, 0);
     const endpointHost = endpoint.host.trim();
     const endpointLabel = endpointHost.length === 0 || endpointHost === DEFAULT_FUSION_AGENT_HOST ?
       DEFAULT_FUSION_ENGINE_VM_LABEL : endpointHost;
@@ -127,22 +134,63 @@ export class FusionAgentDriver {
     } catch (err) {
       this.connected = false;
       this.ready = false;
+      this.supportsTerminateControl = false;
       this.socket = null;
       this.emitStatus(false, 'Agent 连接失败', JSON.stringify(err));
     }
   }
 
   disconnect(): void {
+    this.closeConnection(true, 0);
+  }
+
+  private closeConnection(terminateRemote: boolean, closeDelayMs: number): void {
+    this.stopTerminateCloseTimer();
+    const socketToClose = this.socket;
+    if (terminateRemote) {
+      this.sendRemoteTerminationRequest();
+    }
+
     this.ready = false;
     this.connected = false;
+    this.supportsTerminateControl = false;
     this.pendingUtf8Tail = [];
-    if (this.socket) {
-      try {
-        this.socket.close();
-      } catch (_err) {
-      }
+    if (!socketToClose) {
+      this.socket = null;
+      return;
     }
-    this.socket = null;
+
+    if (closeDelayMs > 0) {
+      this.terminateCloseTimer = setTimeout(() => {
+        this.terminateCloseTimer = -1;
+        if (this.socket !== socketToClose) {
+          return;
+        }
+        this.closeSocket(socketToClose);
+        this.socket = null;
+      }, closeDelayMs) as number;
+      return;
+    }
+
+    this.closeSocket(socketToClose);
+    if (this.socket === socketToClose) {
+      this.socket = null;
+    }
+  }
+
+  private closeSocket(socketToClose: webSocket.WebSocket): void {
+    try {
+      socketToClose.close();
+    } catch (_err) {
+    }
+  }
+
+  private stopTerminateCloseTimer(): void {
+    if (this.terminateCloseTimer < 0) {
+      return;
+    }
+    clearTimeout(this.terminateCloseTimer);
+    this.terminateCloseTimer = -1;
   }
 
   requestCurrentDirectory(): void {
@@ -225,6 +273,7 @@ export class FusionAgentDriver {
       case 'ready':
         this.ready = true;
         this.currentCwd = message.cwd || message.dir || this.currentCwd;
+        this.supportsTerminateControl = this.hasTerminateCapability(message.capabilities);
         this.emitStatus(true, message.sessionId ? `Agent ${message.sessionId}` : 'Agent 就绪', '');
         break;
       case 'cwd':
@@ -236,7 +285,7 @@ export class FusionAgentDriver {
         // no longer be sent, then report the exit label (disconnect() nulls
         // the socket first, so the late 'close' event cannot overwrite it).
         const exitLabel = message.message || 'Shell 已退出';
-        this.disconnect();
+        this.closeConnection(false, 0);
         this.emitStatus(false, exitLabel, '');
         break;
       }
@@ -287,6 +336,37 @@ export class FusionAgentDriver {
       this.ready = false;
       this.emitStatus(false, 'Agent 发送失败', JSON.stringify(err));
     }
+  }
+
+  private sendRemoteTerminationRequest(): void {
+    if (!this.socket || !this.connected) {
+      return;
+    }
+
+    if (this.supportsTerminateControl) {
+      this.sendSocketPayload(stringifyFusionAgentMessage(createTerminateMessage()));
+      return;
+    }
+
+    // Stock wand-agent forwards unknown text frames to the PTY, so the fallback
+    // must stay on the terminal byte path: interrupt the foreground process and
+    // ask the shell to exit before the WebSocket closes.
+    this.sendSocketPayload(this.encodeUtf8('\u0003exit\r'));
+  }
+
+  private hasTerminateCapability(capabilities?: Array<string>): boolean {
+    if (!capabilities) {
+      return false;
+    }
+
+    for (const capability of capabilities) {
+      if (capability === 'terminate' ||
+        capability === 'session.terminate' ||
+        capability === 'control.terminate') {
+        return true;
+      }
+    }
+    return false;
   }
 
   private encodeUtf8(input: string): ArrayBuffer {

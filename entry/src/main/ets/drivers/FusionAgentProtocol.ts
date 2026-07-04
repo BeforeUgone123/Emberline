@@ -117,6 +117,12 @@ export function createResizeMessage(cols: number, rows: number): FusionAgentMess
   };
 }
 
+export function createTerminateMessage(): FusionAgentMessage {
+  return {
+    type: 'terminate'
+  };
+}
+
 export function stringifyFusionAgentMessage(message: FusionAgentMessage): string {
   return JSON.stringify(message);
 }

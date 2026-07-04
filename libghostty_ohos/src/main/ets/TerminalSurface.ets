@@ -9,18 +9,15 @@ export struct TerminalSurface {
   controller: TerminalController = new TerminalController();
   surfaceId: string = 'terminalSurface';
   searchInputId: string = 'terminalSearchInput';
-  imeInputId: string = 'terminalImeInput';
   @Prop surfaceColor: string = '#0B0D10';
+  @Prop @Watch('onActiveChanged') active: boolean = true;
+  @Prop @Watch('onForegroundFocusEpochChanged') foregroundFocusEpoch: number = 0;
   onLinkActivated: TerminalLinkListener | null = null;
-  // Optional transform applied to IME-committed text before it reaches the
-  // terminal (used by the app's sticky Ctrl/Alt accessory keys).
-  imeInputInterceptor: ((value: string) => string) | null = null;
 
   private context: common.UIAbilityContext | null = null;
   private searchInputController: TextInputController = new TextInputController();
-  private imeInputController: TextInputController = new TextInputController();
-  private readonly imeAnchorSentinel: string = '\u200B';
   private fallbackTimer: number = -1;
+  private foregroundFocusTimer: number = -1;
   private contextMenuSelectedText: string = '';
   private contextMenuScreenContent: string = '';
   private contextMenuCanPaste: boolean = false;
@@ -33,7 +30,6 @@ export struct TerminalSurface {
   @State private searchText: string = '';
   @State private searchTotal: number = 0;
   @State private searchSelected: number = -1;
-  @State private imeText: string = this.imeAnchorSentinel;
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -48,6 +44,8 @@ export struct TerminalSurface {
 
   aboutToDisappear(): void {
     this.stopFallbackPolling();
+    this.stopForegroundImeRequest();
+    this.controller.setImeActive(false);
     this.controller.setConfigListener(null);
     this.controller.setLinkListener(null);
   }
@@ -55,7 +53,6 @@ export struct TerminalSurface {
   build() {
     Stack() {
       this.buildTerminalXComponent();
-      this.buildImeInputAnchor();
       if (this.useTextFallback) {
         this.buildTextFallback();
       }
@@ -81,7 +78,8 @@ export struct TerminalSurface {
           return;
         }
 
-        this.controller.bindNative(nativeContext, this.context, this.getDisplayDensity());
+        this.controller.bindNative(nativeContext, this.context, this.getDisplayDensity(), this.surfaceId);
+        this.controller.setImeActive(this.active);
         this.useTextFallback = !this.controller.isRendererReady();
         this.fallbackError = this.controller.getRendererError();
         this.appliedFontSize = this.controller.getConfig().fontSize;
@@ -94,6 +92,7 @@ export struct TerminalSurface {
       })
       .onDestroy(() => {
         this.stopFallbackPolling();
+        this.controller.setImeActive(false);
         this.controller.unbindNative();
       })
       .onAreaChange((_oldValue: Area, newValue: Area) => {
@@ -144,39 +143,6 @@ export struct TerminalSurface {
     .width('100%')
     .height('100%')
     .backgroundColor(this.surfaceColor)
-  }
-
-  @Builder
-  private buildImeInputAnchor() {
-    TextInput({ text: this.imeText, controller: this.imeInputController })
-      .id(this.imeInputId)
-      .type(InputType.Normal)
-      .width(1)
-      .height(1)
-      .fontSize(1)
-      .fontColor('#00000000')
-      .backgroundColor('#00000000')
-      .caretColor('#00000000')
-      .opacity(0.01)
-      .position({ x: 0, y: 0 })
-      .enableKeyboardOnFocus(true)
-      .selectionMenuHidden(true)
-      .onWillInsert((info: InsertValue) => {
-        this.handleImeAnchorInsert(info.insertValue);
-        return false;
-      })
-      .onWillDelete((info: DeleteValue) => {
-        this.handleImeAnchorDelete(info.deleteValue);
-        return false;
-      })
-      .onChange((value: string) => {
-        this.handleImeAnchorChange(value);
-      })
-      .onSubmit(() => {
-        this.controller.write('\r');
-        this.resetImeAnchorText();
-        this.requestImeAnchorFocus();
-      })
   }
 
   @Builder
@@ -249,68 +215,50 @@ export struct TerminalSurface {
   }
 
   private requestTerminalFocus(): void {
+    if (!this.active) {
+      return;
+    }
+    this.controller.setImeActive(true);
     focusControl.requestFocus(this.surfaceId);
-    this.requestImeAnchorFocus();
   }
 
-  private requestImeAnchorFocus(): void {
-    setTimeout(() => {
-      focusControl.requestFocus(this.imeInputId);
-      this.resetImeAnchorCaret();
-    }, 0);
+  private onForegroundFocusEpochChanged(): void {
+    this.scheduleForegroundImeRequest();
   }
 
-  private resetImeAnchorText(): void {
-    this.imeText = this.imeAnchorSentinel;
-    this.resetImeAnchorCaret();
-  }
+  private onActiveChanged(): void {
+    if (this.active) {
+      this.controller.setImeActive(true);
+      this.scheduleForegroundImeRequest();
+      return;
+    }
 
-  private resetImeAnchorCaret(): void {
+    this.controller.setImeActive(false);
+    this.stopForegroundImeRequest();
     try {
-      this.imeInputController.caretPosition(this.imeAnchorSentinel.length);
+      this.searchInputController.stopEditing();
     } catch (err) {
-      console.error('Failed to reset terminal IME anchor caret: ' + JSON.stringify(err));
+      console.error('Failed to stop terminal search editing session: ' + JSON.stringify(err));
     }
   }
 
-  private handleImeAnchorInsert(value: string): void {
-    if (value.length === 0) {
-      this.resetImeAnchorText();
-      return;
-    }
-
-    this.controller.write(this.imeInputInterceptor ? this.imeInputInterceptor(value) : value);
-    this.resetImeAnchorText();
-    this.requestImeAnchorFocus();
+  private scheduleForegroundImeRequest(): void {
+    this.stopForegroundImeRequest();
+    this.foregroundFocusTimer = setTimeout(() => {
+      this.foregroundFocusTimer = -1;
+      if (!this.active || this.searchVisible) {
+        return;
+      }
+      this.requestTerminalFocus();
+    }, 120) as number;
   }
 
-  private handleImeAnchorDelete(value: string): void {
-    const deleteCount = Math.max(value.length, 1);
-    for (let index = 0; index < deleteCount; index++) {
-      this.controller.write('\x7f');
-    }
-    this.resetImeAnchorText();
-    this.requestImeAnchorFocus();
-  }
-
-  private handleImeAnchorChange(value: string): void {
-    if (value === this.imeAnchorSentinel) {
+  private stopForegroundImeRequest(): void {
+    if (this.foregroundFocusTimer < 0) {
       return;
     }
-
-    if (value.length === 0) {
-      this.controller.write('\x7f');
-      this.resetImeAnchorText();
-      this.requestImeAnchorFocus();
-      return;
-    }
-
-    const inserted = value.split(this.imeAnchorSentinel).join('');
-    if (inserted.length > 0) {
-      this.controller.write(this.imeInputInterceptor ? this.imeInputInterceptor(inserted) : inserted);
-    }
-    this.resetImeAnchorText();
-    this.requestImeAnchorFocus();
+    clearTimeout(this.foregroundFocusTimer);
+    this.foregroundFocusTimer = -1;
   }
 
   private startFallbackPolling(): void {

@@ -117,6 +117,10 @@ bool PTYHandler::openPTY(int& masterFd, int& writeFd, pid_t& childPid, int cols,
     if (pid == 0) {
         // Child process
         if (usePipes) {
+            setpgid(0, 0);
+        }
+
+        if (usePipes) {
             // Close parent ends
             ::close(pipeToChild[1]);
             ::close(pipeFromChild[0]);
@@ -256,7 +260,9 @@ void PTYHandler::close(int masterFd, int writeFd, pid_t childPid) {
     }
 
     if (childPid > 0) {
-        kill(childPid, SIGHUP);
+        if (kill(-childPid, SIGHUP) != 0) {
+            kill(childPid, SIGHUP);
+        }
 
         int status;
         int ret = waitpid(childPid, &status, WNOHANG);
@@ -266,7 +272,9 @@ void PTYHandler::close(int masterFd, int writeFd, pid_t childPid) {
             ret = waitpid(childPid, &status, WNOHANG);
             if (ret == 0) {
                 // Still running, force kill
-                kill(childPid, SIGKILL);
+                if (kill(-childPid, SIGKILL) != 0) {
+                    kill(childPid, SIGKILL);
+                }
                 waitpid(childPid, &status, 0);
             }
         }
