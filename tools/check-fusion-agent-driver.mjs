@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+
+const source = await readFile('entry/src/main/ets/drivers/FusionAgentDriver.ets', 'utf8');
+
+assert.match(source, /import\s+\{\s*webSocket\s*\}\s+from\s+'@kit\.NetworkKit';/);
+assert.match(source, /export class FusionAgentDriver/);
+assert.match(source, /buildFusionAgentUrl/);
+assert.match(source, /createCwdQueryMessage/);
+assert.match(source, /createPingMessage/);
+assert.match(source, /createResizeMessage/);
+assert.match(source, /parseFusionAgentMessage/);
+assert.doesNotMatch(source, /createHelloMessage/);
+assert.doesNotMatch(source, /type: 'hello'/);
+assert.match(source, /this\.controller\.setInputListener\(this\.inputListener\)/);
+assert.match(source, /this\.controller\.setSizeListener\(this\.sizeListener\)/);
+assert.match(source, /const fallbackSize: TerminalSize = \{/);
+assert.match(source, /const size: TerminalSize = this\.controller \? this\.controller\.getTerminalSize\(\) : fallbackSize;/);
+assert.doesNotMatch(source, /\? this\.controller\.getTerminalSize\(\) : \{ cols:/);
+assert.match(source, /try \{[\s\S]*this\.socket = webSocket\.createWebSocket\(\);[\s\S]*this\.socket\.connect\(url\);[\s\S]*\} catch \(err\) \{/);
+assert.match(source, /this\.socket\.connect\(/);
+assert.match(source, /private sendSocketPayload\(payload: string \| ArrayBuffer\): void \{/);
+assert.match(source, /try \{[\s\S]*this\.socket\.send\(payload\);[\s\S]*\} catch \(err\) \{/);
+assert.match(source, /this\.sendSocketPayload\(stringifyFusionAgentMessage\(createCwdQueryMessage\(\)\)\)/);
+assert.match(source, /this\.sendSocketPayload\(stringifyFusionAgentMessage\(createResizeMessage/);
+assert.match(source, /this\.sendSocketPayload\(data\)/);
+assert.equal(source.match(/this\.socket\.send\(/g)?.length, 1);
+assert.match(source, /this\.controller\.feed/);
+assert.match(source, /case 'ready':/);
+assert.match(source, /case 'cwd':/);
+assert.match(source, /case 'exit':/);
+assert.match(source, /case 'error':/);
+assert.match(source, /case 'forked':/);
+assert.match(source, /case 'ping':/);
+assert.match(source, /message\.error \|\| message\.message/);

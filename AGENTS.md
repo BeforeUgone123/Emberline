@@ -6,24 +6,33 @@ FusionTerm lives in the GitHub repository `HMG`, but the app codename in this
 workspace remains `FusionTerm`.
 
 Build a HarmonyOS developer terminal whose first useful job is connecting to the
-Fusion Development Engine Linux VM through SSH remote PTY. The expected default
-target is host `bruce`, port `22`, with terminal environment values suitable for
-modern CLIs: `TERM=xterm-256color` and `COLORTERM=truecolor`.
+Fusion Development Engine Linux VM through a `ystyle/wand-agent`-compatible
+WebSocket PTY transport. The expected default target is the Fusion Development
+Engine VM bridge at `ws://172.16.100.2:8765/ws` with token `harmonyterm`, and
+terminal environment values suitable for modern CLIs:
+`TERM=xterm-256color` and `COLORTERM=truecolor`.
 
-The product should feel like a native HarmonyOS terminal workspace, not a demo
-screen or marketing page. The first screen is the terminal surface. App chrome
-should stay compact: connection state, VM action, local fallback, quick keys,
-theme/settings, and later session tabs.
+The product should feel like a desktop-grade terminal in the spirit of Ghostty,
+not a demo screen or marketing page. The first screen is the terminal surface.
+App chrome should stay minimal: connection state, VM action, local fallback,
+theme/settings, and later session tabs. Decision 2026-07-03: no on-screen
+quick-key bar — the target device is a 2-in-1 with a physical keyboard, and
+all key handling goes through the native key encoder. Do not add soft key
+rows back without an explicit user request.
 
 ## Architecture Boundary
 
 - Keep `libghostty_ohos` as the reusable renderer HAR. Do not move app session
   state, SSH profiles, VM assumptions, or UI chrome into that library.
 - Keep app-specific orchestration in `entry`: ArkTS owns UI/state and
-  `libfusion_terminal_driver.so` owns byte-stream transports.
+  `libfusion_terminal_driver.so` owns native fallback byte-stream transports.
+- Add wand-agent-compatible WebSocket orchestration in `entry`, not in
+  `libghostty_ohos`.
 - Treat local PTY as opportunistic. HarmonyOS app sandbox constraints can make
-  local shell execution unreliable; SSH remote PTY to the Fusion VM is the
-  primary product path.
+  local shell execution unreliable; Fusion Agent WebSocket remote PTY to the
+  Fusion VM is the primary product path.
+- Treat SSH remote PTY as fallback and later advanced mode, not the default VM
+  path.
 - Do not persist passwords. Host-key trust and safer credential handling are
   follow-up requirements before broad SSH-client positioning.
 
@@ -32,6 +41,8 @@ theme/settings, and later session tabs.
 - `README.md`: project overview and build notes.
 - `docs/product-positioning.md`: product goals, target users, and non-goals.
 - `docs/handoff.md`: current implementation state and source conversation.
+- `docs/fusion-agent-protocol.md`: wand-agent-compatible WebSocket PTY
+  contract.
 - `docs/superpowers/specs/2026-07-02-harmony-advanced-terminal-design.md`:
   original approved design.
 - `docs/superpowers/plans/2026-07-02-harmony-advanced-terminal.md`: full
@@ -51,7 +62,8 @@ HAP builds must run on a DevEco/Harmony SDK machine with `ohpm`, `hvigorw`,
 
 The repository vendors `libghostty_ohos/prebuilt/arm64-v8a/libghostty_vt.a` so
 the renderer HAR can configure in DevEco without rebuilding Ghostty VT first.
-Third-party SSH sources are intentionally not vendored; fetch them with:
+Third-party SSH fallback sources are intentionally not vendored; fetch them
+with:
 
 ```sh
 bash tools/fetch-third-party.sh
@@ -60,13 +72,17 @@ bash tools/fetch-third-party.sh
 ## Next Best Work
 
 1. Run `ohpm install --all` and a full `hvigorw` build on the DevEco machine.
-2. If the native SSH build fails, fetch `third_party/libssh2` and
+2. Run `wand-agent` or a hardened project fork inside the Fusion Development
+   Engine Linux VM with token `harmonyterm`.
+3. Verify the app can reach the agent at `172.16.100.2:8765/ws`, or update
+   `DEFAULT_FUSION_AGENT_HOST` to the actual VM bridge address.
+4. If the native SSH fallback build fails, fetch `third_party/libssh2` and
    `third_party/mbedtls`, then inspect `entry/src/main/cpp/CMakeLists.txt`.
-3. Implement the first safety milestone from the plan: native driver events,
-   SSH host-key fingerprint reporting, and host-key trust UI.
-4. Split the ArkUI workspace into components only after the current end-to-end
+5. Implement the first safety milestone: Fusion Agent authentication hardening,
+   SSH host-key fingerprint reporting for fallback, and trust UI.
+6. Split the ArkUI workspace into components only after the current end-to-end
    VM connection path compiles.
-5. Keep docs updated whenever product scope changes; do not let the project
+7. Keep docs updated whenever product scope changes; do not let the project
    drift back into a vague "terminal emulator" label.
 
 ## Source Conversation
@@ -84,6 +100,8 @@ Important decision cues from that thread:
 - The user asked to create the Harmony advanced terminal project under
   `/mnt/linux_share/preview`.
 - The user later named the GitHub repository `HMG`.
+- The user approved using a hardened `ystyle/wand-agent`-style WebSocket PTY
+  agent as the preferred VM transport, with SSH retained as fallback.
 
 Related earlier exploration threads discussed broader HarmonyOS ecosystem gaps
 and other product ideas, but they are not the current HMG product source:

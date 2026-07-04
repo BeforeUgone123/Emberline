@@ -12,6 +12,85 @@
 #include <string_view>
 #include <vector>
 
+extern "C" {
+typedef uint16_t GhosttyMods;
+
+typedef enum {
+    GHOSTTY_MOUSE_ACTION_PRESS = 0,
+    GHOSTTY_MOUSE_ACTION_RELEASE = 1,
+    GHOSTTY_MOUSE_ACTION_MOTION = 2,
+} GhosttyMouseAction;
+
+typedef enum {
+    GHOSTTY_MOUSE_BUTTON_UNKNOWN = 0,
+    GHOSTTY_MOUSE_BUTTON_LEFT = 1,
+    GHOSTTY_MOUSE_BUTTON_RIGHT = 2,
+    GHOSTTY_MOUSE_BUTTON_MIDDLE = 3,
+    GHOSTTY_MOUSE_BUTTON_FOUR = 4,
+    GHOSTTY_MOUSE_BUTTON_FIVE = 5,
+} GhosttyMouseButton;
+
+typedef struct {
+    float x;
+    float y;
+} GhosttyMousePosition;
+
+typedef struct {
+    size_t size;
+    uint32_t screen_width;
+    uint32_t screen_height;
+    uint32_t cell_width;
+    uint32_t cell_height;
+    uint32_t padding_top;
+    uint32_t padding_bottom;
+    uint32_t padding_right;
+    uint32_t padding_left;
+} GhosttyMouseEncoderSize;
+
+typedef enum {
+    GHOSTTY_MOUSE_ENCODER_OPT_EVENT = 0,
+    GHOSTTY_MOUSE_ENCODER_OPT_FORMAT = 1,
+    GHOSTTY_MOUSE_ENCODER_OPT_SIZE = 2,
+    GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED = 3,
+    GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL = 4,
+} GhosttyMouseEncoderOption;
+
+ghostty_result_t ghostty_mouse_encoder_new(const void* allocator, GhosttyMouseEncoderHandle* encoder);
+void ghostty_mouse_encoder_free(GhosttyMouseEncoderHandle encoder);
+void ghostty_mouse_encoder_setopt(GhosttyMouseEncoderHandle encoder, GhosttyMouseEncoderOption option, const void* value);
+void ghostty_mouse_encoder_setopt_from_terminal(GhosttyMouseEncoderHandle encoder, ghostty_terminal_t terminal);
+void ghostty_mouse_encoder_reset(GhosttyMouseEncoderHandle encoder);
+ghostty_result_t ghostty_mouse_encoder_encode(GhosttyMouseEncoderHandle encoder,
+                                              GhosttyMouseEventHandle event,
+                                              char* out_buf,
+                                              size_t out_buf_size,
+                                              size_t* out_len);
+ghostty_result_t ghostty_mouse_event_new(const void* allocator, GhosttyMouseEventHandle* event);
+void ghostty_mouse_event_free(GhosttyMouseEventHandle event);
+void ghostty_mouse_event_set_action(GhosttyMouseEventHandle event, GhosttyMouseAction action);
+void ghostty_mouse_event_set_button(GhosttyMouseEventHandle event, GhosttyMouseButton button);
+void ghostty_mouse_event_clear_button(GhosttyMouseEventHandle event);
+void ghostty_mouse_event_set_mods(GhosttyMouseEventHandle event, GhosttyMods mods);
+void ghostty_mouse_event_set_position(GhosttyMouseEventHandle event, GhosttyMousePosition position);
+
+// Terminal mode query and paste encoding from the prebuilt libghostty-vt.
+// A mode id is encoded as (value & 0x7FFF) | ((uint16_t)ansi << 15); private
+// DEC modes use ansi=false, so their id equals the raw mode number.
+typedef uint16_t GhosttyModeId;
+ghostty_result_t ghostty_terminal_mode_get(ghostty_terminal_t terminal, GhosttyModeId mode, bool* out_value);
+
+// Render-state dirty control from the prebuilt libghostty-vt: option 0 is
+// the dirty flag on both the state (enum value) and the row (bool).
+ghostty_result_t ghostty_render_state_set(ghostty_render_state_t state, int32_t option, const void* value);
+ghostty_result_t ghostty_render_state_row_set(ghostty_row_iterator_t iterator, int32_t option, const void* value);
+ghostty_result_t ghostty_paste_encode(char* data,
+                                      size_t data_len,
+                                      bool bracketed,
+                                      char* buf,
+                                      size_t buf_len,
+                                      size_t* out_written);
+}
+
 #undef LOG_TAG
 #define LOG_TAG "Terminal"
 
@@ -301,6 +380,43 @@ SelectionTokenKind ClassifySelectionCodepoint(uint32_t codepoint, bool hasText)
 
     return SelectionTokenKind::Word;
 }
+
+GhosttyMouseAction ToGhosttyMouseAction(TerminalMouseAction action)
+{
+    switch (action) {
+        case TerminalMouseAction::Press:
+            return GHOSTTY_MOUSE_ACTION_PRESS;
+        case TerminalMouseAction::Release:
+            return GHOSTTY_MOUSE_ACTION_RELEASE;
+        case TerminalMouseAction::Motion:
+        default:
+            return GHOSTTY_MOUSE_ACTION_MOTION;
+    }
+}
+
+bool ToGhosttyMouseButton(TerminalMouseButton button, GhosttyMouseButton& outButton)
+{
+    switch (button) {
+        case TerminalMouseButton::Left:
+            outButton = GHOSTTY_MOUSE_BUTTON_LEFT;
+            return true;
+        case TerminalMouseButton::Right:
+            outButton = GHOSTTY_MOUSE_BUTTON_RIGHT;
+            return true;
+        case TerminalMouseButton::Middle:
+            outButton = GHOSTTY_MOUSE_BUTTON_MIDDLE;
+            return true;
+        case TerminalMouseButton::WheelUp:
+            outButton = GHOSTTY_MOUSE_BUTTON_FOUR;
+            return true;
+        case TerminalMouseButton::WheelDown:
+            outButton = GHOSTTY_MOUSE_BUTTON_FIVE;
+            return true;
+        case TerminalMouseButton::None:
+        default:
+            return false;
+    }
+}
 }
 
 Terminal::Terminal(int cols, int rows)
@@ -334,6 +450,14 @@ Terminal::Terminal(int cols, int rows)
 
 Terminal::~Terminal() {
     stop();
+    if (m_mouseEvent) {
+        ghostty_mouse_event_free(m_mouseEvent);
+        m_mouseEvent = nullptr;
+    }
+    if (m_mouseEncoder) {
+        ghostty_mouse_encoder_free(m_mouseEncoder);
+        m_mouseEncoder = nullptr;
+    }
     if (m_rowCells) {
         ghostty_render_state_row_cells_free(m_rowCells);
         m_rowCells = nullptr;
@@ -367,6 +491,10 @@ void Terminal::stop() {
 }
 
 void Terminal::resize(int cols, int rows) {
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_forceFullFrame = true;
+    }
     if (cols == m_cols && rows == m_rows) return;
 
     m_cols = cols;
@@ -480,12 +608,33 @@ ghostty_string_t Terminal::HandleXtversion(ghostty_terminal_t, void* userdata)
     return ghostty_string_t {kVersion, sizeof(kVersion) - 1};
 }
 
-void Terminal::HandleTitleChanged(ghostty_terminal_t, void* userdata)
+void Terminal::HandleTitleChanged(ghostty_terminal_t terminal, void* userdata)
 {
     if (!userdata) {
         return;
     }
-    static_cast<Terminal*>(userdata)->notifyRenderNeeded();
+    Terminal* self = static_cast<Terminal*>(userdata);
+
+    // This callback fires inside ghostty_terminal_vt_write while feedOutput
+    // already holds m_stateMutex — only touch the dedicated title lock here.
+    ghostty_string_t title {};
+    if (terminal && ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TITLE, &title) == GHOSTTY_SUCCESS &&
+        title.ptr != nullptr) {
+        std::lock_guard<std::mutex> lock(self->m_titleMutex);
+        self->m_pendingTitle.assign(reinterpret_cast<const char*>(title.ptr), title.len);
+        self->m_titleDirty = true;
+    }
+    self->notifyRenderNeeded();
+}
+
+std::string Terminal::drainPendingTitle()
+{
+    std::lock_guard<std::mutex> lock(m_titleMutex);
+    if (!m_titleDirty) {
+        return {};
+    }
+    m_titleDirty = false;
+    return m_pendingTitle;
 }
 
 bool Terminal::HandleSize(ghostty_terminal_t, void* userdata, ghostty_size_report_size_t* out_size)
@@ -979,6 +1128,156 @@ void Terminal::scrollView(int delta) {
     notifyRenderNeeded();
 }
 
+bool Terminal::queryPrivateMode(uint16_t mode) const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (!m_vt) {
+        return false;
+    }
+
+    bool value = false;
+    if (ghostty_terminal_mode_get(m_vt, static_cast<GhosttyModeId>(mode & 0x7FFF), &value) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    return value;
+}
+
+bool Terminal::cursorKeysApplicationMode() const
+{
+    return queryPrivateMode(1); // DECCKM
+}
+
+bool Terminal::bracketedPasteEnabled() const
+{
+    return queryPrivateMode(2004);
+}
+
+void Terminal::pasteText(const std::string& text)
+{
+    if (text.empty() || !m_running) {
+        return;
+    }
+
+    const bool bracketed = bracketedPasteEnabled();
+    std::string data = text;
+    std::vector<char> encoded(data.size() + 32);
+    size_t written = 0;
+    ghostty_result_t rc = ghostty_paste_encode(
+        data.data(), data.size(), bracketed, encoded.data(), encoded.size(), &written);
+    if (rc == GHOSTTY_OUT_OF_SPACE) {
+        data = text; // The input buffer is mutated in place; reset before retrying.
+        encoded.resize(written);
+        rc = ghostty_paste_encode(
+            data.data(), data.size(), bracketed, encoded.data(), encoded.size(), &written);
+    }
+    if (rc != GHOSTTY_SUCCESS || written == 0) {
+        OH_LOG_WARN(LOG_APP, "Paste encode failed rc=%{public}d len=%{public}zu", rc, text.size());
+        return;
+    }
+    emitInput(encoded.data(), written);
+}
+
+bool Terminal::isMouseTrackingEnabled() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (!m_vt) {
+        return false;
+    }
+
+    bool tracking = false;
+    if (ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking) != GHOSTTY_SUCCESS) {
+        return false;
+    }
+    return tracking;
+}
+
+bool Terminal::sendMouseEvent(TerminalMouseAction action,
+                              TerminalMouseButton button,
+                              uint16_t mods,
+                              float x,
+                              float y,
+                              uint32_t screenWidth,
+                              uint32_t screenHeight,
+                              uint32_t cellWidth,
+                              uint32_t cellHeight,
+                              bool anyButtonPressed)
+{
+    std::string encoded;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (!m_vt || cellWidth == 0 || cellHeight == 0) {
+            return false;
+        }
+
+        bool tracking = false;
+        if (ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking) != GHOSTTY_SUCCESS || !tracking) {
+            return false;
+        }
+
+        if (!m_mouseEncoder &&
+            ghostty_mouse_encoder_new(nullptr, &m_mouseEncoder) != GHOSTTY_SUCCESS) {
+            return false;
+        }
+        if (!m_mouseEvent &&
+            ghostty_mouse_event_new(nullptr, &m_mouseEvent) != GHOSTTY_SUCCESS) {
+            return false;
+        }
+
+        ghostty_mouse_encoder_setopt_from_terminal(m_mouseEncoder, m_vt);
+
+        GhosttyMouseEncoderSize size {};
+        size.size = sizeof(GhosttyMouseEncoderSize);
+        size.screen_width = screenWidth;
+        size.screen_height = screenHeight;
+        size.cell_width = cellWidth;
+        size.cell_height = cellHeight;
+        ghostty_mouse_encoder_setopt(m_mouseEncoder, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
+
+        bool trackLastCell = true;
+        ghostty_mouse_encoder_setopt(m_mouseEncoder, GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL, &trackLastCell);
+        ghostty_mouse_encoder_setopt(
+            m_mouseEncoder,
+            GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
+            &anyButtonPressed);
+
+        ghostty_mouse_event_set_action(m_mouseEvent, ToGhosttyMouseAction(action));
+        GhosttyMouseButton ghosttyButton = GHOSTTY_MOUSE_BUTTON_UNKNOWN;
+        if (ToGhosttyMouseButton(button, ghosttyButton)) {
+            ghostty_mouse_event_set_button(m_mouseEvent, ghosttyButton);
+        } else {
+            ghostty_mouse_event_clear_button(m_mouseEvent);
+        }
+        ghostty_mouse_event_set_mods(m_mouseEvent, mods);
+        GhosttyMousePosition position { x, y };
+        ghostty_mouse_event_set_position(m_mouseEvent, position);
+
+        char buffer[128];
+        size_t written = 0;
+        const ghostty_result_t result =
+            ghostty_mouse_encoder_encode(m_mouseEncoder, m_mouseEvent, buffer, sizeof(buffer), &written);
+        if (result == GHOSTTY_SUCCESS && written > 0) {
+            encoded.assign(buffer, buffer + written);
+        } else if (result == GHOSTTY_OUT_OF_SPACE && written > 0) {
+            std::vector<char> dynamicBuffer(written);
+            size_t dynamicWritten = 0;
+            if (ghostty_mouse_encoder_encode(
+                    m_mouseEncoder,
+                    m_mouseEvent,
+                    dynamicBuffer.data(),
+                    dynamicBuffer.size(),
+                    &dynamicWritten) == GHOSTTY_SUCCESS &&
+                dynamicWritten > 0) {
+                encoded.assign(dynamicBuffer.data(), dynamicBuffer.data() + dynamicWritten);
+            }
+        }
+    }
+
+    if (!encoded.empty()) {
+        emitInput(encoded);
+    }
+    return true;
+}
+
 void Terminal::resetViewScroll() {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (!m_vt) return;
@@ -1005,6 +1304,7 @@ void Terminal::scrollViewportLocked(ghostty_terminal_scroll_viewport_tag_t tag, 
     if (!m_vt) {
         return;
     }
+    m_forceFullFrame = true; // viewport shifts are invisible to VT row dirt
 
     ghostty_terminal_scroll_viewport_t behavior {};
     behavior.tag = tag;
@@ -1558,6 +1858,7 @@ void Terminal::setMaxScrollback(int lines) {
 void Terminal::setTheme(const TerminalTheme& theme) {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_theme = theme;
+    m_forceFullFrame = true;
     applyThemeLocked();
     notifyRenderNeeded();
 }
@@ -1577,7 +1878,10 @@ void Terminal::notifyRenderNeeded()
 void Terminal::drawFrame() {
     if (!m_renderer) return;
 
-    std::lock_guard<std::mutex> lock(m_stateMutex);
+    // Hold the state mutex only while snapshotting terminal state. The
+    // expensive pixel work below runs unlocked so keyboard input, mouse
+    // events, and feedOutput are never serialized behind a frame render.
+    std::unique_lock<std::mutex> lock(m_stateMutex);
     if (!m_vt || !m_renderState || !m_rowIterator || !m_rowCells) {
         return;
     }
@@ -1585,6 +1889,9 @@ void Terminal::drawFrame() {
         return;
     }
     const uint64_t frameId = ++g_drawFrameCounter;
+
+    int32_t globalDirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
+    ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_DIRTY, &globalDirty);
 
     std::vector<Cell> cells(m_cols * m_rows);
     ghostty_render_state_colors_t colors {};
@@ -1627,7 +1934,34 @@ void Terminal::drawFrame() {
         }
     }
 
+    // Decide whether the whole frame must repaint. Selection/search overlays
+    // and viewport scrolls are not visible to the VT dirty flags, so any
+    // change there forces a full pass; otherwise only VT-dirty rows plus the
+    // old/new cursor rows are snapshotted and repainted.
+    const bool cursorMoved = cursorRow != m_lastCursorRow || cursorCol != m_lastCursorCol ||
+        cursorVisible != m_lastCursorVisible;
+    const bool fullRepaint = m_forceFullFrame ||
+        globalDirty == GHOSTTY_RENDER_STATE_DIRTY_FULL ||
+        selectionActive || m_lastSelectionActive ||
+        searchActive || m_lastSearchActive ||
+        viewportTopRow != m_lastViewportTopRow;
+    std::vector<uint8_t> dirtyRows(static_cast<size_t>(m_rows), fullRepaint ? 1 : 0);
+    bool anyDirtyRow = false;
+    const bool falseValue = false;
+
     for (int row = 0; row < m_rows && ghostty_render_state_row_iterator_next(m_rowIterator); ++row) {
+        bool rowDirty = false;
+        ghostty_render_state_row_get(m_rowIterator, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &rowDirty);
+        if (rowDirty) {
+            ghostty_render_state_row_set(m_rowIterator, 0 /* ROW_OPTION_DIRTY */, &falseValue);
+        }
+        const bool needRow = fullRepaint || rowDirty ||
+            row == cursorRow || row == m_lastCursorRow;
+        if (!needRow) {
+            continue;
+        }
+        dirtyRows[static_cast<size_t>(row)] = 1;
+        anyDirtyRow = anyDirtyRow || rowDirty;
         ghostty_render_state_row_get(m_rowIterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &m_rowCells);
         std::string rowText;
         std::vector<size_t> rowByteStart(static_cast<size_t>(m_cols), 0);
@@ -1753,9 +2087,37 @@ void Terminal::drawFrame() {
             frameId, suspiciousCells, m_cols, m_rows);
     }
 
-    m_renderer->setColors(m_theme.background, m_theme.foreground);
-    m_renderer->setCursorColors(m_theme.cursorColor, m_theme.cursorText);
+    // Both dirty layers are cleared by the renderer side (the API contract
+    // leaves resetting to the caller).
+    const int32_t dirtyFalse = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+    ghostty_render_state_set(m_renderState, 0 /* OPTION_DIRTY */, &dirtyFalse);
+
+    // Nothing changed anywhere: skip the frame entirely (unless the cursor
+    // is blinking, which needs its row repainted every tick).
+    if (!fullRepaint && !anyDirtyRow && !cursorMoved && !m_renderer->cursorBlinkEnabled()) {
+        return;
+    }
+
+    m_forceFullFrame = false;
+    m_lastCursorRow = cursorRow;
+    m_lastCursorCol = cursorCol;
+    m_lastCursorVisible = cursorVisible;
+    m_lastSelectionActive = selectionActive;
+    m_lastSearchActive = searchActive;
+    m_lastViewportTopRow = viewportTopRow;
+
+    const int colsSnapshot = m_cols;
+    const int rowsSnapshot = m_rows;
+    const uint32_t themeBackground = m_theme.background;
+    const uint32_t themeForeground = m_theme.foreground;
+    const uint32_t themeCursor = m_theme.cursorColor;
+    const uint32_t themeCursorText = m_theme.cursorText;
+    lock.unlock();
+
+    m_renderer->setColors(themeBackground, themeForeground);
+    m_renderer->setCursorColors(themeCursor, themeCursorText);
     m_renderer->beginFrame();
-    m_renderer->renderGrid(cells, m_cols, m_rows, cursorRow, cursorCol, cursorVisible);
+    m_renderer->renderGrid(cells, colsSnapshot, rowsSnapshot, cursorRow, cursorCol, cursorVisible,
+                           fullRepaint ? std::vector<uint8_t>() : dirtyRows);
     m_renderer->endFrame();
 }

@@ -17,5 +17,6 @@ oh_modules/
 *.hsp
 local.properties
 entry/.preview/
+jscrash-*.log
 third_party/libssh2/
 third_party/mbedtls/

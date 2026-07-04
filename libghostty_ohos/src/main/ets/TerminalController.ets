@@ -13,15 +13,19 @@ import {
   TerminalInputListener,
   TerminalLinkListener,
   TerminalSearchStatus,
-  TerminalSize
+  TerminalSize,
+  TerminalTitleListener
 } from './TerminalTypes';
 
 interface TerminalNativeBridge {
   writeInput: (data: string) => void;
+  pasteText: (data: string) => void;
+  registerCustomFont: (fontPath: string) => boolean;
   feedOutput: (data: string) => void;
   drainPendingInput: () => string;
   setInputCallback: (callback: ((data: string) => void) | null) => void;
   drainPendingLinkActivation: () => string;
+  drainPendingTitle: () => string;
   drainPendingContextMenuRequest: () => string;
   resizeTerminal: (cols: number, rows: number) => void;
   getScreenContent: () => string;
@@ -65,6 +69,7 @@ export class TerminalController {
   private inputListener: TerminalInputListener | null = null;
   private linkListener: TerminalLinkListener | null = null;
   private contextMenuListener: TerminalContextMenuListener | null = null;
+  private titleListener: TerminalTitleListener | null = null;
   private attachmentListener: TerminalAttachmentListener | null = null;
   private sizeListener: TerminalSizeListener | null = null;
   private inputPollTimer: number = -1;
@@ -79,6 +84,9 @@ export class TerminalController {
     this.native.setResourceManager(context.resourceManager);
     this.native.setInputCallback(this.inputListener);
     this.applyTheme();
+    if (this.titleListener) {
+      this.startInputPolling();
+    }
     this.applyConfig();
     this.startInputPolling();
     this.bindWindowMetadata(context);
@@ -124,6 +132,9 @@ export class TerminalController {
     }
     if (patch.cursorBlink !== undefined) {
       nextConfig.cursorBlink = patch.cursorBlink;
+    }
+    if (patch.bgOpacity !== undefined) {
+      nextConfig.bgOpacity = patch.bgOpacity;
     }
 
     this.setConfig(nextConfig);
@@ -186,6 +197,15 @@ export class TerminalController {
     }
   }
 
+  setTitleListener(listener: TerminalTitleListener | null): void {
+    this.titleListener = listener;
+    if (this.linkListener || this.contextMenuListener || this.titleListener) {
+      this.startInputPolling();
+    } else {
+      this.stopInputPolling();
+    }
+  }
+
   setAttachmentListener(listener: TerminalAttachmentListener | null): void {
     this.attachmentListener = listener;
     this.notifyAttachmentChanged(this.isAttached());
@@ -203,6 +223,24 @@ export class TerminalController {
       return;
     }
     this.native.writeInput(data);
+  }
+
+  paste(data: string): void {
+    if (!this.native || data.length === 0) {
+      return;
+    }
+    if (this.native.pasteText) {
+      this.native.pasteText(data);
+    } else {
+      this.native.writeInput(data);
+    }
+  }
+
+  registerCustomFont(fontPath: string): boolean {
+    if (!this.native || fontPath.length === 0 || !this.native.registerCustomFont) {
+      return false;
+    }
+    return this.native.registerCustomFont(fontPath);
   }
 
   feed(data: string): void {
@@ -398,7 +436,9 @@ export class TerminalController {
   }
 
   private startInputPolling(): void {
-    if (!this.native || (!this.linkListener && !this.contextMenuListener) || this.inputPollTimer >= 0) {
+    if (!this.native ||
+      (!this.linkListener && !this.contextMenuListener && !this.titleListener) ||
+      this.inputPollTimer >= 0) {
       return;
     }
 
@@ -410,6 +450,12 @@ export class TerminalController {
       const activatedLink = this.linkListener ? this.native.drainPendingLinkActivation() : '';
       if (this.linkListener && activatedLink.length > 0) {
         this.linkListener(activatedLink);
+      }
+
+      const pendingTitle = this.titleListener && this.native.drainPendingTitle ?
+        this.native.drainPendingTitle() : '';
+      if (this.titleListener && pendingTitle.length > 0) {
+        this.titleListener(pendingTitle);
       }
 
       const pendingContextMenu = this.contextMenuListener ? this.native.drainPendingContextMenuRequest() : '';

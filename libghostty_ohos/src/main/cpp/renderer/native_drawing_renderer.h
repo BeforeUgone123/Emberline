@@ -24,10 +24,12 @@ public:
     void resize(uint32_t width, uint32_t height) override;
 
     bool loadFontAtlas(NativeResourceManager* resourceManager, const std::string& filesDir) override;
+    bool registerCustomFont(const std::string& fontPath) override;
 
     void beginFrame() override;
     void renderGrid(const std::vector<Cell>& cells, int cols, int rows,
-                    int cursorRow, int cursorCol, bool cursorVisible) override;
+                    int cursorRow, int cursorCol, bool cursorVisible,
+                    const std::vector<uint8_t>& dirtyRows) override;
     void endFrame() override;
 
 protected:
@@ -106,4 +108,16 @@ private:
     std::string m_primaryFontFamily = "libghostty Mono";
     std::string m_symbolFontFamily = "libghostty Nerd Symbols";
     bool m_fontsConfigured = false;
+
+    // Persistent offscreen frame: partial repaints draw only dirty rows here,
+    // then endFrame blits the whole image into the window buffer (buffer
+    // queues rotate buffers, so incremental drawing directly into the window
+    // buffer would show stale frames).
+    std::vector<uint8_t> m_offscreenPixels;
+    uint32_t m_offscreenWidth = 0;
+    uint32_t m_offscreenHeight = 0;
+    int32_t m_offscreenFormat = -1;
+    bool m_offscreenValid = false;
+
+    bool ensureOffscreen(uint32_t width, uint32_t height);
 };

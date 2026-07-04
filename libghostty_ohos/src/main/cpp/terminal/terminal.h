@@ -12,6 +12,25 @@
 #include "../include/ghostty_vt.h"
 
 class Renderer;
+struct GhosttyMouseEncoder;
+struct GhosttyMouseEvent;
+using GhosttyMouseEncoderHandle = GhosttyMouseEncoder*;
+using GhosttyMouseEventHandle = GhosttyMouseEvent*;
+
+enum class TerminalMouseAction {
+    Press,
+    Release,
+    Motion,
+};
+
+enum class TerminalMouseButton {
+    None,
+    Left,
+    Right,
+    Middle,
+    WheelUp,
+    WheelDown,
+};
 
 struct TerminalSearchStatus {
     bool active = false;
@@ -36,10 +55,35 @@ public:
     void getCursorPosition(int& row, int& col) const;
     std::string getLinkAt(int row, int col) const;
 
+    // Returns and clears the most recent OSC 0/2 window title (empty when
+    // nothing new arrived since the last drain).
+    std::string drainPendingTitle();
+
     // Scrollback
     void scrollView(int delta);
     void resetViewScroll();
     int getScrollbackSize() const;
+
+    // Terminal private-mode state used for key encoding and paste handling.
+    bool cursorKeysApplicationMode() const;
+    bool bracketedPasteEnabled() const;
+
+    // Encode clipboard text (bracketed-paste aware, unsafe bytes stripped)
+    // and write it to the terminal input path.
+    void pasteText(const std::string& text);
+
+    // Application mouse reporting for tmux/vim and other full-screen TUIs.
+    bool isMouseTrackingEnabled() const;
+    bool sendMouseEvent(TerminalMouseAction action,
+                        TerminalMouseButton button,
+                        uint16_t mods,
+                        float x,
+                        float y,
+                        uint32_t screenWidth,
+                        uint32_t screenHeight,
+                        uint32_t cellWidth,
+                        uint32_t cellHeight,
+                        bool anyButtonPressed);
 
     // Selection
     bool hasSelection() const;
@@ -76,6 +120,7 @@ public:
     void drawFrame();
 
 private:
+    bool queryPrivateMode(uint16_t mode) const;
     void notifyRenderNeeded();
     void applyThemeLocked();
     void configureCallbacksLocked();
@@ -107,6 +152,8 @@ private:
     ghostty_render_state_t m_renderState;
     ghostty_row_iterator_t m_rowIterator;
     ghostty_row_cells_t m_rowCells;
+    GhosttyMouseEncoderHandle m_mouseEncoder = nullptr;
+    GhosttyMouseEventHandle m_mouseEvent = nullptr;
     TerminalTheme m_theme;
     mutable std::mutex m_stateMutex;
 
@@ -130,4 +177,21 @@ private:
     std::vector<SearchMatch> m_searchMatches;
     size_t m_searchViewportTopRow = 0;
     int m_searchSelectedIndex = -1;
+
+    // Dirty-row rendering state: drawFrame only snapshots and repaints rows
+    // the VT marked dirty (plus cursor rows); these track frame-over-frame
+    // context that the VT dirty flags cannot see.
+    // OSC title updates arrive inside VT callbacks that already hold
+    // m_stateMutex (feedOutput), so they get their own tiny lock.
+    std::mutex m_titleMutex;
+    std::string m_pendingTitle;
+    bool m_titleDirty = false;
+
+    bool m_forceFullFrame = true;
+    int m_lastCursorRow = -1;
+    int m_lastCursorCol = -1;
+    bool m_lastCursorVisible = false;
+    bool m_lastSelectionActive = false;
+    bool m_lastSearchActive = false;
+    size_t m_lastViewportTopRow = static_cast<size_t>(-1);
 };

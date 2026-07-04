@@ -14,6 +14,7 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #undef LOG_TAG
 #define LOG_TAG "NativeDrawingRenderer"
@@ -24,6 +25,89 @@ constexpr uint64_t kBufferUsage =
 
 constexpr size_t kMaxGlyphCacheEntries = 4096;
 std::atomic<uint64_t> g_frameCounter {0};
+
+constexpr const char* kDefaultTerminalFontFamily = "PingFang SC";
+
+// Bundled fonts are each registered under their own family so the paragraph
+// fallback chain can walk them in ghostty-style priority order instead of
+// stopping at the first file that happens to extract.
+struct BundledFontSpec {
+    const char* rawPath;
+    const char* family;
+};
+
+constexpr std::array<BundledFontSpec, 5> kBundledTerminalFonts = {{
+    { "fonts/MapleMonoNormal-NF-CN-Regular.ttf", "FusionTerm Maple Mono" },
+    { "fonts/JetBrainsMono-Regular.ttf", "FusionTerm JetBrains Mono" },
+    { "fonts/SymbolsNerdFontMono-Regular.ttf", "FusionTerm Nerd Symbols" },
+    { "fonts/CascadiaMono.ttf", "FusionTerm Cascadia Mono" },
+    { "fonts/SarasaFixedSC-Regular.ttf", "FusionTerm Sarasa Fixed SC" },
+}};
+
+// Optional device-local Apple-style font files (never committed); the first
+// one present is registered as a private CJK/system fallback family.
+constexpr const char* kPrivateFallbackFontFamily = "FusionTerm Private Fallback";
+constexpr std::array<const char*, 7> kPrivateFallbackFontRawFiles = {
+    "fonts/PingFangSC-Regular.otf",
+    "fonts/PingFangSC-Regular.ttf",
+    "fonts/PingFangSC.ttf",
+    "fonts/PingFang.ttc",
+    "fonts/SF-Pro-Text-Regular.otf",
+    "fonts/SFProText-Regular.otf",
+    "fonts/FusionTerm-Regular.otf",
+};
+
+// A user-imported font registered at runtime always sits at the head of the
+// fallback chain (ghostty font-family semantics).
+constexpr const char* kCustomTerminalFontFamily = "FusionTerm Custom";
+
+// Paragraph-level fallback chain for terminal cells. Bundled families first
+// (Maple Mono NF CN covers Latin + CJK + Nerd Font glyphs in one file, which
+// mirrors the user's desktop ghostty font stack), then platform families.
+constexpr std::array<const char*, 7> kBundledFamilyFallbackOrder = {
+    kCustomTerminalFontFamily,
+    "FusionTerm Maple Mono",
+    "FusionTerm JetBrains Mono",
+    "FusionTerm Nerd Symbols",
+    "FusionTerm Cascadia Mono",
+    "FusionTerm Sarasa Fixed SC",
+    kPrivateFallbackFontFamily,
+};
+
+constexpr std::array<const char*, 14> kSystemMonoFontCandidates = {
+    "/system/fonts/PingFang.ttc",
+    "/system/fonts/PingFangSC-Regular.otf",
+    "/system/fonts/PingFangSC.ttf",
+    "/system/fonts/NotoSansMono[wdth,wght].ttf",
+    "/system/fonts/NotoSansMono-Regular.ttf",
+    "/system/fonts/HarmonyOS_Sans_Mono.ttf",
+    "/system/fonts/HarmonyOS_Sans_Mono_Regular.ttf",
+    "/system/fonts/HarmonyOS_Sans.ttf",
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/DroidSansMono.ttf",
+    "/system/fonts/RobotoMono-Regular.ttf",
+    "/system/fonts/SFMono-Regular.otf",
+    "/system/fonts/Menlo.ttc",
+    "/system/fonts/Monaco.ttf",
+};
+
+constexpr std::array<const char*, 15> kTerminalFontFamilies = {
+    "Sarasa Fixed SC",
+    "JetBrains Mono",
+    "Cascadia Mono",
+    "PingFang SC",
+    "SF Mono",
+    "Menlo",
+    "Monaco",
+    "Apple Color Emoji",
+    "HarmonyOS Sans Mono",
+    "HarmonyOS Sans",
+    "Noto Sans Mono",
+    "Noto Sans CJK SC",
+    "Droid Sans Mono",
+    "monospace",
+    "sans-serif",
+};
 
 bool IsSuspiciousCodepoint(uint32_t codepoint)
 {
@@ -121,6 +205,13 @@ bool ExtractRawFileToPath(
         return false;
     }
 
+    struct stat existing {};
+    if (stat(outputPath.c_str(), &existing) == 0 &&
+        static_cast<size_t>(existing.st_size) == fileSize) {
+        OH_ResourceManager_CloseRawFile(file);
+        return true;
+    }
+
     std::vector<uint8_t> data(fileSize);
     const int readSize = OH_ResourceManager_ReadRawFile(file, data.data(), fileSize);
     OH_ResourceManager_CloseRawFile(file);
@@ -135,6 +226,128 @@ bool ExtractRawFileToPath(
     const size_t written = fwrite(data.data(), 1, data.size(), out);
     fclose(out);
     return written == data.size();
+}
+
+std::string BaseNameFromRawPath(const char* rawPath)
+{
+    if (!rawPath) {
+        return {};
+    }
+    const std::string path(rawPath);
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+template <size_t N>
+bool ExtractFirstAvailableRawFileToPath(
+    NativeResourceManager* resourceManager,
+    const std::array<const char*, N>& rawPaths,
+    const std::string& outputDir,
+    std::string& outputPath,
+    const char** usedRawPath)
+{
+    if (!resourceManager || outputDir.empty()) {
+        return false;
+    }
+
+    for (const char* rawPath : rawPaths) {
+        const std::string fileName = BaseNameFromRawPath(rawPath);
+        if (fileName.empty()) {
+            continue;
+        }
+        const std::string candidateOutputPath = outputDir + "/" + fileName;
+        if (ExtractRawFileToPath(resourceManager, rawPath, candidateOutputPath)) {
+            outputPath = candidateOutputPath;
+            if (usedRawPath) {
+                *usedRawPath = rawPath;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t RegisterBundledTerminalFonts(
+    OH_Drawing_FontCollection* fontCollection,
+    NativeResourceManager* resourceManager,
+    const std::string& fontDir)
+{
+    if (!fontCollection || !resourceManager || fontDir.empty() || !EnsureDirectory(fontDir)) {
+        return 0;
+    }
+
+    size_t registered = 0;
+    for (const BundledFontSpec& spec : kBundledTerminalFonts) {
+        const std::string fileName = BaseNameFromRawPath(spec.rawPath);
+        if (fileName.empty()) {
+            continue;
+        }
+        const std::string outputPath = fontDir + "/" + fileName;
+        if (!ExtractRawFileToPath(resourceManager, spec.rawPath, outputPath)) {
+            OH_LOG_WARN(LOG_APP, "Bundled terminal font missing raw=%{public}s", spec.rawPath);
+            continue;
+        }
+        const uint32_t rc = OH_Drawing_RegisterFont(fontCollection, spec.family, outputPath.c_str());
+        OH_LOG_INFO(LOG_APP, "Registered bundled terminal font rc=%u family=%{public}s path=%{public}s",
+            rc,
+            spec.family,
+            outputPath.c_str());
+        if (rc == 0) {
+            ++registered;
+        }
+    }
+    return registered;
+}
+
+bool RegisterPrivateFallbackFontIfPresent(
+    OH_Drawing_FontCollection* fontCollection,
+    NativeResourceManager* resourceManager,
+    const std::string& fontDir)
+{
+    if (!fontCollection || !resourceManager || fontDir.empty() || !EnsureDirectory(fontDir)) {
+        return false;
+    }
+
+    std::string privateFontPath;
+    const char* usedRawPath = nullptr;
+    if (!ExtractFirstAvailableRawFileToPath(
+            resourceManager,
+            kPrivateFallbackFontRawFiles,
+            fontDir,
+            privateFontPath,
+            &usedRawPath)) {
+        return false;
+    }
+
+    uint32_t rc =
+        OH_Drawing_RegisterFont(fontCollection, kPrivateFallbackFontFamily, privateFontPath.c_str());
+    OH_LOG_INFO(LOG_APP, "Registered private fallback font rc=%u raw=%{public}s path=%{public}s",
+        rc,
+        usedRawPath ? usedRawPath : "",
+        privateFontPath.c_str());
+    return true;
+}
+
+size_t RegisterReadableFonts(OH_Drawing_FontCollection* fontCollection, const char* familyName)
+{
+    if (!fontCollection || !familyName) {
+        return 0;
+    }
+
+    size_t registered = 0;
+    for (const char* fontPath : kSystemMonoFontCandidates) {
+        if (!fontPath || access(fontPath, R_OK) != 0) {
+            continue;
+        }
+
+        uint32_t rc = OH_Drawing_RegisterFont(fontCollection, familyName, fontPath);
+        OH_LOG_INFO(LOG_APP, "Registered terminal font rc=%u family=%{public}s path=%{public}s",
+            rc,
+            familyName,
+            fontPath);
+        ++registered;
+    }
+    return registered;
 }
 }
 
@@ -224,12 +437,19 @@ void NativeDrawingRenderer::cleanup()
     m_lastCursorRectValid = false;
     m_window = nullptr;
     m_fontsConfigured = false;
+    m_offscreenPixels.clear();
+    m_offscreenWidth = 0;
+    m_offscreenHeight = 0;
+    m_offscreenFormat = -1;
+    m_offscreenValid = false;
+    m_needFullRepaint = true;
 }
 
 void NativeDrawingRenderer::resize(uint32_t width, uint32_t height)
 {
     m_width = width;
     m_height = height;
+    m_needFullRepaint = true;
     configureWindow();
 }
 
@@ -242,28 +462,38 @@ bool NativeDrawingRenderer::loadFontAtlas(NativeResourceManager* resourceManager
         return true;
     }
 
-    const char* monoFontPath = "/system/fonts/NotoSansMono[wdth,wght].ttf";
-    if (access(monoFontPath, R_OK) == 0) {
-        uint32_t rc = OH_Drawing_RegisterFont(m_fontCollection, m_primaryFontFamily.c_str(), monoFontPath);
-        OH_LOG_INFO(LOG_APP, "Registered mono font rc=%u path=%{public}s", rc, monoFontPath);
-    } else {
-        OH_LOG_WARN(LOG_APP, "Mono font path unavailable: %{public}s", monoFontPath);
+    if (RegisterReadableFonts(m_fontCollection, m_primaryFontFamily.c_str()) == 0) {
+        OH_LOG_WARN(LOG_APP, "No readable bundled/system mono font candidate found; using platform font fallback");
     }
 
     if (resourceManager && !filesDir.empty()) {
         const std::string fontDir = filesDir + "/fonts";
-        const std::string symbolFontPath = fontDir + "/SymbolsNerdFontMono-Regular.ttf";
-        if (EnsureDirectory(fontDir) &&
-            ExtractRawFileToPath(resourceManager, "fonts/SymbolsNerdFontMono-Regular.ttf", symbolFontPath)) {
-            uint32_t rc = OH_Drawing_RegisterFont(m_fontCollection, m_symbolFontFamily.c_str(), symbolFontPath.c_str());
-            OH_LOG_INFO(LOG_APP, "Registered symbol font rc=%u path=%{public}s", rc, symbolFontPath.c_str());
-        } else {
-            OH_LOG_WARN(LOG_APP, "Failed to extract bundled symbol font");
+        const size_t bundled = RegisterBundledTerminalFonts(m_fontCollection, resourceManager, fontDir);
+        if (bundled == 0) {
+            OH_LOG_WARN(LOG_APP, "No bundled terminal font registered; falling back to platform fonts");
         }
+        RegisterPrivateFallbackFontIfPresent(m_fontCollection, resourceManager, fontDir);
     }
 
     m_fontsConfigured = true;
     updateCellDimensions();
+    m_needFullRepaint = true;
+    return true;
+}
+
+bool NativeDrawingRenderer::ensureOffscreen(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (m_offscreenWidth != width || m_offscreenHeight != height ||
+        m_offscreenFormat != m_currentConfig.format) {
+        m_offscreenPixels.assign(static_cast<size_t>(width) * height * 4, 0);
+        m_offscreenWidth = width;
+        m_offscreenHeight = height;
+        m_offscreenFormat = m_currentConfig.format;
+        m_offscreenValid = false;
+    }
     return true;
 }
 
@@ -323,6 +553,24 @@ void NativeDrawingRenderer::beginFrame()
         return;
     }
 
+    // Draw into the persistent offscreen image, not the freshly dequeued
+    // window buffer: buffer queues rotate buffers, so partial repaints must
+    // accumulate somewhere stable and be blitted whole in endFrame().
+    if (!ensureOffscreen(static_cast<uint32_t>(m_currentConfig.width),
+                         static_cast<uint32_t>(m_currentConfig.height))) {
+        OH_NativeBuffer_Unmap(m_currentNativeBuffer);
+        OH_NativeWindow_NativeWindowAbortBuffer(m_window, m_currentBuffer);
+        if (m_currentFenceFd >= 0) {
+            close(m_currentFenceFd);
+        }
+        m_currentFenceFd = -1;
+        m_currentBuffer = nullptr;
+        m_currentNativeBuffer = nullptr;
+        m_currentPixels = nullptr;
+        m_currentConfig = {};
+        return;
+    }
+
     OH_Drawing_Image_Info info;
     info.width = m_currentConfig.width;
     info.height = m_currentConfig.height;
@@ -333,8 +581,8 @@ void NativeDrawingRenderer::beginFrame()
 
     OH_Drawing_Bitmap* bitmap = OH_Drawing_BitmapCreateFromPixels(
         &info,
-        m_currentPixels,
-        static_cast<uint32_t>(m_currentConfig.stride));
+        m_offscreenPixels.data(),
+        m_offscreenWidth * 4);
     if (!bitmap) {
         OH_LOG_ERROR(LOG_APP, "BitmapCreateFromPixels failed frame=%{public}" PRIu64 " seq=%{public}u stride=%{public}d",
             m_currentFrameId, seqNum, m_currentConfig.stride);
@@ -352,15 +600,21 @@ void NativeDrawingRenderer::beginFrame()
     }
 
     OH_Drawing_CanvasBind(m_canvas, bitmap);
-    OH_Drawing_CanvasClear(m_canvas, m_defaultBgColor);
     OH_Drawing_BitmapDestroy(bitmap);
 }
 
 void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols, int rows,
-                                       int cursorRow, int cursorCol, bool cursorVisible)
+                                       int cursorRow, int cursorCol, bool cursorVisible,
+                                       const std::vector<uint8_t>& dirtyRows)
 {
     if (!m_canvas || !m_currentPixels) {
         return;
+    }
+
+    const bool fullRepaint = m_needFullRepaint || !m_offscreenValid ||
+        dirtyRows.empty() || dirtyRows.size() != static_cast<size_t>(rows);
+    if (fullRepaint) {
+        OH_Drawing_CanvasClear(m_canvas, m_defaultBgColor);
     }
 
     const bool drawCursor = shouldRenderCursor(cursorVisible);
@@ -378,6 +632,9 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
     std::vector<uint8_t> geometryMask(static_cast<size_t>(rows * cols), 0);
 
     for (int row = 0; row < rows; ++row) {
+        if (!fullRepaint && dirtyRows[static_cast<size_t>(row)] == 0) {
+            continue;
+        }
         uint32_t rowBg = m_defaultBgColor;
         bool rowBgSeen = false;
         for (int col = 0; col < cols; ++col) {
@@ -403,10 +660,15 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
             visualAttrs.fg = fg;
             visualAttrs.bg = bg;
             visualAttrs.inverse = false;
-            rowBg = bg;
+            // Default-background cells honor the configured background
+            // opacity; explicitly colored cells stay opaque
+            // (ghostty background-opacity-cells = false).
+            const uint32_t paintBg =
+                (bg | 0xFF000000u) == m_defaultBgOpaque ? m_defaultBgColor : bg;
+            rowBg = paintBg;
             rowBgSeen = true;
 
-            paintCellBackground(left, top, width, cellHeight, bg);
+            paintCellBackground(left, top, width, cellHeight, paintBg);
 
             if (paintBuiltinGlyph(cell, visualAttrs, left, top, width, cellHeight)) {
                 geometryMask[static_cast<size_t>(row * cols + col)] = 1;
@@ -439,6 +701,9 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
     }
 
     for (int row = 0; row < rows; ++row) {
+        if (!fullRepaint && dirtyRows[static_cast<size_t>(row)] == 0) {
+            continue;
+        }
         int col = 0;
         while (col < cols) {
             const Cell& cell = cells[row * cols + col];
@@ -513,12 +778,33 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
             col = nextCol;
         }
     }
+
+    m_needFullRepaint = false;
+    m_offscreenValid = true;
 }
 
 void NativeDrawingRenderer::endFrame()
 {
     if (!m_window || !m_currentBuffer) {
         return;
+    }
+
+    if (m_currentPixels && m_offscreenValid &&
+        m_offscreenWidth == static_cast<uint32_t>(m_currentConfig.width) &&
+        m_offscreenHeight == static_cast<uint32_t>(m_currentConfig.height)) {
+        const uint32_t rowBytes = m_offscreenWidth * 4;
+        const uint32_t dstStride = static_cast<uint32_t>(m_currentConfig.stride);
+        uint8_t* dst = static_cast<uint8_t*>(m_currentPixels);
+        const uint8_t* srcPixels = m_offscreenPixels.data();
+        if (dstStride == rowBytes) {
+            std::memcpy(dst, srcPixels, static_cast<size_t>(rowBytes) * m_offscreenHeight);
+        } else {
+            for (uint32_t y = 0; y < m_offscreenHeight; ++y) {
+                std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                            srcPixels + static_cast<size_t>(y) * rowBytes,
+                            rowBytes);
+            }
+        }
     }
 
     Region dirtyRegion {};
@@ -547,6 +833,25 @@ void NativeDrawingRenderer::endFrame()
     }
     m_currentPixels = nullptr;
     m_currentConfig = {};
+}
+
+bool NativeDrawingRenderer::registerCustomFont(const std::string& fontPath)
+{
+    if (!m_fontCollection || fontPath.empty() || access(fontPath.c_str(), R_OK) != 0) {
+        return false;
+    }
+
+    const uint32_t rc =
+        OH_Drawing_RegisterFont(m_fontCollection, kCustomTerminalFontFamily, fontPath.c_str());
+    OH_LOG_INFO(LOG_APP, "Registered custom terminal font rc=%u path=%{public}s", rc, fontPath.c_str());
+    if (rc != 0) {
+        return false;
+    }
+
+    destroyGlyphCache();
+    updateCellDimensions();
+    m_needFullRepaint = true;
+    return true;
 }
 
 void NativeDrawingRenderer::updateCellDimensions()
@@ -623,7 +928,20 @@ void NativeDrawingRenderer::trimGlyphCache()
     if (m_glyphCache.size() <= kMaxGlyphCacheEntries) {
         return;
     }
-    destroyGlyphCache();
+    // Evict roughly half instead of nuking the whole cache: a full clear
+    // forces every visible glyph to re-shape on the next frame (a visible
+    // stutter), while partial eviction keeps the hot set warm.
+    size_t index = 0;
+    for (auto it = m_glyphCache.begin(); it != m_glyphCache.end();) {
+        if ((index++ & 1) == 0) {
+            if (it->second.typography) {
+                OH_Drawing_DestroyTypography(it->second.typography);
+            }
+            it = m_glyphCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
@@ -674,23 +992,24 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
         OH_Drawing_AddTextStyleDecoration(textStyle, TEXT_DECORATION_LINE_THROUGH);
     }
     OH_Drawing_SetTextStyleDecorationColor(textStyle, attrs.fg);
-    OH_Drawing_TextStyleAddFontFeature(textStyle, "liga", 1);
-    OH_Drawing_TextStyleAddFontFeature(textStyle, "clig", 1);
-    OH_Drawing_TextStyleAddFontFeature(textStyle, "calt", 1);
-    const std::array<const char*, 4> fontFamilies = {
-        m_primaryFontFamily.c_str(),
-        m_symbolFontFamily.c_str(),
-        "monospace",
-        "sans-serif"
-    };
-    const char* families[fontFamilies.size()];
-    for (size_t i = 0; i < fontFamilies.size(); ++i) {
-        families[i] = fontFamilies[i];
+    OH_Drawing_TextStyleAddFontFeature(textStyle, "liga", 0);
+    OH_Drawing_TextStyleAddFontFeature(textStyle, "clig", 0);
+    OH_Drawing_TextStyleAddFontFeature(textStyle, "calt", 0);
+    std::vector<const char*> families;
+    families.reserve(kBundledFamilyFallbackOrder.size() + kTerminalFontFamilies.size() + 3);
+    for (const char* family : kBundledFamilyFallbackOrder) {
+        families.push_back(family);
+    }
+    families.push_back(kDefaultTerminalFontFamily);
+    families.push_back(m_primaryFontFamily.c_str());
+    families.push_back(m_symbolFontFamily.c_str());
+    for (const char* family : kTerminalFontFamilies) {
+        families.push_back(family);
     }
     OH_Drawing_SetTextStyleFontFamilies(textStyle,
-                                        static_cast<int>(fontFamilies.size()),
-                                        families);
-    OH_Drawing_SetTextStyleLocale(textStyle, "en-US");
+                                        static_cast<int>(families.size()),
+                                        families.data());
+    OH_Drawing_SetTextStyleLocale(textStyle, "zh-Hans");
 
     OH_Drawing_TypographyCreate* handler = OH_Drawing_CreateTypographyHandler(typographyStyle, m_fontCollection);
     if (!handler) {
@@ -749,6 +1068,9 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
 void NativeDrawingRenderer::paintCellBackground(float left, float top, float width, float height, uint32_t color)
 {
     OH_Drawing_BrushSetColor(m_brush, color);
+    // SRC: replace destination pixels. Repainted rows must not blend the
+    // translucent default background onto last frame's pixels.
+    OH_Drawing_BrushSetBlendMode(m_brush, BLEND_MODE_SRC);
     OH_Drawing_CanvasAttachBrush(m_canvas, m_brush);
     OH_Drawing_RectSetLeft(m_rect, left);
     OH_Drawing_RectSetTop(m_rect, top);
@@ -983,17 +1305,22 @@ bool NativeDrawingRenderer::paintBuiltinGlyph(
     BoxGlyphEdges edges = getBoxGlyphEdges(cp);
     if (edges.up != LineStyle::None || edges.right != LineStyle::None ||
         edges.down != LineStyle::None || edges.left != LineStyle::None) {
+        // Half-length strokes meet at the cell center; extend each stroke by
+        // half the maximum stroke thickness so corners join without a notch.
+        const float joinOverlap = std::max(1.0f, std::round(std::min(width, height) * 0.07f));
         if (edges.left != LineStyle::None) {
-            paintBuiltinLineHorizontal(left, top, width * 0.5f, height, edges.left, false, false, fg);
+            paintBuiltinLineHorizontal(left, top, width * 0.5f + joinOverlap, height, edges.left, false, false, fg);
         }
         if (edges.right != LineStyle::None) {
-            paintBuiltinLineHorizontal(left + width * 0.5f, top, width * 0.5f, height, edges.right, false, false, fg);
+            paintBuiltinLineHorizontal(left + width * 0.5f - joinOverlap, top, width * 0.5f + joinOverlap,
+                                       height, edges.right, false, false, fg);
         }
         if (edges.up != LineStyle::None) {
-            paintBuiltinLineVertical(left, top, width, height * 0.5f, edges.up, false, false, fg);
+            paintBuiltinLineVertical(left, top, width, height * 0.5f + joinOverlap, edges.up, false, false, fg);
         }
         if (edges.down != LineStyle::None) {
-            paintBuiltinLineVertical(left, top + height * 0.5f, width, height * 0.5f, edges.down, false, false, fg);
+            paintBuiltinLineVertical(left, top + height * 0.5f - joinOverlap, width, height * 0.5f + joinOverlap,
+                                     edges.down, false, false, fg);
         }
         return true;
     }

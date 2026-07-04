@@ -25,6 +25,7 @@
         "label": "$string:EntryAbility_label",
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
+        "launchType": "multiton",
         "orientation": "follow_desktop",
         "supportWindowMode": [
           "fullscreen",

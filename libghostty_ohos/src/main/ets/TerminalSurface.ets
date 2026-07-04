@@ -9,11 +9,17 @@ export struct TerminalSurface {
   controller: TerminalController = new TerminalController();
   surfaceId: string = 'terminalSurface';
   searchInputId: string = 'terminalSearchInput';
-  surfaceColor: string = '#0B0D10';
+  imeInputId: string = 'terminalImeInput';
+  @Prop surfaceColor: string = '#0B0D10';
   onLinkActivated: TerminalLinkListener | null = null;
+  // Optional transform applied to IME-committed text before it reaches the
+  // terminal (used by the app's sticky Ctrl/Alt accessory keys).
+  imeInputInterceptor: ((value: string) => string) | null = null;
 
   private context: common.UIAbilityContext | null = null;
   private searchInputController: TextInputController = new TextInputController();
+  private imeInputController: TextInputController = new TextInputController();
+  private readonly imeAnchorSentinel: string = '\u200B';
   private fallbackTimer: number = -1;
   private contextMenuSelectedText: string = '';
   private contextMenuScreenContent: string = '';
@@ -27,6 +33,7 @@ export struct TerminalSurface {
   @State private searchText: string = '';
   @State private searchTotal: number = 0;
   @State private searchSelected: number = -1;
+  @State private imeText: string = this.imeAnchorSentinel;
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -48,6 +55,7 @@ export struct TerminalSurface {
   build() {
     Stack() {
       this.buildTerminalXComponent();
+      this.buildImeInputAnchor();
       if (this.useTextFallback) {
         this.buildTextFallback();
       }
@@ -139,6 +147,39 @@ export struct TerminalSurface {
   }
 
   @Builder
+  private buildImeInputAnchor() {
+    TextInput({ text: this.imeText, controller: this.imeInputController })
+      .id(this.imeInputId)
+      .type(InputType.Normal)
+      .width(1)
+      .height(1)
+      .fontSize(1)
+      .fontColor('#00000000')
+      .backgroundColor('#00000000')
+      .caretColor('#00000000')
+      .opacity(0.01)
+      .position({ x: 0, y: 0 })
+      .enableKeyboardOnFocus(true)
+      .selectionMenuHidden(true)
+      .onWillInsert((info: InsertValue) => {
+        this.handleImeAnchorInsert(info.insertValue);
+        return false;
+      })
+      .onWillDelete((info: DeleteValue) => {
+        this.handleImeAnchorDelete(info.deleteValue);
+        return false;
+      })
+      .onChange((value: string) => {
+        this.handleImeAnchorChange(value);
+      })
+      .onSubmit(() => {
+        this.controller.write('\r');
+        this.resetImeAnchorText();
+        this.requestImeAnchorFocus();
+      })
+  }
+
+  @Builder
   private buildSearchOverlay() {
     Column() {
       Row({ space: 8 }) {
@@ -165,21 +206,21 @@ export struct TerminalSurface {
           .width(64)
           .textAlign(TextAlign.Center)
 
-        Button('Prev')
+        Button('上一个')
           .height(34)
           .fontSize(13)
           .onClick(() => {
             this.navigateSearch(false);
           })
 
-        Button('Next')
+        Button('下一个')
           .height(34)
           .fontSize(13)
           .onClick(() => {
             this.navigateSearch(true);
           })
 
-        Button('Close')
+        Button('关闭')
           .height(34)
           .fontSize(13)
           .onClick(() => {
@@ -209,6 +250,67 @@ export struct TerminalSurface {
 
   private requestTerminalFocus(): void {
     focusControl.requestFocus(this.surfaceId);
+    this.requestImeAnchorFocus();
+  }
+
+  private requestImeAnchorFocus(): void {
+    setTimeout(() => {
+      focusControl.requestFocus(this.imeInputId);
+      this.resetImeAnchorCaret();
+    }, 0);
+  }
+
+  private resetImeAnchorText(): void {
+    this.imeText = this.imeAnchorSentinel;
+    this.resetImeAnchorCaret();
+  }
+
+  private resetImeAnchorCaret(): void {
+    try {
+      this.imeInputController.caretPosition(this.imeAnchorSentinel.length);
+    } catch (err) {
+      console.error('Failed to reset terminal IME anchor caret: ' + JSON.stringify(err));
+    }
+  }
+
+  private handleImeAnchorInsert(value: string): void {
+    if (value.length === 0) {
+      this.resetImeAnchorText();
+      return;
+    }
+
+    this.controller.write(this.imeInputInterceptor ? this.imeInputInterceptor(value) : value);
+    this.resetImeAnchorText();
+    this.requestImeAnchorFocus();
+  }
+
+  private handleImeAnchorDelete(value: string): void {
+    const deleteCount = Math.max(value.length, 1);
+    for (let index = 0; index < deleteCount; index++) {
+      this.controller.write('\x7f');
+    }
+    this.resetImeAnchorText();
+    this.requestImeAnchorFocus();
+  }
+
+  private handleImeAnchorChange(value: string): void {
+    if (value === this.imeAnchorSentinel) {
+      return;
+    }
+
+    if (value.length === 0) {
+      this.controller.write('\x7f');
+      this.resetImeAnchorText();
+      this.requestImeAnchorFocus();
+      return;
+    }
+
+    const inserted = value.split(this.imeAnchorSentinel).join('');
+    if (inserted.length > 0) {
+      this.controller.write(this.imeInputInterceptor ? this.imeInputInterceptor(inserted) : inserted);
+    }
+    this.resetImeAnchorText();
+    this.requestImeAnchorFocus();
   }
 
   private startFallbackPolling(): void {
@@ -240,10 +342,10 @@ export struct TerminalSurface {
       if (content.length > 0) {
         this.fallbackContent = content;
       } else if (this.fallbackError.length > 0) {
-        this.fallbackContent = this.fallbackError + '\n\nWaiting for terminal output...';
+        this.fallbackContent = this.fallbackError + '\n\n等待终端输出…';
       }
     } catch (err) {
-      this.fallbackContent = 'Failed to read terminal buffer';
+      this.fallbackContent = '读取终端缓冲区失败';
       console.error('Failed to sync fallback screen: ' + JSON.stringify(err));
     }
   }
@@ -270,37 +372,37 @@ export struct TerminalSurface {
   @Builder
   private buildTerminalContextMenu() {
     Menu() {
-      MenuItem({ content: 'Find' })
+      MenuItem({ content: '查找' })
         .onClick(() => {
           this.openSearch(this.searchVisible ? this.searchText : '');
         })
       if (this.hasTerminalSelection()) {
-        MenuItem({ content: 'Find Selection' })
+        MenuItem({ content: '查找所选' })
           .onClick(() => {
             this.openSearch(this.controller.getSelectedText());
           })
       }
       if (this.hasTerminalSelection()) {
-        MenuItem({ content: 'Copy' })
+        MenuItem({ content: '复制' })
           .onClick(() => {
             this.copyToClipboard(this.controller.getSelectedText());
           })
       }
       if (this.hasClipboardContents()) {
-        MenuItem({ content: 'Paste' })
+        MenuItem({ content: '粘贴' })
           .onClick(() => {
             this.pasteFromClipboard();
           })
       }
       if (this.hasTerminalSelection()) {
-        MenuItem({ content: 'Clear Selection' })
+        MenuItem({ content: '取消选择' })
           .onClick(() => {
             this.controller.clearSelection();
             this.requestTerminalFocus();
           })
       }
       if (this.hasTerminalScreenContent()) {
-        MenuItem({ content: 'Copy Screen' })
+        MenuItem({ content: '复制整屏' })
           .onClick(() => {
             this.copyToClipboard(this.controller.getScreenContent());
           })
@@ -401,7 +503,7 @@ export struct TerminalSurface {
         text = primaryRecord.toPlainText();
       }
       if (text.length > 0) {
-        this.controller.write(text);
+        this.controller.paste(text);
       }
     } catch (err) {
       console.error('Failed to paste into terminal: ' + JSON.stringify(err));

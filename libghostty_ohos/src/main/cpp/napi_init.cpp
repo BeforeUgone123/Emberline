@@ -432,88 +432,180 @@ bool AppendPrintableKey(OH_NativeXComponent_KeyCode code, bool shift, bool capsL
     }
 }
 
+int XtermModifierCode(bool shift, bool alt, bool ctrl)
+{
+    return 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
+}
+
+// Cursor-style key (arrows/Home/End). Modified keys always use CSI 1;m<final>;
+// unmodified keys honor DECCKM application cursor mode (SS3 <final>).
+void BuildCursorKey(std::string& sequence, char finalByte, int modCode, bool appCursorKeys)
+{
+    if (modCode > 1) {
+        sequence = "\x1b[1;";
+        sequence += std::to_string(modCode);
+        sequence.push_back(finalByte);
+    } else if (appCursorKeys) {
+        sequence = "\x1bO";
+        sequence.push_back(finalByte);
+    } else {
+        sequence = "\x1b[";
+        sequence.push_back(finalByte);
+    }
+}
+
+// Editing-pad key encoded as CSI <number>~ with optional xterm modifier.
+void BuildTildeKey(std::string& sequence, int number, int modCode)
+{
+    sequence = "\x1b[";
+    sequence += std::to_string(number);
+    if (modCode > 1) {
+        sequence.push_back(';');
+        sequence += std::to_string(modCode);
+    }
+    sequence.push_back('~');
+}
+
+// SS3 function key (F1-F4); with modifiers xterm switches to CSI 1;m<final>.
+void BuildSs3FunctionKey(std::string& sequence, char finalByte, int modCode)
+{
+    if (modCode > 1) {
+        sequence = "\x1b[1;";
+        sequence += std::to_string(modCode);
+        sequence.push_back(finalByte);
+    } else {
+        sequence = "\x1bO";
+        sequence.push_back(finalByte);
+    }
+}
+
+// Ctrl chords on non-letter keys that map to C0 control bytes.
+bool AppendCtrlSpecialKey(OH_NativeXComponent_KeyCode code, bool shift, std::string& out)
+{
+    switch (code) {
+        case LINUX_KEY_SPACE:
+        case KEY_SPACE:
+            out.push_back('\0'); // Ctrl-Space -> NUL (tmux default prefix candidates)
+            return true;
+        case LINUX_KEY_LEFT_BRACE:
+        case KEY_LEFT_BRACKET:
+            out.push_back('\x1b');
+            return true;
+        case LINUX_KEY_BACKSLASH:
+        case KEY_BACKSLASH:
+            out.push_back('\x1c');
+            return true;
+        case LINUX_KEY_RIGHT_BRACE:
+        case KEY_RIGHT_BRACKET:
+            out.push_back('\x1d');
+            return true;
+        case LINUX_KEY_6:
+            out.push_back('\x1e'); // Ctrl-6 / Ctrl-^
+            return true;
+        case LINUX_KEY_MINUS:
+        case KEY_MINUS:
+            out.push_back('\x1f'); // Ctrl-- / Ctrl-_
+            return true;
+        case LINUX_KEY_SLASH:
+        case KEY_SLASH:
+            out.push_back('\x1f'); // Ctrl-/ commonly aliases Ctrl-_
+            return true;
+        default:
+            (void)shift;
+            return false;
+    }
+}
+
 bool BuildKeySequence(
     OH_NativeXComponent_KeyCode code,
     uint64_t modifiers,
     bool capsLock,
+    bool appCursorKeys,
     std::string& sequence)
 {
     const bool ctrl = IsCtrlPressed(modifiers);
     const bool alt = IsAltPressed(modifiers);
     const bool shift = IsShiftPressed(modifiers);
+    const int modCode = XtermModifierCode(shift, alt, ctrl);
 
     switch (code) {
         case LINUX_KEY_UP:
-        case KEY_DPAD_UP: sequence = "\x1b[A"; return true;
+        case KEY_DPAD_UP: BuildCursorKey(sequence, 'A', modCode, appCursorKeys); return true;
         case LINUX_KEY_DOWN:
-        case KEY_DPAD_DOWN: sequence = "\x1b[B"; return true;
+        case KEY_DPAD_DOWN: BuildCursorKey(sequence, 'B', modCode, appCursorKeys); return true;
         case LINUX_KEY_RIGHT:
-        case KEY_DPAD_RIGHT: sequence = "\x1b[C"; return true;
+        case KEY_DPAD_RIGHT: BuildCursorKey(sequence, 'C', modCode, appCursorKeys); return true;
         case LINUX_KEY_LEFT:
-        case KEY_DPAD_LEFT: sequence = "\x1b[D"; return true;
+        case KEY_DPAD_LEFT: BuildCursorKey(sequence, 'D', modCode, appCursorKeys); return true;
+        case LINUX_KEY_HOME:
+        case KEY_MOVE_HOME:
+        case KEY_HOME:
+            BuildCursorKey(sequence, 'H', modCode, appCursorKeys);
+            return true;
+        case LINUX_KEY_END:
+        case KEY_MOVE_END:
+            BuildCursorKey(sequence, 'F', modCode, appCursorKeys);
+            return true;
         case KEY_ESCAPE: sequence = "\x1b"; return true;
         case LINUX_KEY_ENTER:
         case KEY_ENTER:
         case KEY_NUMPAD_ENTER:
-            sequence = "\r";
+            sequence = alt ? "\x1b\r" : "\r";
             return true;
         case LINUX_KEY_TAB:
         case KEY_TAB:
-            sequence = "\t";
+            sequence = shift ? "\x1b[Z" : "\t";
             return true;
         case LINUX_KEY_BACKSPACE:
         case KEY_DEL:
-            sequence = "\x7f";
+            sequence = alt ? "\x1b\x7f" : "\x7f";
             return true;
         case LINUX_KEY_DELETE:
         case KEY_FORWARD_DEL:
-            sequence = "\x1b[3~";
-            return true;
-        case LINUX_KEY_HOME:
-        case KEY_MOVE_HOME:
-        case KEY_HOME:
-            sequence = "\x1b[H";
-            return true;
-        case LINUX_KEY_END:
-        case KEY_MOVE_END:
-            sequence = "\x1b[F";
+            BuildTildeKey(sequence, 3, modCode);
             return true;
         case LINUX_KEY_PAGE_UP:
         case KEY_PAGE_UP:
-            sequence = "\x1b[5~";
+            BuildTildeKey(sequence, 5, modCode);
             return true;
         case LINUX_KEY_PAGE_DOWN:
         case KEY_PAGE_DOWN:
-            sequence = "\x1b[6~";
+            BuildTildeKey(sequence, 6, modCode);
             return true;
         case LINUX_KEY_INSERT:
         case KEY_INSERT:
-            sequence = "\x1b[2~";
+            BuildTildeKey(sequence, 2, modCode);
             return true;
-        case KEY_F1: sequence = "\x1bOP"; return true;
-        case KEY_F2: sequence = "\x1bOQ"; return true;
-        case KEY_F3: sequence = "\x1bOR"; return true;
-        case KEY_F4: sequence = "\x1bOS"; return true;
-        case KEY_F5: sequence = "\x1b[15~"; return true;
-        case KEY_F6: sequence = "\x1b[17~"; return true;
-        case KEY_F7: sequence = "\x1b[18~"; return true;
-        case KEY_F8: sequence = "\x1b[19~"; return true;
-        case KEY_F9: sequence = "\x1b[20~"; return true;
-        case KEY_F10: sequence = "\x1b[21~"; return true;
-        case KEY_F11: sequence = "\x1b[23~"; return true;
-        case KEY_F12: sequence = "\x1b[24~"; return true;
+        case KEY_F1: BuildSs3FunctionKey(sequence, 'P', modCode); return true;
+        case KEY_F2: BuildSs3FunctionKey(sequence, 'Q', modCode); return true;
+        case KEY_F3: BuildSs3FunctionKey(sequence, 'R', modCode); return true;
+        case KEY_F4: BuildSs3FunctionKey(sequence, 'S', modCode); return true;
+        case KEY_F5: BuildTildeKey(sequence, 15, modCode); return true;
+        case KEY_F6: BuildTildeKey(sequence, 17, modCode); return true;
+        case KEY_F7: BuildTildeKey(sequence, 18, modCode); return true;
+        case KEY_F8: BuildTildeKey(sequence, 19, modCode); return true;
+        case KEY_F9: BuildTildeKey(sequence, 20, modCode); return true;
+        case KEY_F10: BuildTildeKey(sequence, 21, modCode); return true;
+        case KEY_F11: BuildTildeKey(sequence, 23, modCode); return true;
+        case KEY_F12: BuildTildeKey(sequence, 24, modCode); return true;
         default:
             break;
     }
 
-    const int linuxLetter = LinuxLetterOffset(code);
-    if (ctrl && linuxLetter >= 0) {
-        sequence.push_back(static_cast<char>(1 + linuxLetter));
-        return true;
-    }
-
-    if (ctrl && code >= KEY_A && code <= KEY_Z) {
-        sequence.push_back(static_cast<char>(1 + (code - KEY_A)));
+    if (ctrl) {
+        std::string control;
+        const int linuxLetter = LinuxLetterOffset(code);
+        if (linuxLetter >= 0) {
+            control.push_back(static_cast<char>(1 + linuxLetter));
+        } else if (code >= KEY_A && code <= KEY_Z) {
+            control.push_back(static_cast<char>(1 + (code - KEY_A)));
+        } else if (!AppendCtrlSpecialKey(code, shift, control)) {
+            return false;
+        }
+        if (alt) {
+            sequence.push_back('\x1b');
+        }
+        sequence += control;
         return true;
     }
 
@@ -742,8 +834,9 @@ public:
             NotifyImeStateLocked();
         }
 
+        const bool appCursorKeys = m_terminal->cursorKeysApplicationMode();
         std::string sequence;
-        if (!BuildKeySequence(code, modifiers, capsLock, sequence) || sequence.empty()) {
+        if (!BuildKeySequence(code, modifiers, capsLock, appCursorKeys, sequence) || sequence.empty()) {
             return false;
         }
 
@@ -792,11 +885,18 @@ public:
             return;
         }
 
+        // While the application tracks the mouse (tmux/vim with mouse on),
+        // touch becomes a synthesized mouse: tap = left click, long-press
+        // then drag = button drag (pane splitters), plain swipe = wheel.
+        const bool forwardTouchAsMouse = m_terminal->isMouseTrackingEnabled();
+
         switch (touchEvent.type) {
             case OH_NATIVEXCOMPONENT_DOWN: {
                 m_isTouching = true;
                 m_isSelecting = false;
+                m_touchMouseDragActive = false;
                 m_touchScrollRemainderY = 0.0f;
+                m_touchWheelRemainderY = 0.0f;
                 m_lastTouchY = touchEvent.y;
                 m_touchStartX = touchEvent.x;
                 m_touchStartY = touchEvent.y;
@@ -813,6 +913,23 @@ public:
                 const float dy = touchEvent.y - m_touchStartY;
                 const float moveDistance = std::sqrt(dx * dx + dy * dy);
                 const uint64_t elapsed = getCurrentTimeMs() - m_touchStartTime;
+
+                if (forwardTouchAsMouse) {
+                    if (!m_touchMouseDragActive && elapsed >= LONG_PRESS_MS && moveDistance < MOVE_THRESHOLD) {
+                        SendTouchMouseEvent(TerminalMouseAction::Press,
+                                            m_touchStartX, m_touchStartY, true, cellWidth, cellHeight);
+                        m_touchMouseDragActive = true;
+                    }
+                    if (m_touchMouseDragActive) {
+                        SendTouchMouseEvent(TerminalMouseAction::Motion,
+                                            touchEvent.x, touchEvent.y, true, cellWidth, cellHeight);
+                    } else if (moveDistance >= MOVE_THRESHOLD) {
+                        ForwardTouchWheel(m_lastTouchY - touchEvent.y, cellWidth, cellHeight,
+                                          touchEvent.x, touchEvent.y);
+                    }
+                    m_lastTouchY = touchEvent.y;
+                    break;
+                }
 
                 if (!m_isSelecting && elapsed >= LONG_PRESS_MS) {
                     int startRow = 0;
@@ -837,6 +954,33 @@ public:
 
             case OH_NATIVEXCOMPONENT_UP:
             case OH_NATIVEXCOMPONENT_CANCEL: {
+                if (forwardTouchAsMouse && m_isTouching) {
+                    const float dx = touchEvent.x - m_touchStartX;
+                    const float dy = touchEvent.y - m_touchStartY;
+                    const float moveDistance = std::sqrt(dx * dx + dy * dy);
+                    const uint64_t elapsed = getCurrentTimeMs() - m_touchStartTime;
+
+                    if (m_touchMouseDragActive) {
+                        SendTouchMouseEvent(TerminalMouseAction::Release,
+                                            touchEvent.x, touchEvent.y, false, cellWidth, cellHeight);
+                    } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP &&
+                               moveDistance < MOVE_THRESHOLD && elapsed < LONG_PRESS_MS) {
+                        SendTouchMouseEvent(TerminalMouseAction::Press,
+                                            touchEvent.x, touchEvent.y, true, cellWidth, cellHeight);
+                        SendTouchMouseEvent(TerminalMouseAction::Release,
+                                            touchEvent.x, touchEvent.y, false, cellWidth, cellHeight);
+                        ShowImeLocked(IME_REQUEST_REASON_TOUCH);
+                        NotifyImeStateLocked();
+                    }
+
+                    m_isTouching = false;
+                    m_isSelecting = false;
+                    m_touchMouseDragActive = false;
+                    m_touchScrollRemainderY = 0.0f;
+                    m_touchWheelRemainderY = 0.0f;
+                    break;
+                }
+
                 if (m_isTouching && !m_isSelecting) {
                     const float dx = touchEvent.x - m_touchStartX;
                     const float dy = touchEvent.y - m_touchStartY;
@@ -858,7 +1002,9 @@ public:
 
                 m_isTouching = false;
                 m_isSelecting = false;
+                m_touchMouseDragActive = false;
                 m_touchScrollRemainderY = 0.0f;
+                m_touchWheelRemainderY = 0.0f;
                 break;
             }
 
@@ -893,6 +1039,13 @@ public:
         int row = 0;
         int col = 0;
         MapPointToCell(mouseEvent.x, mouseEvent.y, cellWidth, cellHeight, row, col);
+
+        m_lastMouseX = mouseEvent.x;
+        m_lastMouseY = mouseEvent.y;
+        m_lastMousePositionKnown = true;
+        if (TrySendTerminalMouseEvent(mouseEvent, cellWidth, cellHeight)) {
+            return;
+        }
 
         switch (mouseEvent.action) {
             case OH_NATIVEXCOMPONENT_MOUSE_PRESS:
@@ -1004,6 +1157,10 @@ public:
         const int32_t toolType = OH_ArkUI_UIInputEvent_GetToolType(event);
         if (sourceType == UI_INPUT_EVENT_SOURCE_TYPE_MOUSE ||
             toolType == UI_INPUT_EVENT_TOOL_TYPE_MOUSE) {
+            if (TrySendTerminalWheelEvent(vertical, cellHeight)) {
+                return;
+            }
+
             constexpr double kWheelStepDegrees = 15.0;
             const int scrollLines = std::max(1, static_cast<int>(std::lround(std::abs(vertical) / kWheelStepDegrees)));
             m_terminal->scrollView(vertical > 0.0 ? scrollLines : -scrollLines);
@@ -1111,6 +1268,12 @@ public:
         }
     }
 
+    void PasteText(const std::string& data) {
+        if (m_terminal && !data.empty()) {
+            m_terminal->pasteText(data);
+        }
+    }
+
     void FeedOutput(const std::string& data) {
         if (m_terminal && !data.empty()) {
             m_terminal->feedOutput(data.data(), data.size());
@@ -1122,6 +1285,10 @@ public:
         std::string drained;
         drained.swap(m_pendingInput);
         return drained;
+    }
+
+    std::string DrainPendingTitle() {
+        return m_terminal ? m_terminal->drainPendingTitle() : std::string();
     }
 
     void SetInputCallback(napi_env env, napi_value callback)
@@ -1352,6 +1519,21 @@ public:
         return true;
     }
 
+    bool RegisterCustomFont(const std::string& fontPath) {
+        if (!m_renderer || !m_renderer->registerCustomFont(fontPath)) {
+            return false;
+        }
+
+        if (m_terminal && m_windowWidth > 0 && m_windowHeight > 0) {
+            int cols = 80;
+            int rows = 24;
+            ComputeTerminalSize(m_windowWidth, m_windowHeight, cols, rows);
+            m_terminal->resize(cols, rows);
+        }
+        RequestRender();
+        return true;
+    }
+
     std::vector<std::string> GetThemeList() const {
         std::vector<std::string> themes;
         if (!m_resourceManager) {
@@ -1376,11 +1558,13 @@ public:
         return themes;
     }
 
-    void SetConfig(int fontSize, int scrollbackLines, uint32_t bgColor, uint32_t fgColor, int cursorStyle, bool cursorBlink) {
+    void SetConfig(int fontSize, int scrollbackLines, uint32_t bgColor, uint32_t fgColor, int cursorStyle,
+                   bool cursorBlink, double bgOpacity) {
         m_fontSize = static_cast<float>(fontSize);
 
         if (m_renderer) {
             m_renderer->setFontSize(m_fontSize);
+            m_renderer->setBackgroundOpacity(static_cast<float>(bgOpacity));
             m_renderer->setColors(bgColor, fgColor);
             m_renderer->setCursorStyle(cursorStyle, cursorBlink);
         }
@@ -1615,6 +1799,223 @@ private:
         col = static_cast<int>(x / cellWidth);
         row = std::max(0, row);
         col = std::max(0, col);
+    }
+
+    void GetTerminalPixelSize(float cellWidth, float cellHeight, uint32_t& screenWidth, uint32_t& screenHeight) const {
+        screenWidth = m_windowWidth;
+        screenHeight = m_windowHeight;
+        if ((screenWidth == 0 || screenHeight == 0) && m_terminal) {
+            screenWidth = std::max<uint32_t>(
+                1U,
+                static_cast<uint32_t>(std::lround(cellWidth * static_cast<float>(m_terminal->getCols()))));
+            screenHeight = std::max<uint32_t>(
+                1U,
+                static_cast<uint32_t>(std::lround(cellHeight * static_cast<float>(m_terminal->getRows()))));
+        }
+        screenWidth = std::max<uint32_t>(1U, screenWidth);
+        screenHeight = std::max<uint32_t>(1U, screenHeight);
+    }
+
+    TerminalMouseAction MapMouseAction(int32_t action) const {
+        switch (action) {
+            case OH_NATIVEXCOMPONENT_MOUSE_PRESS:
+                return TerminalMouseAction::Press;
+            case OH_NATIVEXCOMPONENT_MOUSE_RELEASE:
+            case OH_NATIVEXCOMPONENT_MOUSE_CANCEL:
+                return TerminalMouseAction::Release;
+            case OH_NATIVEXCOMPONENT_MOUSE_MOVE:
+            case OH_NATIVEXCOMPONENT_MOUSE_NONE:
+            default:
+                return TerminalMouseAction::Motion;
+        }
+    }
+
+    TerminalMouseButton MapMouseButton(int32_t button) const {
+        switch (button) {
+            case OH_NATIVEXCOMPONENT_LEFT_BUTTON:
+                return TerminalMouseButton::Left;
+            case OH_NATIVEXCOMPONENT_RIGHT_BUTTON:
+                return TerminalMouseButton::Right;
+            default:
+                return TerminalMouseButton::None;
+        }
+    }
+
+    void ResetLocalMouseTrackingState() {
+        m_isMousePressed = false;
+        m_trackedPressButton = TerminalMouseButton::None;
+        m_isMouseSelecting = false;
+        m_mouseDragged = false;
+        m_mouseHadSelectionOnPress = false;
+        m_mousePressOnSelection = false;
+    }
+
+    // Forward a synthesized left-button mouse event for a touch gesture while
+    // the application has mouse tracking enabled.
+    void SendTouchMouseEvent(TerminalMouseAction action,
+                             float x,
+                             float y,
+                             bool anyButtonPressed,
+                             float cellWidth,
+                             float cellHeight) {
+        if (!m_terminal) {
+            return;
+        }
+        uint32_t screenWidth = 0;
+        uint32_t screenHeight = 0;
+        GetTerminalPixelSize(cellWidth, cellHeight, screenWidth, screenHeight);
+        m_terminal->sendMouseEvent(
+            action,
+            TerminalMouseButton::Left,
+            0,
+            x,
+            y,
+            screenWidth,
+            screenHeight,
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellWidth))),
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellHeight))),
+            anyButtonPressed);
+    }
+
+    // Convert vertical touch travel into wheel events (natural scrolling)
+    // while mouse tracking is active; one wheel step per cell height.
+    void ForwardTouchWheel(float dyPixels, float cellWidth, float cellHeight, float x, float y) {
+        if (!m_terminal) {
+            return;
+        }
+        m_touchWheelRemainderY += dyPixels;
+        const float step = std::max(1.0f, cellHeight);
+        uint32_t screenWidth = 0;
+        uint32_t screenHeight = 0;
+        GetTerminalPixelSize(cellWidth, cellHeight, screenWidth, screenHeight);
+        const uint32_t cellWidthPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellWidth)));
+        const uint32_t cellHeightPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellHeight)));
+        while (std::abs(m_touchWheelRemainderY) >= step) {
+            const TerminalMouseButton wheelButton = m_touchWheelRemainderY > 0.0f
+                ? TerminalMouseButton::WheelDown
+                : TerminalMouseButton::WheelUp;
+            m_terminal->sendMouseEvent(
+                TerminalMouseAction::Press,
+                wheelButton,
+                0,
+                x,
+                y,
+                screenWidth,
+                screenHeight,
+                cellWidthPx,
+                cellHeightPx,
+                false);
+            m_touchWheelRemainderY += m_touchWheelRemainderY > 0.0f ? -step : step;
+        }
+    }
+
+    bool TrySendTerminalMouseEvent(const OH_NativeXComponent_MouseEvent& mouseEvent,
+                                   float cellWidth,
+                                   float cellHeight) {
+        if (!m_terminal || !m_terminal->isMouseTrackingEnabled()) {
+            return false;
+        }
+        if (mouseEvent.action == OH_NATIVEXCOMPONENT_MOUSE_NONE) {
+            return false;
+        }
+
+        const TerminalMouseAction action = MapMouseAction(mouseEvent.action);
+        TerminalMouseButton button = TerminalMouseButton::None;
+        if (action != TerminalMouseAction::Motion) {
+            button = MapMouseButton(mouseEvent.button);
+            if (button == TerminalMouseButton::None) {
+                return false;
+            }
+        } else if (m_isMousePressed) {
+            // Drag motion must report the held button (xterm button-motion
+            // encoding) so TUIs like tmux can drag pane splitters.
+            button = m_trackedPressButton;
+        }
+
+        uint32_t screenWidth = 0;
+        uint32_t screenHeight = 0;
+        GetTerminalPixelSize(cellWidth, cellHeight, screenWidth, screenHeight);
+        const uint32_t cellWidthPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellWidth)));
+        const uint32_t cellHeightPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellHeight)));
+        const bool isPress = mouseEvent.action == OH_NATIVEXCOMPONENT_MOUSE_PRESS;
+        const bool isRelease = mouseEvent.action == OH_NATIVEXCOMPONENT_MOUSE_RELEASE ||
+            mouseEvent.action == OH_NATIVEXCOMPONENT_MOUSE_CANCEL;
+        const bool anyButtonPressed = isPress || (m_isMousePressed && !isRelease);
+
+        const bool sent = m_terminal->sendMouseEvent(
+            action,
+            button,
+            0,
+            mouseEvent.x,
+            mouseEvent.y,
+            screenWidth,
+            screenHeight,
+            cellWidthPx,
+            cellHeightPx,
+            anyButtonPressed);
+        if (!sent) {
+            return false;
+        }
+
+        if (isPress) {
+            m_isMousePressed = true;
+            m_trackedPressButton = button;
+            m_isMouseSelecting = false;
+            m_mouseDragged = false;
+            m_mouseHadSelectionOnPress = false;
+            m_mousePressOnSelection = false;
+        } else if (isRelease) {
+            ResetLocalMouseTrackingState();
+        } else if (m_isMousePressed) {
+            m_mouseDragged = true;
+        }
+        return true;
+    }
+
+    bool TrySendTerminalWheelEvent(double vertical, float cellHeight) {
+        if (!m_terminal || !m_renderer || !m_terminal->isMouseTrackingEnabled()) {
+            return false;
+        }
+
+        const float cellWidth = m_renderer->getCellWidth();
+        if (!std::isfinite(cellWidth) || cellWidth <= 0.0f) {
+            return false;
+        }
+
+        uint32_t screenWidth = 0;
+        uint32_t screenHeight = 0;
+        GetTerminalPixelSize(cellWidth, cellHeight, screenWidth, screenHeight);
+        const uint32_t cellWidthPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellWidth)));
+        const uint32_t cellHeightPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellHeight)));
+        constexpr double kWheelStepDegrees = 15.0;
+        const int wheelSteps =
+            std::max(1, static_cast<int>(std::lround(std::abs(vertical) / kWheelStepDegrees)));
+        const TerminalMouseButton button =
+            vertical > 0.0 ? TerminalMouseButton::WheelDown : TerminalMouseButton::WheelUp;
+        const float x = m_lastMousePositionKnown ? m_lastMouseX : 0.0f;
+        const float y = m_lastMousePositionKnown ? m_lastMouseY : 0.0f;
+
+        bool sent = false;
+        for (int i = 0; i < wheelSteps; ++i) {
+            sent = m_terminal->sendMouseEvent(
+                TerminalMouseAction::Press,
+                button,
+                0,
+                x,
+                y,
+                screenWidth,
+                screenHeight,
+                cellWidthPx,
+                cellHeightPx,
+                false) || sent;
+        }
+        return sent;
     }
 
     bool QueueLinkActivationAtPoint(float x, float y, float cellWidth, float cellHeight) {
@@ -2213,10 +2614,16 @@ private:
     bool m_isTouching = false;
     bool m_isSelecting = false;
     bool m_isMousePressed = false;
+    TerminalMouseButton m_trackedPressButton = TerminalMouseButton::None;
+    bool m_touchMouseDragActive = false;
+    float m_touchWheelRemainderY = 0.0f;
     bool m_isMouseSelecting = false;
     bool m_mouseDragged = false;
     bool m_mouseHadSelectionOnPress = false;
     bool m_mousePressOnSelection = false;
+    float m_lastMouseX = 0.0f;
+    float m_lastMouseY = 0.0f;
+    bool m_lastMousePositionKnown = false;
     int m_mousePressRow = 0;
     int m_mousePressCol = 0;
     int m_lastClickRow = -1;
@@ -2408,6 +2815,22 @@ static napi_value FeedOutput(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+static napi_value PasteText(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, args);
+    if (!host || argc < 1) {
+        return nullptr;
+    }
+
+    size_t strLen = 0;
+    napi_get_value_string_utf8(env, args[0], nullptr, 0, &strLen);
+    std::vector<char> buffer(strLen + 1, '\0');
+    napi_get_value_string_utf8(env, args[0], buffer.data(), buffer.size(), &strLen);
+    host->PasteText(std::string(buffer.data(), strLen));
+    return nullptr;
+}
+
 static napi_value DrainPendingInput(napi_env env, napi_callback_info info) {
     size_t argc = 0;
     TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
@@ -2438,6 +2861,15 @@ static napi_value SetInputCallback(napi_env env, napi_callback_info info) {
         host->ClearInputCallback();
     }
     return nullptr;
+}
+
+static napi_value DrainPendingTitle(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    napi_value result;
+    const std::string title = host ? host->DrainPendingTitle() : std::string();
+    napi_create_string_utf8(env, title.c_str(), title.length(), &result);
+    return result;
 }
 
 static napi_value DrainPendingLinkActivation(napi_env env, napi_callback_info info) {
@@ -2822,12 +3254,14 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     napi_value fgColorVal;
     napi_value cursorStyleVal;
     napi_value cursorBlinkVal;
+    napi_value bgOpacityVal = nullptr;
     napi_get_named_property(env, args[0], "fontSize", &fontSizeVal);
     napi_get_named_property(env, args[0], "scrollbackLines", &scrollbackVal);
     napi_get_named_property(env, args[0], "bgColor", &bgColorVal);
     napi_get_named_property(env, args[0], "fgColor", &fgColorVal);
     napi_get_named_property(env, args[0], "cursorStyle", &cursorStyleVal);
     napi_get_named_property(env, args[0], "cursorBlink", &cursorBlinkVal);
+    napi_get_named_property(env, args[0], "bgOpacity", &bgOpacityVal);
 
     int32_t fontSize = 14;
     int32_t scrollbackLines = 10000;
@@ -2835,6 +3269,7 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     uint32_t fgColor = 0xFFFFFFFF;
     int32_t cursorStyle = 0;
     bool cursorBlink = true;
+    double bgOpacity = 1.0;
 
     napi_get_value_int32(env, fontSizeVal, &fontSize);
     napi_get_value_int32(env, scrollbackVal, &scrollbackLines);
@@ -2842,8 +3277,31 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     napi_get_value_uint32(env, fgColorVal, &fgColor);
     napi_get_value_int32(env, cursorStyleVal, &cursorStyle);
     napi_get_value_bool(env, cursorBlinkVal, &cursorBlink);
-    host->SetConfig(fontSize, scrollbackLines, bgColor, fgColor, cursorStyle, cursorBlink);
+    if (bgOpacityVal != nullptr) {
+        napi_get_value_double(env, bgOpacityVal, &bgOpacity);
+    }
+    if (!(bgOpacity >= 0.0 && bgOpacity <= 1.0)) {
+        bgOpacity = 1.0;
+    }
+    host->SetConfig(fontSize, scrollbackLines, bgColor, fgColor, cursorStyle, cursorBlink, bgOpacity);
     return nullptr;
+}
+
+static napi_value RegisterCustomFont(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, args);
+    napi_value result;
+    bool registered = false;
+    if (host && argc >= 1) {
+        size_t strLen = 0;
+        napi_get_value_string_utf8(env, args[0], nullptr, 0, &strLen);
+        std::vector<char> buffer(strLen + 1, '\0');
+        napi_get_value_string_utf8(env, args[0], buffer.data(), buffer.size(), &strLen);
+        registered = host->RegisterCustomFont(std::string(buffer.data(), strLen));
+    }
+    napi_get_boolean(env, registered, &result);
+    return result;
 }
 
 static napi_value IsRendererReady(napi_env env, napi_callback_info info) {
@@ -2901,6 +3359,9 @@ static napi_value Init(napi_env env, napi_value exports) {
 
     napi_property_descriptor desc[] = {
         {"writeInput", nullptr, WriteInput, nullptr, nullptr, nullptr, napi_default, host},
+        {"pasteText", nullptr, PasteText, nullptr, nullptr, nullptr, napi_default, host},
+        {"registerCustomFont", nullptr, RegisterCustomFont, nullptr, nullptr, nullptr, napi_default, host},
+        {"drainPendingTitle", nullptr, DrainPendingTitle, nullptr, nullptr, nullptr, napi_default, host},
         {"feedOutput", nullptr, FeedOutput, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingInput", nullptr, DrainPendingInput, nullptr, nullptr, nullptr, napi_default, host},
         {"setInputCallback", nullptr, SetInputCallback, nullptr, nullptr, nullptr, napi_default, host},

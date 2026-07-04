@@ -8,7 +8,7 @@ export interface ConnectionProfile {
 }
 
 export function createFusionVmProfile(host: string, port: number, user: string, password: string): ConnectionProfile {
-  const normalizedHost = host.trim().length > 0 ? host.trim() : 'bruce';
+  const normalizedHost = host.trim().length > 0 ? host.trim() : '172.16.100.2';
   const normalizedUser = user.trim().length > 0 ? user.trim() : 'user';
   return {
     id: `${normalizedUser}@${normalizedHost}:${port}`,
@@ -19,4 +19,3 @@ export function createFusionVmProfile(host: string, port: number, user: string, 
     password
   };
 }
-

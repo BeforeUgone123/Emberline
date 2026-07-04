@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 #include <sys/wait.h>
 #include "pty/pty_handler.h"
@@ -140,6 +141,11 @@ public:
             session->disconnect();
         }
         PTYHandler::close(masterFd, writeFd, childPid);
+
+        {
+            std::lock_guard<std::mutex> lock(m_outputMutex);
+            m_pendingUtf8.clear();
+        }
     }
 
     void Write(const std::string& data)
@@ -294,34 +300,75 @@ private:
         }
     }
 
+    // Byte streams from the PTY/SSH reader are chunked arbitrarily, so a
+    // multi-byte UTF-8 sequence can be split across reads. Returns the number
+    // of trailing bytes that form an incomplete sequence (0 if none).
+    static size_t TrailingIncompleteUtf8(const char* data, size_t len)
+    {
+        const size_t lookback = len < 3 ? len : 3;
+        for (size_t back = 1; back <= lookback; ++back) {
+            const unsigned char byte = static_cast<unsigned char>(data[len - back]);
+            if ((byte & 0xC0) == 0x80) {
+                continue; // continuation byte, keep scanning for the lead
+            }
+            size_t needed = 0;
+            if ((byte & 0x80) == 0x00) {
+                needed = 1;
+            } else if ((byte & 0xE0) == 0xC0) {
+                needed = 2;
+            } else if ((byte & 0xF0) == 0xE0) {
+                needed = 3;
+            } else if ((byte & 0xF8) == 0xF0) {
+                needed = 4;
+            } else {
+                return 0; // invalid lead; let the consumer replace it
+            }
+            return needed > back ? back : 0;
+        }
+        return 0;
+    }
+
     void EmitOutput(const std::string& data)
     {
         if (data.empty()) {
             return;
         }
 
+        std::string chunk;
+        {
+            std::lock_guard<std::mutex> lock(m_outputMutex);
+            m_pendingUtf8 += data;
+            const size_t tail = TrailingIncompleteUtf8(m_pendingUtf8.data(), m_pendingUtf8.size());
+            if (tail >= m_pendingUtf8.size()) {
+                return; // only an incomplete sequence buffered; wait for more
+            }
+            chunk = m_pendingUtf8.substr(0, m_pendingUtf8.size() - tail);
+            m_pendingUtf8.erase(0, m_pendingUtf8.size() - tail);
+        }
+
         napi_threadsafe_function tsfn = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_outputMutex);
             if (m_outputTsfn == nullptr) {
-                m_outputBuffer += data;
+                m_outputBuffer += chunk;
                 return;
             }
             tsfn = m_outputTsfn;
         }
 
-        auto* output = new std::string(data);
+        auto* output = new std::string(std::move(chunk));
         const napi_status status = napi_call_threadsafe_function(tsfn, output, napi_tsfn_nonblocking);
         if (status != napi_ok) {
-            delete output;
             std::lock_guard<std::mutex> lock(m_outputMutex);
-            m_outputBuffer += data;
+            m_outputBuffer += *output;
+            delete output;
         }
     }
 
     std::mutex m_mutex;
     std::mutex m_outputMutex;
     std::string m_outputBuffer;
+    std::string m_pendingUtf8;
     napi_threadsafe_function m_outputTsfn = nullptr;
     std::string m_filesDir;
     std::thread m_localReadThread;
@@ -335,10 +382,18 @@ private:
     int m_rows = DEFAULT_ROWS;
 };
 
-FusionTerminalDriver& GetDriver()
+// Each ArkTS FusionTerminalDriver owns one native session so multiple app
+// windows (multiton ability instances share this process) cannot stomp on a
+// single global PTY/SSH connection.
+std::mutex g_sessionsMutex;
+std::unordered_map<int32_t, std::shared_ptr<FusionTerminalDriver>> g_sessions;
+int32_t g_nextSessionId = 1;
+
+std::shared_ptr<FusionTerminalDriver> FindSession(int32_t sessionId)
 {
-    static FusionTerminalDriver driver;
-    return driver;
+    std::lock_guard<std::mutex> lock(g_sessionsMutex);
+    auto it = g_sessions.find(sessionId);
+    return it == g_sessions.end() ? nullptr : it->second;
 }
 
 void SetNamedFunction(napi_env env, napi_value exports, const char* name, napi_callback callback)
@@ -373,65 +428,135 @@ int32_t ReadIntArg(napi_env env, napi_value value, int32_t fallback)
     return result;
 }
 
-napi_value Initialize(napi_env env, napi_callback_info info)
+napi_value CreateSession(napi_env env, napi_callback_info info)
+{
+    int32_t sessionId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_sessionsMutex);
+        sessionId = g_nextSessionId++;
+        g_sessions.emplace(sessionId, std::make_shared<FusionTerminalDriver>());
+    }
+    napi_value result;
+    napi_create_int32(env, sessionId, &result);
+    return result;
+}
+
+napi_value DestroySession(napi_env env, napi_callback_info info)
 {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (argc >= 1) {
-        GetDriver().Initialize(ReadStringArg(env, args[0]));
+    if (argc < 1) {
+        return ReturnUndefined(env);
+    }
+
+    std::shared_ptr<FusionTerminalDriver> session;
+    {
+        std::lock_guard<std::mutex> lock(g_sessionsMutex);
+        auto it = g_sessions.find(ReadIntArg(env, args[0], -1));
+        if (it != g_sessions.end()) {
+            session = std::move(it->second);
+            g_sessions.erase(it);
+        }
+    }
+    if (session) {
+        session->ClearOutputCallback();
+        session->Stop();
+    }
+    return ReturnUndefined(env);
+}
+
+napi_value Initialize(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) {
+        return ReturnUndefined(env);
+    }
+    if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+        session->Initialize(ReadStringArg(env, args[1]));
     }
     return ReturnUndefined(env);
 }
 
 napi_value StartLocal(napi_env env, napi_callback_info info)
 {
-    size_t argc = 2;
-    napi_value args[2] = {nullptr, nullptr};
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    const int32_t cols = argc >= 1 ? ReadIntArg(env, args[0], DEFAULT_COLS) : DEFAULT_COLS;
-    const int32_t rows = argc >= 2 ? ReadIntArg(env, args[1], DEFAULT_ROWS) : DEFAULT_ROWS;
+    const int32_t cols = argc >= 2 ? ReadIntArg(env, args[1], DEFAULT_COLS) : DEFAULT_COLS;
+    const int32_t rows = argc >= 3 ? ReadIntArg(env, args[2], DEFAULT_ROWS) : DEFAULT_ROWS;
+    bool started = false;
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            started = session->StartLocal(cols, rows);
+        }
+    }
     napi_value result;
-    napi_get_boolean(env, GetDriver().StartLocal(cols, rows), &result);
+    napi_get_boolean(env, started, &result);
     return result;
 }
 
 napi_value ConnectSsh(napi_env env, napi_callback_info info)
 {
-    size_t argc = 6;
-    napi_value args[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 7;
+    napi_value args[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    const std::string host = argc >= 1 ? ReadStringArg(env, args[0]) : "";
-    const int32_t port = argc >= 2 ? ReadIntArg(env, args[1], 22) : 22;
-    const std::string user = argc >= 3 ? ReadStringArg(env, args[2]) : "";
-    const std::string password = argc >= 4 ? ReadStringArg(env, args[3]) : "";
-    const int32_t cols = argc >= 5 ? ReadIntArg(env, args[4], DEFAULT_COLS) : DEFAULT_COLS;
-    const int32_t rows = argc >= 6 ? ReadIntArg(env, args[5], DEFAULT_ROWS) : DEFAULT_ROWS;
+    const std::string host = argc >= 2 ? ReadStringArg(env, args[1]) : "";
+    const int32_t port = argc >= 3 ? ReadIntArg(env, args[2], 22) : 22;
+    const std::string user = argc >= 4 ? ReadStringArg(env, args[3]) : "";
+    const std::string password = argc >= 5 ? ReadStringArg(env, args[4]) : "";
+    const int32_t cols = argc >= 6 ? ReadIntArg(env, args[5], DEFAULT_COLS) : DEFAULT_COLS;
+    const int32_t rows = argc >= 7 ? ReadIntArg(env, args[6], DEFAULT_ROWS) : DEFAULT_ROWS;
+    bool connected = false;
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            connected = session->ConnectSsh(host, port, user, password, cols, rows);
+        }
+    }
     napi_value result;
-    napi_get_boolean(env, GetDriver().ConnectSsh(host, port, user, password, cols, rows), &result);
+    napi_get_boolean(env, connected, &result);
     return result;
 }
 
 napi_value Stop(napi_env env, napi_callback_info info)
 {
-    GetDriver().Stop();
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            session->Stop();
+        }
+    }
     return ReturnUndefined(env);
 }
 
 napi_value WriteInput(napi_env env, napi_callback_info info)
 {
-    size_t argc = 1;
-    napi_value args[1] = {nullptr};
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (argc >= 1) {
-        GetDriver().Write(ReadStringArg(env, args[0]));
+    if (argc >= 2) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            session->Write(ReadStringArg(env, args[1]));
+        }
     }
     return ReturnUndefined(env);
 }
 
 napi_value DrainOutput(napi_env env, napi_callback_info info)
 {
-    const std::string output = GetDriver().DrainOutput();
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string output;
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            output = session->DrainOutput();
+        }
+    }
     napi_value result;
     napi_create_string_utf8(env, output.c_str(), output.length(), &result);
     return result;
@@ -439,37 +564,49 @@ napi_value DrainOutput(napi_env env, napi_callback_info info)
 
 napi_value SetOutputCallback(napi_env env, napi_callback_info info)
 {
-    size_t argc = 1;
-    napi_value args[1] = {nullptr};
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     if (argc < 1) {
-        GetDriver().ClearOutputCallback();
+        return ReturnUndefined(env);
+    }
+
+    auto session = FindSession(ReadIntArg(env, args[0], -1));
+    if (!session) {
         return ReturnUndefined(env);
     }
 
     napi_valuetype valueType = napi_undefined;
-    napi_typeof(env, args[0], &valueType);
+    if (argc >= 2) {
+        napi_typeof(env, args[1], &valueType);
+    }
     if (valueType == napi_function) {
-        GetDriver().SetOutputCallback(env, args[0]);
+        session->SetOutputCallback(env, args[1]);
     } else {
-        GetDriver().ClearOutputCallback();
+        session->ClearOutputCallback();
     }
     return ReturnUndefined(env);
 }
 
 napi_value Resize(napi_env env, napi_callback_info info)
 {
-    size_t argc = 2;
-    napi_value args[2] = {nullptr, nullptr};
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    const int32_t cols = argc >= 1 ? ReadIntArg(env, args[0], DEFAULT_COLS) : DEFAULT_COLS;
-    const int32_t rows = argc >= 2 ? ReadIntArg(env, args[1], DEFAULT_ROWS) : DEFAULT_ROWS;
-    GetDriver().Resize(cols, rows);
+    const int32_t cols = argc >= 2 ? ReadIntArg(env, args[1], DEFAULT_COLS) : DEFAULT_COLS;
+    const int32_t rows = argc >= 3 ? ReadIntArg(env, args[2], DEFAULT_ROWS) : DEFAULT_ROWS;
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            session->Resize(cols, rows);
+        }
+    }
     return ReturnUndefined(env);
 }
 
 napi_value Init(napi_env env, napi_value exports)
 {
+    SetNamedFunction(env, exports, "createSession", CreateSession);
+    SetNamedFunction(env, exports, "destroySession", DestroySession);
     SetNamedFunction(env, exports, "initialize", Initialize);
     SetNamedFunction(env, exports, "startLocal", StartLocal);
     SetNamedFunction(env, exports, "connectSsh", ConnectSsh);

@@ -18,9 +18,12 @@ export interface DriverStatus {
 type DriverStatusListener = (status: DriverStatus) => void;
 
 export class FusionTerminalDriver {
+  private sessionId: number = -1;
   private controller: TerminalController | null = null;
   private context: common.UIAbilityContext | null = null;
   private started: boolean = false;
+  private startRequested: boolean = false;
+  private nativeInitialized: boolean = false;
   private startRetryTimer: number = -1;
   private lastCols: number = 0;
   private lastRows: number = 0;
@@ -29,7 +32,9 @@ export class FusionTerminalDriver {
   private statusListener: DriverStatusListener | null = null;
 
   private readonly inputListener: TerminalInputListener = (data: string): void => {
-    nativeDriver.writeInput(data);
+    if (this.sessionId >= 0) {
+      nativeDriver.writeInput(this.sessionId, data);
+    }
   };
 
   private readonly outputListener = (data: string): void => {
@@ -43,7 +48,7 @@ export class FusionTerminalDriver {
       this.startWhenSized();
       return;
     }
-    this.stopNativeSession();
+    this.stopNativeSession(true);
   };
 
   private readonly sizeListener = (size: TerminalSize): void => {
@@ -64,7 +69,9 @@ export class FusionTerminalDriver {
 
     this.lastCols = cols;
     this.lastRows = rows;
-    nativeDriver.resize(cols, rows);
+    if (this.sessionId >= 0) {
+      nativeDriver.resize(this.sessionId, cols, rows);
+    }
   };
 
   attach(controller: TerminalController, context: common.UIAbilityContext): void {
@@ -82,40 +89,46 @@ export class FusionTerminalDriver {
       this.controller.setAttachmentListener(null);
       this.controller.setSizeListener(null);
     }
-    this.stopNativeSession();
+    this.stopNativeSession(true);
+    if (this.sessionId >= 0) {
+      nativeDriver.destroySession(this.sessionId);
+      this.sessionId = -1;
+    }
     this.controller = null;
     this.context = null;
   }
 
   setStatusListener(listener: DriverStatusListener | null): void {
     this.statusListener = listener;
-    this.emitStatus(false, this.mode, 'Idle', '');
+    this.emitStatus(false, this.mode, '待机', '');
   }
 
   startLocal(): void {
     this.mode = 'local';
     this.pendingProfile = null;
+    this.startRequested = true;
     this.restart();
   }
 
   connectSsh(profile: ConnectionProfile): void {
     this.mode = 'ssh';
     this.pendingProfile = profile;
+    this.startRequested = true;
     this.restart();
   }
 
   stop(): void {
-    this.stopNativeSession();
-    this.emitStatus(false, this.mode, 'Stopped', '');
+    this.stopNativeSession(true);
+    this.emitStatus(false, this.mode, '已停止', '');
   }
 
   private restart(): void {
-    this.stopNativeSession();
+    this.stopNativeSession(false);
     this.startWhenSized();
   }
 
   private startWhenSized(): void {
-    if (this.started || !this.controller || !this.context) {
+    if (!this.startRequested || this.started || !this.controller || !this.context) {
       return;
     }
 
@@ -127,11 +140,16 @@ export class FusionTerminalDriver {
       return;
     }
 
-    nativeDriver.initialize(this.context.filesDir);
-    nativeDriver.setOutputCallback(this.outputListener);
+    if (this.sessionId < 0) {
+      this.sessionId = nativeDriver.createSession();
+    }
+    nativeDriver.initialize(this.sessionId, this.context.filesDir);
+    this.nativeInitialized = true;
+    nativeDriver.setOutputCallback(this.sessionId, this.outputListener);
 
     if (this.mode === 'ssh' && this.pendingProfile) {
       this.started = nativeDriver.connectSsh(
+        this.sessionId,
         this.pendingProfile.host,
         this.pendingProfile.port,
         this.pendingProfile.user,
@@ -144,8 +162,8 @@ export class FusionTerminalDriver {
       this.emitStatus(
         this.started,
         'ssh',
-        this.started ? this.pendingProfile.title : 'SSH failed',
-        this.started ? '' : 'Unable to connect to Fusion VM'
+        this.started ? this.pendingProfile.title : 'SSH 连接失败',
+        this.started ? '' : '无法连接 Fusion VM'
       );
       if (!this.started) {
         this.scheduleStartRetry();
@@ -153,26 +171,32 @@ export class FusionTerminalDriver {
       return;
     }
 
-    this.started = nativeDriver.startLocal(cols, rows);
+    this.started = nativeDriver.startLocal(this.sessionId, cols, rows);
     this.lastCols = cols;
     this.lastRows = rows;
-    this.emitStatus(this.started, 'local', this.started ? 'Local PTY' : 'Local PTY failed', '');
+    this.emitStatus(this.started, 'local', this.started ? '本地 PTY' : '本地 PTY 启动失败', '');
     if (!this.started) {
       this.scheduleStartRetry();
     }
   }
 
-  private stopNativeSession(): void {
+  private stopNativeSession(clearRequest: boolean): void {
     this.stopStartRetry();
-    nativeDriver.setOutputCallback(null);
-    if (this.started) {
-      nativeDriver.stop();
-    } else {
-      nativeDriver.stop();
+    if (this.nativeInitialized && this.sessionId >= 0) {
+      try {
+        nativeDriver.setOutputCallback(this.sessionId, null);
+        nativeDriver.stop(this.sessionId);
+      } catch (err) {
+        console.error('Failed to stop native terminal driver: ' + JSON.stringify(err));
+      }
+      this.nativeInitialized = false;
     }
     this.started = false;
     this.lastCols = 0;
     this.lastRows = 0;
+    if (clearRequest) {
+      this.startRequested = false;
+    }
   }
 
   private scheduleStartRetry(): void {
@@ -197,7 +221,9 @@ export class FusionTerminalDriver {
     if (!this.statusListener) {
       return;
     }
-    this.statusListener({ connected, mode, label, error });
+    const safeMode = mode || 'local';
+    const safeLabel = label || '';
+    const safeError = error || '';
+    this.statusListener({ connected, mode: safeMode, label: safeLabel, error: safeError });
   }
 }
-
