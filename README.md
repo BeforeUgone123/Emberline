@@ -108,11 +108,63 @@ hvigorw assembleHap --mode module -p product=default -p module=entry@default --n
 
 改动 `libghostty_ohos/` 下的 C++ 后需要完整重编(HAR 会随 entry 一起构建)。
 
-### 连接 Agent(可选)
+### 在融合开发引擎 Linux VM 部署 wand-agent(Agent 会话后端)
 
-在 Linux VM/远端主机部署 `wand-agent` 后,在应用内设置抽屉「连接」页填入
-WebSocket 地址与 token(默认示例 `ws://172.16.100.2:8765/ws`)。SSH 与本地
-shell 无需任何服务端组件。
+Agent 会话面向 HarmonyOS PC「融合开发引擎」(Fusion Development Engine)自带
+的 Linux 虚拟机:VM 与宿主经桥接网络互通(VM 侧地址通常为
+`172.16.100.2`),Emberline 通过 WebSocket PTY 直连,零上传共享目录、断线
+自动重连。SSH 与本地 shell 无需任何服务端组件,可跳过本节。
+
+**1. 安装(VM 内,二选一)**
+
+方式 A — 从源码构建(需要 Go 1.21+):
+
+```sh
+git clone https://github.com/beforeugone520/wand-agent.git
+cd wand-agent
+go build -o wand-agent .
+install -m 755 wand-agent /usr/local/bin/
+```
+
+方式 B — 直接部署预构建二进制:把构建好的 `wand-agent` 拷进 VM(如经共享
+目录),放到 `/usr/local/bin/` 并 `chmod +x`。
+
+**2. 运行**
+
+```sh
+wand-agent --host 172.16.100.2 --token <你的token>
+```
+
+默认监听 `8765` 端口、路径 `/ws`;`--host` 绑定 VM 桥接网卡地址,`--token`
+是 Bearer 鉴权令牌(应用侧需填一致)。前台跑通后建议改为 systemd 常驻:
+
+```ini
+# /etc/systemd/system/wand-agent.service
+[Unit]
+Description=wand-agent WebSocket PTY for Emberline
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2 --token <你的token>
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+systemctl daemon-reload && systemctl enable --now wand-agent
+```
+
+**3. 应用侧连接**
+
+在 Emberline 设置抽屉「连接」页填入地址与 token(默认示例
+`ws://172.16.100.2:8765/ws`),点「连接 Agent」;应用会自动记住并在下次
+启动时重连。
+
+**安全提示**:token 鉴权面向可信的 VM 桥接网络;若把 agent 暴露到桥接网络
+之外,请更换强随机 token 并配合防火墙限制来源。
 
 ### 代码质量门
 

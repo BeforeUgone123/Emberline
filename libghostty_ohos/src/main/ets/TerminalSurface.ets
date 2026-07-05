@@ -327,6 +327,12 @@ export struct TerminalSurface {
           .onSubmit(() => {
             this.navigateSearch(true);
           })
+          .onFocus(() => {
+            // Tapping back into the search box after touching the terminal:
+            // the terminal grabbed the IME back (requestTerminalFocus), so
+            // yield it again for the box.
+            this.controller.setImeActive(false);
+          })
 
         Text(this.searchLabel())
           .fontSize(13)
@@ -777,6 +783,11 @@ export struct TerminalSurface {
     const nextQuery = initialQuery.length > 0 ? initialQuery : this.searchText;
     this.searchVisible = true;
     this.searchText = nextQuery;
+    // The terminal's native IME editor must YIELD while the search box owns
+    // the keyboard: with it still active, the two IME clients fight over the
+    // input method and the whole overlay reads as dead (can't type, close
+    // button's click gets broken up by the focus tug-of-war).
+    this.controller.setImeActive(false);
     this.controller.startSearch(nextQuery);
     this.syncSearchStatus();
     setTimeout(() => {
@@ -787,6 +798,7 @@ export struct TerminalSurface {
   private navigateSearch(next: boolean): void {
     this.controller.navigateSearch(next);
     this.syncSearchStatus();
+    this.controller.setImeActive(false);
     setTimeout(() => {
       focusControl.requestFocus(this.searchInputId);
     }, 0);
