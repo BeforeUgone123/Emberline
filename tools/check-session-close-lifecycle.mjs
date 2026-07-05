@@ -7,14 +7,21 @@ const protocol = await readFile('entry/src/main/ets/drivers/FusionAgentProtocol.
 const pty = await readFile('entry/src/main/cpp/pty/pty_handler.cpp', 'utf8');
 
 const closeSessionBody = index.match(/  private closeSession\(id: number\): void \{[\s\S]*?\n  \}/)?.[0] ?? '';
-assert.match(closeSessionBody, /session\.agentDriver\.terminate\(\);/,
-  'closing a terminal tab should terminate its remote agent task, not only detach UI listeners');
+assert.match(closeSessionBody, /session\.agentDriver\.detach\(\);/,
+  'closing a terminal tab should passively detach from the remote agent instead of interrupting tmux/codex');
+assert.doesNotMatch(closeSessionBody, /session\.agentDriver\.terminate\(\);/,
+  'closing a terminal tab must not send remote termination controls or Ctrl-C bytes');
 assert.match(closeSessionBody, /session\.driver\.detach\(\);/,
   'closing a terminal tab should still stop and destroy native local\/SSH sessions');
 
-const disappearBody = index.match(/  aboutToDisappear\(\): void \{[\s\S]*?\n  \}/)?.[0] ?? '';
-assert.match(disappearBody, /session\.agentDriver\.terminate\(\);/,
-  'ability teardown should terminate agent tasks for all tabs');
+// Anchor on the ability-teardown body specifically: the chip now also defines
+// an aboutToDisappear (filament breathing cleanup), so target the one that
+// starts by unregistering the foreground event hub — that is the ability's.
+const disappearBody = index.match(/  aboutToDisappear\(\): void \{\s*this\.context\?\.eventHub\.off\([\s\S]*?\n  \}/)?.[0] ?? '';
+assert.match(disappearBody, /session\.agentDriver\.detach\(\);/,
+  'ability teardown should passively detach agent sockets without injecting terminal input');
+assert.doesNotMatch(disappearBody, /session\.agentDriver\.terminate\(\);/,
+  'ability teardown must not interrupt remote foreground tasks');
 
 assert.match(protocol, /export function createTerminateMessage\(\): FusionAgentMessage \{/,
   'Fusion Agent protocol should model an explicit terminate control for hardened agents');
@@ -26,15 +33,23 @@ assert.match(agent, /createTerminateMessage/,
 assert.match(agent, /terminate\(\): void \{/,
   'agent driver should expose a termination path separate from passive socket close');
 assert.match(agent, /sendRemoteTerminationRequest\(\)/,
-  'agent driver should send a remote termination request before closing');
+  'explicit termination should still use a separate remote termination path');
 assert.match(agent, /this\.supportsTerminateControl/,
   'agent driver should only send terminate JSON when the server advertises support');
 assert.match(agent, /this\.sendSocketPayload\(stringifyFusionAgentMessage\(createTerminateMessage\(\)\)\)/,
   'hardened agents should receive terminate as a JSON control frame');
-assert.match(agent, /this\.sendSocketPayload\(this\.encodeUtf8\('\\u0003exit\\r'\)\)/,
-  'stock wand-agent fallback should receive terminal-safe Ctrl-C + exit bytes instead of unknown JSON');
+assert.doesNotMatch(agent, /encodeUtf8\('\\u0003exit\\r'\)/,
+  'stock wand-agent fallback must not receive Ctrl-C + exit bytes because that can kill tmux foreground tasks');
+assert.doesNotMatch(agent, /encodeUtf8\('\\u0003/,
+  'remote lifecycle cleanup must not be implemented by injecting Ctrl-C into the PTY');
+assert.match(agent, /detach\(\): void \{[\s\S]*?this\.closeConnection\(false, 0\);[\s\S]*?this\.controller = null;/,
+  'detach should passively close the socket and release controller listeners');
+assert.match(agent, /disconnect\(\): void \{\s*this\.closeConnection\(false, 0\);\s*\}/,
+  'manual disconnect should be passive and must not interrupt the remote PTY');
+assert.match(agent, /connect\(endpoint: FusionAgentEndpoint\): void \{\s*this\.closeConnection\(false, 0\);/,
+  'reconnecting should passively close the old socket before opening a new one');
 assert.match(agent, /private terminateCloseTimer: number = -1;/,
-  'agent driver should keep the socket alive briefly so the termination bytes can flush');
+  'agent driver should keep the socket alive briefly so an advertised terminate control can flush');
 assert.match(agent, /clearTimeout\(this\.terminateCloseTimer\)/,
   'agent driver should cancel pending termination timers during reconnect or teardown');
 

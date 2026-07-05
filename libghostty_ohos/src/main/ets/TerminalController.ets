@@ -10,8 +10,12 @@ import {
   TerminalConfig,
   TerminalConfigPatch,
   TerminalContextMenuListener,
+  TerminalCopyRequestListener,
   TerminalInputListener,
   TerminalLinkListener,
+  TerminalNotificationListener,
+  TerminalPasteRequestListener,
+  TerminalScrollbarState,
   TerminalSearchStatus,
   TerminalSize,
   TerminalTitleListener
@@ -28,7 +32,10 @@ interface TerminalNativeBridge {
   setInputCallback: (surfaceId: string, callback: ((data: string) => void) | null) => void;
   drainPendingLinkActivation: (surfaceId: string) => string;
   drainPendingTitle: (surfaceId: string) => string;
+  drainPendingNotification: (surfaceId: string) => string;
   drainPendingContextMenuRequest: (surfaceId: string) => string;
+  drainPendingCopyRequest: (surfaceId: string) => string;
+  drainPendingPasteRequest: (surfaceId: string) => string;
   resizeTerminal: (surfaceId: string, cols: number, rows: number) => void;
   getScreenContent: (surfaceId: string) => string;
   getCursorPosition: (surfaceId: string) => CursorPosition;
@@ -42,6 +49,8 @@ interface TerminalNativeBridge {
   scrollView: (surfaceId: string, delta: number) => void;
   resetScroll: (surfaceId: string) => void;
   getScrollbackSize: (surfaceId: string) => number;
+  getScrollbarState: (surfaceId: string) => TerminalScrollbarState;
+  scrollToOffset: (surfaceId: string, offset: number) => void;
   startSelection: (surfaceId: string, row: number, col: number) => void;
   updateSelection: (surfaceId: string, row: number, col: number) => void;
   clearSelection: (surfaceId: string) => void;
@@ -73,9 +82,18 @@ export class TerminalController {
   private linkListener: TerminalLinkListener | null = null;
   private contextMenuListener: TerminalContextMenuListener | null = null;
   private titleListener: TerminalTitleListener | null = null;
+  private notificationListener: TerminalNotificationListener | null = null;
+  private copyRequestListener: TerminalCopyRequestListener | null = null;
+  private pasteRequestListener: TerminalPasteRequestListener | null = null;
   private attachmentListener: TerminalAttachmentListener | null = null;
   private sizeListener: TerminalSizeListener | null = null;
   private inputPollTimer: number = -1;
+  // Hidden tabs suspend the 60Hz input drain; the surface toggles this with
+  // its `active` prop so background sessions stop burning CPU on idle polls.
+  // Titles keep flowing on a slow poll so a background tab still shows live
+  // progress (spinners in OSC titles) while it works.
+  private pollingSuspended: boolean = false;
+  private titlePollTimer: number = -1;
   private trackedWindow: window.Window | null = null;
   private windowRectListener: ((options: window.RectChangeOptions) => void) | null = null;
   private lastReportedSize: TerminalSize = { cols: 0, rows: 0 };
@@ -93,6 +111,9 @@ export class TerminalController {
     }
     this.applyConfig();
     this.startInputPolling();
+    if (this.pollingSuspended) {
+      this.startBackgroundTitlePolling();
+    }
     this.bindWindowMetadata(context);
     this.notifyAttachmentChanged(true);
   }
@@ -103,6 +124,7 @@ export class TerminalController {
     }
     this.unbindWindowMetadata();
     this.stopInputPolling();
+    this.stopBackgroundTitlePolling();
     this.native = null;
     this.nativeSurfaceId = '';
     this.notifyAttachmentChanged(false);
@@ -110,6 +132,12 @@ export class TerminalController {
 
   isAttached(): boolean {
     return this.native !== null;
+  }
+
+  // Native surface id this controller is bound to (empty when unbound). Lets a
+  // driver point the native direct-output sink at the right renderer surface.
+  getSurfaceId(): string {
+    return this.native ? this.nativeSurfaceId : '';
   }
 
   setConfig(config: TerminalConfig): void {
@@ -122,6 +150,9 @@ export class TerminalController {
     const nextConfig = cloneTerminalConfig(this.config);
     if (patch.fontSize !== undefined) {
       nextConfig.fontSize = patch.fontSize;
+    }
+    if (patch.fontFamily !== undefined) {
+      nextConfig.fontFamily = patch.fontFamily;
     }
     if (patch.scrollbackLines !== undefined) {
       nextConfig.scrollbackLines = patch.scrollbackLines;
@@ -177,34 +208,113 @@ export class TerminalController {
     if (this.native) {
       this.native.setInputCallback(this.nativeSurfaceId, this.inputListener);
     }
-    if (this.linkListener || this.contextMenuListener) {
-      this.startInputPolling();
-    } else {
-      this.stopInputPolling();
-    }
+    this.refreshInputPolling();
   }
 
   setLinkListener(listener: TerminalLinkListener | null): void {
     this.linkListener = listener;
-    if (this.inputListener || this.linkListener || this.contextMenuListener) {
-      this.startInputPolling();
-    } else {
-      this.stopInputPolling();
-    }
+    this.refreshInputPolling();
   }
 
   setContextMenuListener(listener: TerminalContextMenuListener | null): void {
     this.contextMenuListener = listener;
-    if (this.inputListener || this.linkListener || this.contextMenuListener) {
-      this.startInputPolling();
-    } else {
-      this.stopInputPolling();
-    }
+    this.refreshInputPolling();
   }
 
   setTitleListener(listener: TerminalTitleListener | null): void {
     this.titleListener = listener;
-    if (this.linkListener || this.contextMenuListener || this.titleListener) {
+    this.refreshInputPolling();
+  }
+
+  setNotificationListener(listener: TerminalNotificationListener | null): void {
+    this.notificationListener = listener;
+    this.refreshInputPolling();
+  }
+
+  setCopyRequestListener(listener: TerminalCopyRequestListener | null): void {
+    this.copyRequestListener = listener;
+    this.refreshInputPolling();
+  }
+
+  setPasteRequestListener(listener: TerminalPasteRequestListener | null): void {
+    this.pasteRequestListener = listener;
+    this.refreshInputPolling();
+  }
+
+  // One-tap accessory-bar entry points: reuse the same surface listeners the
+  // native shortcut path drains, so behaviour matches Ctrl+Shift+C / Ctrl+V.
+  requestCopy(): void {
+    if (this.copyRequestListener) {
+      this.copyRequestListener('');
+    }
+  }
+
+  requestPaste(): void {
+    if (this.pasteRequestListener) {
+      this.pasteRequestListener();
+    }
+  }
+
+  setPollingSuspended(suspended: boolean): void {
+    if (this.pollingSuspended === suspended) {
+      return;
+    }
+    this.pollingSuspended = suspended;
+    if (suspended) {
+      this.stopInputPolling();
+      this.startBackgroundTitlePolling();
+    } else {
+      this.stopBackgroundTitlePolling();
+      this.refreshInputPolling();
+    }
+  }
+
+  private drainPendingNotificationOnce(): void {
+    if (!this.native || !this.notificationListener || !this.native.drainPendingNotification) {
+      return;
+    }
+    const pending = this.native.drainPendingNotification(this.nativeSurfaceId);
+    if (pending.length > 0) {
+      this.notificationListener(pending.startsWith('T') ? pending.slice(1) : '');
+    }
+  }
+
+  private drainPendingTitleOnce(): void {
+    if (!this.native || !this.titleListener || !this.native.drainPendingTitle) {
+      return;
+    }
+    const pendingTitle = this.native.drainPendingTitle(this.nativeSurfaceId);
+    if (pendingTitle.length > 0) {
+      this.titleListener(pendingTitle);
+    }
+  }
+
+  private startBackgroundTitlePolling(): void {
+    if (this.titlePollTimer >= 0 || !this.native) {
+      return;
+    }
+    this.titlePollTimer = setInterval(() => {
+      this.drainPendingTitleOnce();
+      this.drainPendingNotificationOnce();
+    }, 500) as number;
+  }
+
+  private stopBackgroundTitlePolling(): void {
+    if (this.titlePollTimer < 0) {
+      return;
+    }
+    clearInterval(this.titlePollTimer);
+    this.titlePollTimer = -1;
+  }
+
+  private needsInputPolling(): boolean {
+    return !!(this.inputListener || this.linkListener || this.contextMenuListener ||
+      this.titleListener || this.notificationListener ||
+      this.copyRequestListener || this.pasteRequestListener);
+  }
+
+  private refreshInputPolling(): void {
+    if (this.needsInputPolling()) {
       this.startInputPolling();
     } else {
       this.stopInputPolling();
@@ -304,6 +414,20 @@ export class TerminalController {
       return 0;
     }
     return this.native.getScrollbackSize(this.nativeSurfaceId);
+  }
+
+  getScrollbarState(): TerminalScrollbarState {
+    if (!this.native) {
+      return { total: 0, offset: 0, visible: 0 };
+    }
+    return this.native.getScrollbarState(this.nativeSurfaceId);
+  }
+
+  scrollToOffset(offset: number): void {
+    if (!this.native) {
+      return;
+    }
+    this.native.scrollToOffset(this.nativeSurfaceId, offset);
   }
 
   getScreenContent(): string {
@@ -448,10 +572,22 @@ export class TerminalController {
     this.configListener(this.getConfig(), this.themeName);
   }
 
+  // Native copy requests arrive as "copy" (copy the current selection) or as
+  // "T<text>" (copy explicit text, e.g. an OSC 52 payload); an empty callback
+  // argument tells the surface to read the selection itself.
+  private dispatchCopyRequest(pendingCopy: string): void {
+    if (!this.copyRequestListener) {
+      return;
+    }
+    if (pendingCopy.startsWith('T')) {
+      this.copyRequestListener(pendingCopy.slice(1));
+      return;
+    }
+    this.copyRequestListener('');
+  }
+
   private startInputPolling(): void {
-    if (!this.native ||
-      (!this.linkListener && !this.contextMenuListener && !this.titleListener) ||
-      this.inputPollTimer >= 0) {
+    if (!this.native || !this.needsInputPolling() || this.pollingSuspended || this.inputPollTimer >= 0) {
       return;
     }
 
@@ -471,6 +607,8 @@ export class TerminalController {
         this.titleListener(pendingTitle);
       }
 
+      this.drainPendingNotificationOnce();
+
       const pendingContextMenu = this.contextMenuListener ?
         this.native.drainPendingContextMenuRequest(this.nativeSurfaceId) : '';
       if (this.contextMenuListener && pendingContextMenu.length > 0) {
@@ -481,6 +619,18 @@ export class TerminalController {
           Number.isFinite(x) ? x : 0,
           Number.isFinite(y) ? y : 0
         );
+      }
+
+      const pendingCopy = this.copyRequestListener && this.native.drainPendingCopyRequest ?
+        this.native.drainPendingCopyRequest(this.nativeSurfaceId) : '';
+      if (this.copyRequestListener && pendingCopy.length > 0) {
+        this.dispatchCopyRequest(pendingCopy);
+      }
+
+      const pendingPaste = this.pasteRequestListener ?
+        this.native.drainPendingPasteRequest(this.nativeSurfaceId) : '';
+      if (this.pasteRequestListener && pendingPaste.length > 0) {
+        this.pasteRequestListener();
       }
     }, 16) as number;
   }

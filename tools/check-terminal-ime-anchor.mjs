@@ -21,8 +21,8 @@ const nativeSurfaceShowBlock = nativeBridge.match(/void OnSurfaceShow\(OH_Native
 const nativeSurfaceHideBlock = nativeBridge.match(/void OnSurfaceHide\(\)[\s\S]*?\n    void OnSurfaceDestroyed/)?.[0] ?? '';
 const nativeFocusBlock = nativeBridge.match(/void OnFocusEvent\(\)[\s\S]*?\n    void OnBlurEvent/)?.[0] ?? '';
 const nativeBlurBlock = nativeBridge.match(/void OnBlurEvent\(\)[\s\S]*?\n    bool DispatchKeyEvent/)?.[0] ?? '';
-const indexTabBarBlock = index.match(/private buildTabBar\(\)[\s\S]*?\n  @Builder\n  private buildConnectScrim/)?.[0] ?? '';
-const indexAccessoryBlock = index.match(/private buildAccessoryBar\(\)[\s\S]*?\n  @Builder\n  private buildThemeScrim/)?.[0] ?? '';
+const indexTabBarBlock = index.match(/private buildTabBar\(\)[\s\S]*?\n  @Builder\n  private buildDrawerScrim/)?.[0] ?? '';
+const indexAccessoryBlock = index.match(/private buildAccessoryBar\(\)[\s\S]*?\n  private filteredThemes/)?.[0] ?? '';
 
 assert.match(surface, /XComponent\(\{\s*id: this\.surfaceId,\s*type: XComponentType\.SURFACE,\s*libraryname: 'libghostty_ohos'/s);
 assert.match(surface, /\.focusable\(true\)/);
@@ -51,7 +51,31 @@ assert.match(surface, /@Prop @Watch\('onActiveChanged'\) active: boolean = true;
 assert.match(surface, /private foregroundFocusTimer: number = -1;/);
 assert.match(surface, /this\.controller\.setImeActive\(this\.active\);/);
 assert.match(surface, /private onActiveChanged\(\): void \{/);
+// active now owns only IME/focus/search-exit: an open drawer/tab-editor hides
+// the keyboard, but the still-visible terminal keeps polling via `visible`.
 assert.match(surface, /if \(this\.active\) \{\s*this\.controller\.setImeActive\(true\);\s*this\.scheduleForegroundImeRequest\(\);\s*return;\s*\}/s);
+assert.match(
+  surface,
+  /@Prop @Watch\('onVisibleChanged'\) visible: boolean = true;/,
+  'tab visibility must be a prop distinct from active so a translucent drawer does not throttle the visible terminal'
+);
+assert.match(
+  surface,
+  /private onVisibleChanged\(\): void \{\s*this\.controller\.setPollingSuspended\(!this\.visible\);/s,
+  'tab visibility (not active) must gate the controller input polling for background tabs'
+);
+assert.match(
+  surface,
+  /private onVisibleChanged\(\): void \{[\s\S]*?if \(this\.visible\) \{\s*this\.syncScrollbarState\(\);\s*this\.startScrollbarPolling\(\);\s*\} else \{\s*this\.stopScrollbarPolling\(\);\s*\}/s,
+  'the visibility watch owns the scrollbar refresh loop for background/foreground tabs'
+);
+const onActiveChangedBlock =
+  surface.match(/private onActiveChanged\(\): void \{[\s\S]*?\n  \}/)?.[0] ?? '';
+assert.doesNotMatch(
+  onActiveChangedBlock,
+  /setPollingSuspended|startScrollbarPolling|stopScrollbarPolling|syncScrollbarState/,
+  'active watch must only touch IME/focus/search; polling and scrollbar belong to the visibility watch'
+);
 assert.match(surface, /this\.controller\.setImeActive\(false\);/);
 assert.match(surface, /private onForegroundFocusEpochChanged\(\): void \{/);
 assert.match(surface, /private scheduleForegroundImeRequest\(\): void \{/);
@@ -75,11 +99,20 @@ assert.doesNotMatch(
 );
 assert.match(
   index,
-  /active: session\.id === this\.activeSessionId &&\s*!this\.connectPanelOpen &&\s*!this\.settingsPanelOpen &&\s*!this\.themePanelOpen/s
+  /active: session\.id === this\.activeSessionId &&\s*!this\.drawerOpen &&\s*!this\.tabEditOpen/s
+);
+assert.match(
+  index,
+  /visible: session\.id === this\.activeSessionId/,
+  'polling/scrollbar gating must follow raw tab visibility, independent of drawer/tab-edit overlays'
 );
 assert.match(index, /foregroundFocusEpoch: this\.foregroundFocusEpoch/);
 assert.match(index, /private focusActiveTerminalSoon\(\): void \{/);
-assert.match(index, /focusControl\.requestFocus\(`fusionTermSurface-\$\{sessionId\}`\);/);
+assert.match(
+  index,
+  /focusControl\.requestFocus\(`fusionTermSurface-g\$\{session\.surfaceSeq\}`\);/,
+  'programmatic focus must target the process-global surface id (multiton-safe)'
+);
 assert.match(index, /session\.controller\.setImeActive\(true\);/);
 assert.doesNotMatch(
   index.match(/private focusActiveTerminalSoon\(\): void \{[\s\S]*?\n  \}/)?.[0] ?? '',
@@ -88,22 +121,22 @@ assert.doesNotMatch(
 );
 assert.match(
   indexTabBarBlock,
-  /Button\('\+'\)[\s\S]*?\.focusable\(false\)[\s\S]*?this\.addSession\(true\);/s,
+  /ic_plus[\s\S]*?\.focusable\(false\)[\s\S]*?this\.addSession\(true\);/s,
   'new-tab button must not keep keyboard focus from the terminal'
 );
-for (const label of ['⌘', '连接', '设置']) {
+for (const label of ['ic_keyboard', 'ic_link', 'ic_gear']) {
   assert.match(
     indexTabBarBlock,
-    new RegExp(`Button\\('${label}'\\)[\\s\\S]*?\\.focusable\\(false\\)`),
+    new RegExp(`${label}[\\s\\S]*?\\.focusable\\(false\\)`),
     `${label} chrome button must not participate in arrow-key focus traversal`
   );
 }
 assert.match(
   index,
-  /\.backgroundColor\(this\.active \? COLOR_KEY_BG : '#00000000'\)\s*\.focusable\(false\)\s*\.onClick/s,
+  /\.backgroundColor\(this\.active \? '#151A22' : '#00000000'\)[\s\S]*?\.focusable\(false\)\s*\.onClick/s,
   'tab chips must be mouse/touch clickable without stealing arrow-key focus'
 );
-for (const label of ['Esc', 'Tab', 'Ctrl', 'Alt']) {
+for (const label of ['Esc', 'Tab', '\\^C', '复制', '粘贴']) {
   assert.match(
     indexAccessoryBlock,
     new RegExp(`Button\\('${label}'\\)[\\s\\S]*?\\.focusable\\(false\\)`),
@@ -112,13 +145,27 @@ for (const label of ['Esc', 'Tab', 'Ctrl', 'Alt']) {
 }
 assert.match(
   indexAccessoryBlock,
+  /Button\('复制'\)[\s\S]*?controller\.requestCopy\(\);/s,
+  'copy accessory button must reuse the surface copy listener'
+);
+assert.match(
+  indexAccessoryBlock,
+  /Button\('粘贴'\)[\s\S]*?controller\.requestPaste\(\);/s,
+  'paste accessory button must reuse the surface paste listener'
+);
+assert.match(
+  indexAccessoryBlock,
   /Button\(key\)[\s\S]*?\.focusable\(false\)[\s\S]*?this\.sendAccessoryKey\(key\);/s,
   'accessory arrow buttons must not capture the physical arrow keys after click'
 );
 
 assert.match(ability, /const FOREGROUND_FOCUS_EVENT: string = 'fusionTermForeground';/);
 assert.match(ability, /private wasBackgrounded: boolean = false;/);
-assert.match(ability, /onBackground\(\): void \{\s*this\.wasBackgrounded = true;\s*\}/s);
+assert.match(
+  ability,
+  /onBackground\(\): void \{\s*this\.wasBackgrounded = true;[\s\S]*?eventHub\.emit\(BACKGROUND_EVENT\);\s*\}/s,
+  'onBackground must record the flag AND broadcast so the page can notify for the active tab'
+);
 assert.match(
   ability,
   /onForeground\(\): void \{\s*if \(!this\.wasBackgrounded\) \{\s*return;\s*\}\s*this\.wasBackgrounded = false;\s*this\.context\.eventHub\.emit\(FOREGROUND_FOCUS_EVENT\);\s*\}/s,
@@ -207,7 +254,14 @@ assert.match(nativeBridge, /std::recursive_mutex m_surfaceMutex;/);
 assert.match(nativeBridge, /void RequestIme\(\)\s*\{\s*std::lock_guard<std::recursive_mutex> surfaceLock\(m_surfaceMutex\);\s*ShowImeLocked\(IME_REQUEST_REASON_OTHER\);\s*NotifyImeStateLocked\(\);/s);
 assert.match(nativeBridge, /ResetImeSessionLocked\(\);/);
 assert.match(nativeBridge, /OH_InputMethodController_Detach\(m_imeInputMethodProxy\);/);
-assert.match(nativeBridge, /OH_TextEditorProxy_Destroy\(m_imeTextEditorProxy\);/);
+assert.doesNotMatch(
+  nativeBridge,
+  /OH_TextEditorProxy_Destroy/,
+  'text editor proxies must NEVER be destroyed: the IME service delivers ' +
+  'OnInputStop -> SendKeyboardStatusV2 asynchronously over binder and a ' +
+  'destroyed proxy is the exact UAF behind the OS_IPC SIGSEGV cppcrash ' +
+  '(2026-07-04/05). Retire via g_retiredImeProxies instead.'
+);
 assert.doesNotMatch(nativeBridge, /m_imeSessionNeedsReset/);
 assert.match(
   nativeBridge,

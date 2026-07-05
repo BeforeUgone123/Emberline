@@ -22,14 +22,15 @@ research to a HarmonyOS advanced terminal project. The important decisions were:
 - keep SSH remote PTY as fallback rather than the first product path;
 - keep local PTY as a fallback/prototype;
 - create the project under `/mnt/linux_share/preview/harmony-advanced-terminal`;
-- publish the repository as `HMG`.
+- publish the repository as `HMG`, then rename it to match the app name
+  `Emberline`.
 
 Related exploratory threads:
 
 - `019e8d39-437f-7260-9b63-895bad7f4138`: HarmonyOS ecosystem-gap discussion,
   including Obsidian-like note and AI folder-reading ideas.
 - `019ea70e-87d9-76f1-831e-414bae920875`: broader HarmonyOS project
-  brainstorming; those ideas are explicitly out of scope for HMG.
+  brainstorming; those ideas are explicitly out of scope for Emberline.
 
 ## Current State
 
@@ -225,4 +226,4 @@ wand-agent --host 172.16.100.2 --token harmonyterm
 
 Keep the product focused on the Fusion VM terminal path. Earlier brainstorming
 included AI note apps, PPT/PDF annotation, and lifestyle products, but those are
-not part of HMG unless the user explicitly reopens that scope.
+not part of Emberline unless the user explicitly reopens that scope.

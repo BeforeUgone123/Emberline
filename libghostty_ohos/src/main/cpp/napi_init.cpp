@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -58,6 +59,16 @@ ExampleDriverWriteInputFn ResolveExampleDriverWriteInput()
     return cached;
 }
 
+// The IME framework delivers OnInputStop over binder asynchronously: after
+// OH_InputMethodController_Detach returns, the controller-side listener can
+// still call into the TextEditorProxy's function table. Destroying the proxy
+// therefore crashes in SendKeyboardStatusV2 with a wild jump (real device
+// cppcrash, 2026-07-04). Proxies are never destroyed: live hosts reuse
+// theirs, dying hosts park them here so late callbacks only hit the no-op
+// FindImeHost path.
+std::mutex g_retiredImeProxiesMutex;
+std::vector<InputMethod_TextEditorProxy*> g_retiredImeProxies;
+
 std::mutex g_imeProxyHostsMutex;
 std::unordered_map<InputMethod_TextEditorProxy*, TerminalHost*> g_imeProxyHosts;
 std::mutex g_processImeHostMutex;
@@ -99,6 +110,20 @@ constexpr uint64_t LONG_PRESS_MS = 500;
 constexpr uint64_t MULTI_CLICK_MS = 400;
 constexpr float MOVE_THRESHOLD = 20.0f;
 constexpr auto CURSOR_BLINK_TICK = std::chrono::milliseconds(250);
+// Inertial (fling) scrolling for touch swipes. Velocity is px/s of touch
+// travel; the render thread animates it with exponential decay.
+constexpr float FLING_START_MIN_VELOCITY = 240.0f;
+constexpr float FLING_STOP_VELOCITY = 40.0f;
+constexpr float FLING_MAX_VELOCITY = 9000.0f;
+constexpr float FLING_DECAY_PER_SECOND = 2.4f;
+static constexpr size_t kMaxOsc52SequenceBytes = 16 * 1024 * 1024;
+// Animation cadence for the fling. The decay itself is time-based
+// [v *= exp(-k*dt) with dt = real elapsed steady_clock time] and the stop
+// test is on speed, not tick count, so total travel is frame-rate
+// independent; this tick only sets how finely the smooth-scroll pixel pool is
+// consumed. 8ms ~= one 120Hz frame interval on MatePad Edge, giving finer
+// per-frame granularity than the old 11ms without changing the distance.
+constexpr auto FLING_TICK = std::chrono::milliseconds(8);
 constexpr OH_NativeXComponent_KeyCode LINUX_KEY_TAB =
     static_cast<OH_NativeXComponent_KeyCode>(15);
 constexpr OH_NativeXComponent_KeyCode LINUX_KEY_1 =
@@ -319,6 +344,55 @@ bool IsAltPressed(uint64_t modifiers)
 bool IsShiftPressed(uint64_t modifiers)
 {
     return (modifiers & ARKUI_MODIFIER_KEY_SHIFT) != 0;
+}
+
+// Ctrl-Shift-C / Ctrl-Insert copy to the system clipboard; plain Ctrl-C stays
+// a terminal interrupt and must keep flowing to the PTY.
+bool IsCopyShortcut(OH_NativeXComponent_KeyCode code, uint64_t modifiers)
+{
+    const bool ctrl = IsCtrlPressed(modifiers);
+    const bool shift = IsShiftPressed(modifiers);
+    const bool alt = IsAltPressed(modifiers);
+    const bool isCtrlShiftCopy = ctrl && shift && !alt && (code == LINUX_KEY_C || code == KEY_C);
+    const bool isCtrlInsertCopy = ctrl && !shift && !alt && (code == LINUX_KEY_INSERT || code == KEY_INSERT);
+    return isCtrlShiftCopy || isCtrlInsertCopy;
+}
+
+bool IsPasteShortcut(OH_NativeXComponent_KeyCode code, uint64_t modifiers)
+{
+    const bool ctrl = IsCtrlPressed(modifiers);
+    const bool shift = IsShiftPressed(modifiers);
+    const bool alt = IsAltPressed(modifiers);
+    const bool isCtrlPaste = ctrl && !alt && (code == LINUX_KEY_V || code == KEY_V);
+    const bool isShiftInsertPaste = shift && !ctrl && !alt && (code == LINUX_KEY_INSERT || code == KEY_INSERT);
+    return isCtrlPaste || isShiftInsertPaste;
+}
+
+// Minimal base64 decoder for OSC 52 clipboard payloads; returns an empty
+// string on any malformed input.
+std::string DecodeBase64(const std::string& encoded)
+{
+    static const std::string alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int accum = 0;
+    int bits = 0;
+    for (const char c : encoded) {
+        if (c == '=' || c == '\r' || c == '\n') {
+            continue;
+        }
+        const size_t idx = alphabet.find(c);
+        if (idx == std::string::npos) {
+            return std::string();
+        }
+        accum = (accum << 6) | static_cast<int>(idx);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((accum >> bits) & 0xFF));
+        }
+    }
+    return out;
 }
 
 int LinuxLetterOffset(OH_NativeXComponent_KeyCode code)
@@ -674,6 +748,7 @@ public:
         StopRenderLoop();
         ClearInputCallback();
         DetachImeLocked();
+        RetireImeProxyLocked();
         std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         CleanupSurfaceLocked();
         if (m_terminal) {
@@ -726,6 +801,14 @@ public:
             if (!m_renderer->init(m_nativeWindow, m_windowWidth, m_windowHeight)) {
                 m_rendererReady = false;
                 m_rendererError = "Native drawing renderer initialization failed";
+                // A re-created surface can reach this branch with the render
+                // loop still running from the previous life; it reads
+                // m_renderer outside m_surfaceMutex, so stop it before
+                // CleanupSurfaceLocked deletes the renderer (audit 2026-07-05).
+                StopRenderLoop();
+                if (m_terminal) {
+                    m_terminal->setRenderer(nullptr);
+                }
                 CleanupSurfaceLocked();
                 OH_LOG_ERROR(LOG_APP, "Failed to initialize native drawing renderer");
                 return;
@@ -887,6 +970,15 @@ public:
             }
         }
 
+        if (IsCopyShortcut(code, modifiers)) {
+            QueueCopyRequest();
+            return true;
+        }
+        if (IsPasteShortcut(code, modifiers)) {
+            QueuePasteRequest();
+            return true;
+        }
+
         const bool appCursorKeys = m_terminal->cursorKeysApplicationMode();
         std::string sequence;
         if (!BuildKeySequence(code, modifiers, capsLock, appCursorKeys, sequence) || sequence.empty()) {
@@ -927,6 +1019,33 @@ public:
             m_surfaceScreenTop = static_cast<double>(touchEvent.screenY - touchEvent.y);
         }
 
+        // Mouse input arrives twice: as a synthesized touch here and as a real
+        // mouse event in DispatchMouseEvent. The mouse path owns selection and
+        // clicks; consuming the synthesized touch too made a left-button drag
+        // select text and pan the viewport at the same time (and doubled every
+        // click tmux saw). Neither marker is reliable alone on device, so
+        // check the tool type, the event source, and — as a last resort —
+        // whether the mouse path currently tracks a pressed button.
+        OH_NativeXComponent_TouchPointToolType touchToolType =
+            OH_NATIVEXCOMPONENT_TOOL_TYPE_UNKNOWN;
+        if (OH_NativeXComponent_GetTouchPointToolType(component, 0, &touchToolType) ==
+                OH_NATIVEXCOMPONENT_RESULT_SUCCESS &&
+            touchToolType == OH_NATIVEXCOMPONENT_TOOL_TYPE_MOUSE) {
+            return;
+        }
+        OH_NativeXComponent_EventSourceType touchSourceType =
+            OH_NATIVEXCOMPONENT_SOURCE_TYPE_UNKNOWN;
+        if (OH_NativeXComponent_GetTouchEventSourceType(component, touchEvent.id, &touchSourceType) ==
+                OH_NATIVEXCOMPONENT_RESULT_SUCCESS &&
+            touchSourceType == OH_NATIVEXCOMPONENT_SOURCE_TYPE_MOUSE) {
+            return;
+        }
+        if (m_isMousePressed) {
+            // A mouse button is held: the mouse path owns the pointer, and a
+            // finger cannot be the source of this stream. Drop it entirely.
+            return;
+        }
+
         if (!m_terminal || !m_renderer) {
             return;
         }
@@ -945,6 +1064,13 @@ public:
 
         switch (touchEvent.type) {
             case OH_NATIVEXCOMPONENT_DOWN: {
+                // A new touch stops any running fling immediately and snaps
+                // the smooth-scroll fraction so a plain tap never leaves
+                // content resting between lines.
+                CancelFling();
+                RequestSmoothScrollSnap();
+                m_touchVelocityY = 0.0f;
+                m_lastTouchMoveSampleMs = getCurrentTimeMs();
                 m_isTouching = true;
                 m_isSelecting = false;
                 m_touchMouseDragActive = false;
@@ -960,6 +1086,18 @@ public:
             case OH_NATIVEXCOMPONENT_MOVE: {
                 if (!m_isTouching) {
                     break;
+                }
+
+                // Track swipe velocity (px/s, low-pass filtered) for fling start.
+                {
+                    const uint64_t nowMs = getCurrentTimeMs();
+                    const float stepDy = m_lastTouchY - touchEvent.y;
+                    const uint64_t dtMs = nowMs - m_lastTouchMoveSampleMs;
+                    if (dtMs > 0 && dtMs < 120) {
+                        const float sample = stepDy * 1000.0f / static_cast<float>(dtMs);
+                        m_touchVelocityY = 0.65f * sample + 0.35f * m_touchVelocityY;
+                    }
+                    m_lastTouchMoveSampleMs = nowMs;
                 }
 
                 const float dx = touchEvent.x - m_touchStartX;
@@ -997,6 +1135,7 @@ public:
                     int col = 0;
                     MapPointToCell(touchEvent.x, touchEvent.y, cellWidth, cellHeight, row, col);
                     m_terminal->updateSelection(row, col);
+                    UpdateSelectionAutoScroll(touchEvent.x, touchEvent.y);
                 } else if (moveDistance >= MOVE_THRESHOLD) {
                     ScrollViewportByPointerDelta(m_lastTouchY - touchEvent.y, cellHeight);
                 }
@@ -1025,6 +1164,9 @@ public:
                         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
                         NotifyImeStateLocked();
+                    } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP &&
+                               moveDistance >= MOVE_THRESHOLD) {
+                        StartFling(m_touchVelocityY, true, touchEvent.x, touchEvent.y);
                     }
 
                     m_isTouching = false;
@@ -1035,6 +1177,7 @@ public:
                     break;
                 }
 
+                bool touchFlingStarted = false;
                 if (m_isTouching && !m_isSelecting) {
                     const float dx = touchEvent.x - m_touchStartX;
                     const float dy = touchEvent.y - m_touchStartY;
@@ -1052,6 +1195,8 @@ public:
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
                         NotifyImeStateLocked();
                         QueueLinkActivationAtPoint(touchEvent.x, touchEvent.y, cellWidth, cellHeight);
+                    } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP && moveDistance >= MOVE_THRESHOLD) {
+                        touchFlingStarted = StartFling(m_touchVelocityY, false, touchEvent.x, touchEvent.y);
                     }
                 }
 
@@ -1060,6 +1205,12 @@ public:
                 m_touchMouseDragActive = false;
                 m_touchScrollRemainderY = 0.0f;
                 m_touchWheelRemainderY = 0.0f;
+                StopSelectionAutoScroll();
+                if (!touchFlingStarted) {
+                    // No fling took over: snap the sub-line presentation
+                    // offset back to the grid.
+                    RequestSmoothScrollSnap();
+                }
                 break;
             }
 
@@ -1127,6 +1278,7 @@ public:
                 }
                 if (m_isMouseSelecting) {
                     m_terminal->updateSelection(row, col);
+                    UpdateSelectionAutoScroll(mouseEvent.x, mouseEvent.y);
                 }
                 break;
 
@@ -1169,6 +1321,7 @@ public:
                 m_mouseDragged = false;
                 m_mouseHadSelectionOnPress = false;
                 m_mousePressOnSelection = false;
+                StopSelectionAutoScroll();
                 break;
 
             case OH_NATIVEXCOMPONENT_MOUSE_CANCEL:
@@ -1177,6 +1330,7 @@ public:
                 m_mouseDragged = false;
                 m_mouseHadSelectionOnPress = false;
                 m_mousePressOnSelection = false;
+                StopSelectionAutoScroll();
                 break;
 
             case OH_NATIVEXCOMPONENT_MOUSE_NONE:
@@ -1190,9 +1344,28 @@ public:
             return;
         }
 
+        const float cellHeight = m_renderer->getCellHeight();
+        if (!std::isfinite(cellHeight) || cellHeight <= 0.0f) {
+            return;
+        }
+
         const int32_t action = OH_ArkUI_AxisEvent_GetAxisAction(event);
         if (action == UI_AXIS_EVENT_ACTION_END || action == UI_AXIS_EVENT_ACTION_CANCEL) {
+            bool flingStarted = false;
+            if (action == UI_AXIS_EVENT_ACTION_END && m_terminal) {
+                // Hand the release velocity to the shared fling animation so a
+                // two-finger trackpad swipe glides instead of stopping dead.
+                const float x = OH_ArkUI_PointerEvent_GetX(event);
+                const float y = OH_ArkUI_PointerEvent_GetY(event);
+                flingStarted = StartFling(m_axisVelocityY, m_terminal->isMouseTrackingEnabled(), x, y);
+            }
             m_axisScrollRemainderY = 0.0;
+            m_axisVelocityY = 0.0f;
+            if (!flingStarted) {
+                // No fling took over: snap the sub-line presentation offset
+                // back to the grid so content never rests misaligned.
+                RequestSmoothScrollSnap();
+            }
             return;
         }
         if (action != UI_AXIS_EVENT_ACTION_BEGIN && action != UI_AXIS_EVENT_ACTION_UPDATE) {
@@ -1200,19 +1373,23 @@ public:
         }
 
         const double vertical = OH_ArkUI_AxisEvent_GetVerticalAxisValue(event);
-        if (!std::isfinite(vertical) || vertical == 0.0) {
+        if (!std::isfinite(vertical)) {
             return;
         }
 
-        const float cellHeight = m_renderer->getCellHeight();
-        if (!std::isfinite(cellHeight) || cellHeight <= 0.0f) {
-            return;
-        }
-
-        const int32_t sourceType = OH_ArkUI_UIInputEvent_GetSourceType(event);
+        // Touchpad two-finger scrolling reports SourceType MOUSE with
+        // ToolType TOUCHPAD (official HarmonyOS touchpad guide), so the
+        // touchpad must be identified positively by tool type. The previous
+        // "source == mouse => wheel" routing sent every touchpad event into
+        // the notch-wheel branch below, which scrolls at least one full line
+        // per event — that was the "same speed no matter how fast you swipe,
+        // never smooth" feel; the tuned touchpad path never ran at all.
         const int32_t toolType = OH_ArkUI_UIInputEvent_GetToolType(event);
-        if (sourceType == UI_INPUT_EVENT_SOURCE_TYPE_MOUSE ||
-            toolType == UI_INPUT_EVENT_TOOL_TYPE_MOUSE) {
+        if (toolType != UI_INPUT_EVENT_TOOL_TYPE_TOUCHPAD) {
+            // Discrete mouse-wheel notches: 15 degrees per step, >= 1 line.
+            if (vertical == 0.0) {
+                return;
+            }
             if (TrySendTerminalWheelEvent(vertical, cellHeight)) {
                 return;
             }
@@ -1223,14 +1400,45 @@ public:
             return;
         }
 
-        m_axisScrollRemainderY += vertical;
-        const int scrollLines = static_cast<int>(m_axisScrollRemainderY / cellHeight);
-        if (scrollLines == 0) {
+        // Touchpad axis values are logical vp; cell metrics are physical px.
+        // Track finger travel 1:1 in physical pixels; inertia comes from the
+        // shared fling. (Earlier gain experiments were accidentally tuned
+        // against the wheel branch and are void.)
+        const double deltaPx = vertical * static_cast<double>(std::max(1.0f, m_density));
+
+        const uint64_t nowMs = getCurrentTimeMs();
+        if (action == UI_AXIS_EVENT_ACTION_BEGIN) {
+            // A fresh two-finger gesture takes over from any running fling.
+            CancelFling();
+            m_axisVelocityY = 0.0f;
+            OH_LOG_INFO(LOG_APP, "trackpad axis begin v=%{public}.2f density=%{public}.2f",
+                        vertical, m_density);
+        } else {
+            const uint64_t dtMs = nowMs - m_lastAxisSampleMs;
+            if (dtMs > 0 && dtMs < 120) {
+                const float sample = static_cast<float>(deltaPx) * 1000.0f / static_cast<float>(dtMs);
+                m_axisVelocityY = 0.65f * sample + 0.35f * m_axisVelocityY;
+            }
+        }
+        m_lastAxisSampleMs = nowMs;
+
+        if (m_terminal->isMouseTrackingEnabled()) {
+            // tmux/vim own the pointer: deliver wheel events so the TUI
+            // scrolls, instead of silently panning the local scrollback.
+            m_axisScrollRemainderY += deltaPx;
+            const int scrollLines = static_cast<int>(m_axisScrollRemainderY / cellHeight);
+            if (scrollLines != 0) {
+                m_axisScrollRemainderY -= static_cast<double>(scrollLines) * cellHeight;
+                const float x = OH_ArkUI_PointerEvent_GetX(event);
+                const float y = OH_ArkUI_PointerEvent_GetY(event);
+                SendFlingWheelSteps(scrollLines, x, y);
+            }
             return;
         }
 
-        m_terminal->scrollView(scrollLines);
-        m_axisScrollRemainderY += static_cast<double>(scrollLines) * cellHeight;
+        // Local scrollback pans through the pixel pool; the render thread
+        // turns it into whole-line scrolls plus a blit fraction in one step.
+        AddSmoothScrollPixels(deltaPx);
     }
 
     void SetResourceManager(napi_env env, napi_value value) {
@@ -1245,6 +1453,9 @@ public:
     }
 
     void SetDensity(double density) {
+        // setDensity -> onFontMetricsChanged -> destroyGlyphCache: must not
+        // race the render thread (see SetConfig).
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         m_density = static_cast<float>(density > 0 ? density : 1.0);
         if (m_renderer) {
             m_renderer->setDensity(m_density);
@@ -1351,8 +1562,121 @@ public:
 
     void FeedOutput(const std::string& data) {
         if (m_terminal && !data.empty()) {
+            CaptureOsc52ClipboardRequests(data);
+            CaptureOsc9Notifications(data);
             m_terminal->feedOutput(data.data(), data.size());
         }
+    }
+
+    // OSC 9 desktop notifications (iTerm2 protocol): AI CLIs (claude code,
+    // codex with iterm2 notify channels) and scripts emit ESC ] 9 ; body BEL
+    // to say "task finished, look at me". ConEmu progress reports
+    // (ESC ] 9 ; 4 ; ...) share the prefix and are skipped.
+    void CaptureOsc9Notifications(const std::string& data) {
+        const std::string osc9Prefix = "\x1b]9;";
+        size_t searchPos = 0;
+        while (true) {
+            const size_t start = data.find(osc9Prefix, searchPos);
+            if (start == std::string::npos) {
+                return;
+            }
+            const size_t payloadStart = start + osc9Prefix.size();
+            size_t end = data.find('\x07', payloadStart);
+            size_t terminatorLen = 1;
+            const size_t st = data.find("\x1b\\", payloadStart);
+            if (st != std::string::npos && (end == std::string::npos || st < end)) {
+                end = st;
+                terminatorLen = 2;
+            }
+            if (end == std::string::npos) {
+                return;
+            }
+            std::string payload = data.substr(payloadStart, end - payloadStart);
+            searchPos = end + terminatorLen;
+            if (payload.rfind("4;", 0) == 0) {
+                continue;
+            }
+            if (payload.size() > 300) {
+                payload.resize(300);
+            }
+            std::lock_guard<std::mutex> lock(m_notificationMutex);
+            if (m_pendingNotifications.size() < 8) {
+                m_pendingNotifications.push_back(std::move(payload));
+            }
+        }
+    }
+
+    // OSC 52 lets remote programs (tmux set-clipboard, vim/yank plugins) push
+    // text to the system clipboard through the terminal output stream.
+    void CaptureOsc52ClipboardRequests(const std::string& data) {
+        const std::string osc52Prefix = "\x1b]52;";
+        std::lock_guard<std::mutex> lock(m_osc52Mutex);
+        std::string scanData;
+        if (!m_pendingOsc52Sequence.empty()) {
+            scanData = std::move(m_pendingOsc52Sequence);
+            scanData += data;
+            m_pendingOsc52Sequence.clear();
+        } else {
+            scanData = data;
+        }
+
+        size_t searchPos = 0;
+        while (true) {
+            const size_t start = scanData.find(osc52Prefix, searchPos);
+            if (start == std::string::npos) {
+                RememberOsc52PrefixTail(scanData);
+                return;
+            }
+            const size_t payloadStart = start + osc52Prefix.size();
+            size_t end = scanData.find('\x07', payloadStart);
+            size_t terminatorLen = 1;
+            const size_t st = scanData.find("\x1b\\", payloadStart);
+            if (st != std::string::npos && (end == std::string::npos || st < end)) {
+                end = st;
+                terminatorLen = 2;
+            }
+            if (end == std::string::npos) {
+                m_pendingOsc52Sequence = scanData.substr(start);
+                if (m_pendingOsc52Sequence.size() > kMaxOsc52SequenceBytes) {
+                    OH_LOG_WARN(LOG_APP, "Dropping oversized incomplete OSC 52 clipboard sequence");
+                    m_pendingOsc52Sequence.clear();
+                }
+                return;
+            }
+            const std::string payload = scanData.substr(payloadStart, end - payloadStart);
+            HandleOsc52Payload(payload);
+            searchPos = end + terminatorLen;
+        }
+    }
+
+    void RememberOsc52PrefixTail(const std::string& data) {
+        const std::string osc52Prefix = "\x1b]52;";
+        m_pendingOsc52Sequence.clear();
+        const size_t maxTail = std::min(osc52Prefix.size() - 1, data.size());
+        for (size_t len = maxTail; len > 0; --len) {
+            const size_t index = data.size() - len;
+            if (osc52Prefix.compare(0, len, data, index, len) == 0) {
+                m_pendingOsc52Sequence = data.substr(index);
+                return;
+            }
+        }
+    }
+
+    void HandleOsc52Payload(const std::string& payload) {
+        // Payload is "<targets>;<base64 data>"; "?" queries are ignored.
+        const size_t sep = payload.find(';');
+        if (sep == std::string::npos) {
+            return;
+        }
+        const std::string encoded = payload.substr(sep + 1);
+        if (encoded.empty() || encoded == "?") {
+            return;
+        }
+        const std::string decoded = DecodeBase64(encoded);
+        if (decoded.empty()) {
+            return;
+        }
+        QueueCopyText(decoded);
     }
 
     std::string DrainPendingInput() {
@@ -1364,6 +1688,23 @@ public:
 
     std::string DrainPendingTitle() {
         return m_terminal ? m_terminal->drainPendingTitle() : std::string();
+    }
+
+    // One pending notification event per call: "T<text>" for an OSC 9
+    // notification, "B" for a bare BEL, empty when nothing is pending.
+    std::string DrainPendingNotification() {
+        {
+            std::lock_guard<std::mutex> lock(m_notificationMutex);
+            if (!m_pendingNotifications.empty()) {
+                std::string text = "T" + m_pendingNotifications.front();
+                m_pendingNotifications.erase(m_pendingNotifications.begin());
+                return text;
+            }
+        }
+        if (m_terminal && m_terminal->drainPendingBell()) {
+            return "B";
+        }
+        return {};
     }
 
     void SetInputCallback(napi_env env, napi_value callback)
@@ -1448,7 +1789,54 @@ public:
         return drained;
     }
 
+    // Copy requests reach ArkTS as "copy" (copy the current selection) or as
+    // "T<text>" (explicit text, e.g. a decoded OSC 52 payload).
+    void QueueCopyRequest() {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        m_pendingCopyRequest = "copy";
+    }
+
+    void QueueCopyText(const std::string& text) {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        m_pendingCopyRequest = "T" + text;
+    }
+
+    std::string DrainPendingCopyRequest() {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        std::string drained;
+        drained.swap(m_pendingCopyRequest);
+        return drained;
+    }
+
+    void QueuePasteRequest() {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        m_pendingPasteRequest = "paste";
+    }
+
+    std::string DrainPendingPasteRequest() {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        std::string drained;
+        drained.swap(m_pendingPasteRequest);
+        return drained;
+    }
+
+    TerminalScrollbarState GetScrollbarState() const {
+        if (!m_terminal) {
+            return TerminalScrollbarState {};
+        }
+        return m_terminal->getScrollbarState();
+    }
+
+    void ScrollToOffset(int offset) {
+        if (m_terminal) {
+            m_terminal->scrollToOffset(offset);
+        }
+    }
+
     void ResizeTerminal(int cols, int rows) {
+        // Align with every other resize path: exclude the render thread's
+        // drawFrame (held under m_surfaceMutex) while the grid changes.
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         if (m_terminal) {
             m_terminal->resize(cols, rows);
         }
@@ -1562,6 +1950,9 @@ public:
     }
 
     bool LoadTheme(const std::string& themeName) {
+        // Mutates renderer colors/repaint flags: keep it off the render
+        // thread's back as well (cheap, called rarely).
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         if (!m_resourceManager || !m_terminal) {
             return false;
         }
@@ -1595,6 +1986,9 @@ public:
     }
 
     bool RegisterCustomFont(const std::string& fontPath) {
+        // registerCustomFont destroys the glyph cache: must not race the
+        // render thread (see SetConfig).
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         if (!m_renderer || !m_renderer->registerCustomFont(fontPath)) {
             return false;
         }
@@ -1634,11 +2028,23 @@ public:
     }
 
     void SetConfig(int fontSize, int scrollbackLines, uint32_t bgColor, uint32_t fgColor, int cursorStyle,
-                   bool cursorBlink, double bgOpacity) {
+                   bool cursorBlink, double bgOpacity, const std::string& fontFamily) {
+        // Must exclude the render thread: setFontSize/setFontFamily destroy
+        // the glyph cache while renderGrid may be painting from it (the
+        // OH_Drawing_TypographyPaint CFI abort, cppcrash 2026-07-05).
+        std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         m_fontSize = static_cast<float>(fontSize);
+        // Remember the requested scrollback regardless of whether the terminal
+        // exists yet: on cold start SetConfig can arrive before the surface
+        // creates the Terminal, and construction is the only point ghostty_vt
+        // consumes max_scrollback (see TryInitializeTerminalLocked).
+        if (scrollbackLines > 0) {
+            m_scrollbackLines = scrollbackLines;
+        }
 
         if (m_renderer) {
             m_renderer->setFontSize(m_fontSize);
+            m_renderer->setFontFamily(fontFamily);
             m_renderer->setBackgroundOpacity(static_cast<float>(bgOpacity));
             m_renderer->setColors(bgColor, fgColor);
             m_renderer->setCursorStyle(cursorStyle, cursorBlink);
@@ -1811,7 +2217,14 @@ private:
             std::unique_lock<std::mutex> lock(m_renderMutex);
             while (m_renderThreadRunning) {
                 const bool animateCursor = m_renderer && m_renderer->cursorBlinkEnabled();
-                if (animateCursor) {
+                if (m_flingActive || m_selAutoScrollVel.load(std::memory_order_relaxed) != 0.0f) {
+                    // Fixed cadence while the fling or a selection edge
+                    // auto-scroll animates; frames are forced below, so the
+                    // dirty flag is not part of this wait.
+                    m_renderCv.wait_for(lock, FLING_TICK, [this]() {
+                        return !m_renderThreadRunning || m_resizePending;
+                    });
+                } else if (animateCursor) {
                     m_renderCv.wait_for(lock, CURSOR_BLINK_TICK, [this]() {
                         return !m_renderThreadRunning || m_renderDirty || m_resizePending;
                     });
@@ -1825,13 +2238,131 @@ private:
                     break;
                 }
 
+                // Advance the fling animation under the lock; the resulting
+                // scroll runs after unlock (it takes the terminal state lock).
+                int flingWheelSteps = 0;
+                float flingPointerX = 0.0f;
+                float flingPointerY = 0.0f;
+                bool flingTicked = false;
+                float flingSmoothPx = 0.0f;
+                bool flingJustStopped = false;
+                if (m_flingActive) {
+                    flingTicked = true;
+                    const auto now = std::chrono::steady_clock::now();
+                    float dt = std::chrono::duration<float>(now - m_flingLastTick).count();
+                    m_flingLastTick = now;
+                    dt = std::clamp(dt, 0.0f, 0.05f);
+                    const float cellHeight = m_renderer ? m_renderer->getCellHeight() : 0.0f;
+                    if (!std::isfinite(cellHeight) || cellHeight <= 0.0f) {
+                        m_flingActive = false;
+                    } else {
+                        if (m_flingAsWheel) {
+                            m_flingRemainderY += m_flingVelocityY * dt;
+                            const int lines = static_cast<int>(m_flingRemainderY / cellHeight);
+                            if (lines != 0) {
+                                m_flingRemainderY -= static_cast<float>(lines) * cellHeight;
+                                flingWheelSteps = lines;
+                                flingPointerX = m_flingPointerX;
+                                flingPointerY = m_flingPointerY;
+                            }
+                        } else {
+                            flingSmoothPx = m_flingVelocityY * dt;
+                        }
+                        m_flingVelocityY *= std::exp(-FLING_DECAY_PER_SECOND * dt);
+                        if (std::abs(m_flingVelocityY) < FLING_STOP_VELOCITY) {
+                            m_flingActive = false;
+                            flingJustStopped = true;
+                        }
+                    }
+                }
+
                 const bool shouldResize = m_resizePending;
                 const uint32_t resizeWidth = m_pendingWidth;
                 const uint32_t resizeHeight = m_pendingHeight;
-                const bool shouldRender = m_renderDirty || shouldResize || animateCursor;
+                const bool shouldRender = m_renderDirty || shouldResize || animateCursor ||
+                    flingTicked || flingWheelSteps != 0 ||
+                    m_selAutoScrollVel.load(std::memory_order_relaxed) != 0.0f;
                 m_resizePending = false;
                 m_renderDirty = false;
                 lock.unlock();
+
+                if (flingWheelSteps != 0) {
+                    SendFlingWheelSteps(flingWheelSteps, flingPointerX, flingPointerY);
+                }
+
+                // Consume the smooth-scroll pixel pool: whole lines scroll
+                // the viewport and the remainder becomes the blit fraction,
+                // in one step on this thread. Splitting these across threads
+                // let a frame catch the fraction wrapping before the line
+                // scroll landed — that mismatch was the slow-swipe judder.
+                {
+                    double pendingPx = m_smoothScrollPendingPx.exchange(0.0, std::memory_order_relaxed);
+                    pendingPx += static_cast<double>(flingSmoothPx);
+                    // Selection edge auto-scroll rides the same pixel pool.
+                    const float selVel = m_selAutoScrollVel.load(std::memory_order_relaxed);
+                    bool selTicked = false;
+                    if (selVel != 0.0f) {
+                        const auto selNow = std::chrono::steady_clock::now();
+                        float selDt = std::chrono::duration<float>(selNow - m_selScrollLastTick).count();
+                        selDt = std::clamp(selDt, 0.0f, 0.05f);
+                        pendingPx += static_cast<double>(selVel * selDt);
+                        selTicked = true;
+                    }
+                    m_selScrollLastTick = std::chrono::steady_clock::now();
+                    const bool snap =
+                        m_smoothSnapRequested.exchange(false, std::memory_order_relaxed) || flingJustStopped;
+                    if (snap) {
+                        m_smoothScrollFracPx = 0.0;
+                        if (m_renderer) {
+                            m_renderer->setScrollFraction(0.0f);
+                        }
+                    } else if (pendingPx != 0.0) {
+                        m_smoothScrollFracPx += pendingPx;
+                        const float smoothCellH = m_renderer ? m_renderer->getCellHeight() : 0.0f;
+                        if (std::isfinite(smoothCellH) && smoothCellH > 0.0f && m_terminal) {
+                            const int lines = static_cast<int>(m_smoothScrollFracPx / smoothCellH);
+                            if (lines != 0) {
+                                m_smoothScrollFracPx -= static_cast<double>(lines) * smoothCellH;
+                                m_terminal->scrollView(lines);
+                            }
+                            // Edge clamp AFTER the line scroll, against fresh
+                            // scrollbar state. Scrollbar offset counts from
+                            // the TOP: 0 = oldest rows, total - visible =
+                            // live bottom. Resetting the accumulator (not
+                            // just the presented fraction) stops overscroll
+                            // from banking travel the user would have to pay
+                            // back before reversing — and kills the twitch
+                            // when swiping past the bottom edge.
+                            const TerminalScrollbarState sb = m_terminal->getScrollbarState();
+                            const int maxOffset = sb.total > sb.visible ? sb.total - sb.visible : 0;
+                            if ((m_smoothScrollFracPx > 0.0 && sb.offset >= maxOffset) ||
+                                (m_smoothScrollFracPx < 0.0 && sb.offset <= 0)) {
+                                m_smoothScrollFracPx = 0.0;
+                            }
+                            if (m_renderer) {
+                                m_renderer->setScrollFraction(static_cast<float>(m_smoothScrollFracPx));
+                            }
+                        }
+                    }
+                }
+
+                // While edge auto-scroll runs, keep extending the selection
+                // toward the last pointer position so newly revealed rows are
+                // swept into it.
+                if (m_selAutoScrollVel.load(std::memory_order_relaxed) != 0.0f &&
+                    m_terminal && m_renderer) {
+                    const float selCellW = m_renderer->getCellWidth();
+                    const float selCellH = m_renderer->getCellHeight();
+                    if (std::isfinite(selCellW) && selCellW > 0.0f &&
+                        std::isfinite(selCellH) && selCellH > 0.0f) {
+                        int selRow = 0;
+                        int selCol = 0;
+                        MapPointToCell(m_selPointerX.load(std::memory_order_relaxed),
+                                       m_selPointerY.load(std::memory_order_relaxed),
+                                       selCellW, selCellH, selRow, selCol);
+                        m_terminal->updateSelection(selRow, selCol);
+                    }
+                }
 
                 {
                     std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
@@ -1862,6 +2393,7 @@ private:
             m_renderThreadRunning = false;
             m_renderDirty = false;
             m_resizePending = false;
+            m_flingActive = false;
         }
         m_renderCv.notify_all();
         if (m_renderThread.joinable()) {
@@ -1946,6 +2478,11 @@ private:
                              float cellHeight) {
         if (!m_terminal) {
             return;
+        }
+        // A stale local selection highlight must not linger once the tracked
+        // TUI (tmux/yazi) owns the pointer interaction.
+        if (action == TerminalMouseAction::Press) {
+            m_terminal->clearSelection();
         }
         uint32_t screenWidth = 0;
         uint32_t screenHeight = 0;
@@ -2048,6 +2585,9 @@ private:
         }
 
         if (isPress) {
+            // Clear any stale local selection highlight before the tracked
+            // TUI drag owns the pointer.
+            m_terminal->clearSelection();
             m_isMousePressed = true;
             m_trackedPressButton = button;
             m_isMouseSelecting = false;
@@ -2133,16 +2673,131 @@ private:
         if (!m_terminal || !std::isfinite(deltaY) || !std::isfinite(cellHeight) || cellHeight <= 0.0f) {
             return;
         }
+        // Finger drags glide pixel-for-pixel: the render thread converts the
+        // pool into whole-line scrolls plus a blit fraction in one step.
+        AddSmoothScrollPixels(static_cast<double>(deltaY));
+    }
 
-        m_touchScrollRemainderY += deltaY;
-        const int scrollLines = static_cast<int>(m_touchScrollRemainderY / cellHeight);
-        if (scrollLines == 0) {
+    // Fling: the touch thread hands the release velocity to the render thread,
+    // which animates the scroll with exponential decay at FLING_TICK cadence.
+    bool StartFling(float velocityY, bool asWheel, float pointerX, float pointerY) {
+        if (!std::isfinite(velocityY)) {
+            return false;
+        }
+        const float clamped = std::clamp(velocityY, -FLING_MAX_VELOCITY, FLING_MAX_VELOCITY);
+        if (std::abs(clamped) < FLING_START_MIN_VELOCITY) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_renderMutex);
+            m_flingActive = true;
+            m_flingAsWheel = asWheel;
+            m_flingVelocityY = clamped;
+            m_flingRemainderY = 0.0f;
+            m_flingPointerX = pointerX;
+            m_flingPointerY = pointerY;
+            m_flingLastTick = std::chrono::steady_clock::now();
+        }
+        m_renderCv.notify_one();
+        return true;
+    }
+
+    void CancelFling() {
+        std::lock_guard<std::mutex> lock(m_renderMutex);
+        m_flingActive = false;
+    }
+
+    // Selection drag near the viewport edge: velocity scales linearly with
+    // how deep the pointer sits in the band. Called from touch/mouse MOVE.
+    void UpdateSelectionAutoScroll(float x, float y) {
+        m_selPointerX.store(x, std::memory_order_relaxed);
+        m_selPointerY.store(y, std::memory_order_relaxed);
+        const float h = m_renderer ? static_cast<float>(m_renderer->getHeight()) : 0.0f;
+        if (h <= 0.0f) {
+            m_selAutoScrollVel.store(0.0f, std::memory_order_relaxed);
             return;
         }
-
-        m_terminal->scrollView(scrollLines);
-        m_touchScrollRemainderY -= static_cast<float>(scrollLines) * cellHeight;
+        constexpr float kEdgeBandPx = 96.0f;
+        constexpr float kMaxVelPxPerSec = 1600.0f;
+        float vel = 0.0f;
+        if (y < kEdgeBandPx) {
+            vel = -kMaxVelPxPerSec * (1.0f - std::max(y, 0.0f) / kEdgeBandPx);
+        } else if (y > h - kEdgeBandPx) {
+            vel = kMaxVelPxPerSec * (1.0f - std::max(h - y, 0.0f) / kEdgeBandPx);
+        }
+        const float prev = m_selAutoScrollVel.exchange(vel, std::memory_order_relaxed);
+        if (vel != 0.0f && prev == 0.0f) {
+            // Wake the render loop so the fixed-tick branch takes over.
+            RequestRender();
+        }
     }
+
+    void StopSelectionAutoScroll() {
+        m_selAutoScrollVel.store(0.0f, std::memory_order_relaxed);
+    }
+
+    // Input threads feed scroll travel here; the render thread consumes it.
+    // (atomic<double>::fetch_add needs C++20, hence the CAS loop.)
+    void AddSmoothScrollPixels(double px) {
+        if (!std::isfinite(px) || px == 0.0) {
+            return;
+        }
+        double expected = m_smoothScrollPendingPx.load(std::memory_order_relaxed);
+        while (!m_smoothScrollPendingPx.compare_exchange_weak(
+            expected, expected + px, std::memory_order_relaxed)) {
+        }
+        RequestRender();
+    }
+
+    // Snap the presentation offset back to the grid once no gesture or fling
+    // owns the scroll anymore; consumed by the render thread.
+    void RequestSmoothScrollSnap() {
+        m_smoothSnapRequested.store(true, std::memory_order_relaxed);
+        RequestRender();
+    }
+
+    // Runs on the render thread, outside m_renderMutex.
+    void SendFlingWheelSteps(int steps, float x, float y) {
+        if (steps == 0 || !m_terminal || !m_renderer) {
+            return;
+        }
+        if (!m_terminal->isMouseTrackingEnabled()) {
+            // The app left mouse-tracking mid-fling: stop instead of scrolling
+            // a viewport the application no longer expects.
+            CancelFling();
+            return;
+        }
+        const float cellWidth = m_renderer->getCellWidth();
+        const float cellHeight = m_renderer->getCellHeight();
+        if (!std::isfinite(cellWidth) || !std::isfinite(cellHeight) ||
+            cellWidth <= 0.0f || cellHeight <= 0.0f) {
+            return;
+        }
+        uint32_t screenWidth = 0;
+        uint32_t screenHeight = 0;
+        GetTerminalPixelSize(cellWidth, cellHeight, screenWidth, screenHeight);
+        const uint32_t cellWidthPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellWidth)));
+        const uint32_t cellHeightPx =
+            std::max<uint32_t>(1U, static_cast<uint32_t>(std::lround(cellHeight)));
+        const TerminalMouseButton wheelButton =
+            steps > 0 ? TerminalMouseButton::WheelDown : TerminalMouseButton::WheelUp;
+        const int count = std::min(std::abs(steps), 8);
+        for (int i = 0; i < count; ++i) {
+            m_terminal->sendMouseEvent(
+                TerminalMouseAction::Press,
+                wheelButton,
+                0,
+                x,
+                y,
+                screenWidth,
+                screenHeight,
+                cellWidthPx,
+                cellHeightPx,
+                false);
+        }
+    }
+
 
     void TryInitializeTerminalLocked() {
         if (!m_surfaceReady) {
@@ -2155,7 +2810,9 @@ private:
             int cols = 80;
             int rows = 24;
             ComputeTerminalSize(m_windowWidth, m_windowHeight, cols, rows);
-            m_terminal = new Terminal(cols, rows);
+            // Pass the ETS-provided scrollback depth: ghostty_vt only honors it
+            // at creation, so this is where the configured value takes effect.
+            m_terminal = new Terminal(cols, rows, m_scrollbackLines);
             m_terminal->setRenderer(m_renderer);
             m_terminal->setRenderRequestCallback([this]() { RequestRender(); });
             m_terminal->setInputCallback([this](const std::string& data) {
@@ -2179,21 +2836,19 @@ private:
             return;
         }
 
-        napi_threadsafe_function tsfn = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(m_inputMutex);
-            if (m_inputTsfn == nullptr) {
-                m_pendingInput += data;
-                return;
-            }
-            tsfn = m_inputTsfn;
+        // The call happens INSIDE the mutex: setters swap the pointer under
+        // this lock and abort/release the old TSFN only after the swap, so a
+        // call in flight here can never race the release (audit 2026-07-05).
+        // nonblocking call never enters JS, so holding the lock is safe.
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        if (m_inputTsfn == nullptr) {
+            m_pendingInput += data;
+            return;
         }
-
         auto* copy = new std::string(data);
-        const napi_status status = napi_call_threadsafe_function(tsfn, copy, napi_tsfn_nonblocking);
+        const napi_status status = napi_call_threadsafe_function(m_inputTsfn, copy, napi_tsfn_nonblocking);
         if (status != napi_ok) {
             delete copy;
-            std::lock_guard<std::mutex> lock(m_inputMutex);
             m_pendingInput += data;
         }
     }
@@ -2283,13 +2938,26 @@ private:
             m_imeInputMethodProxy = nullptr;
             ForgetProcessImeOwnerLocked();
         }
-        if (m_imeTextEditorProxy != nullptr) {
-            UnregisterImeHost(m_imeTextEditorProxy);
-            OH_TextEditorProxy_Destroy(m_imeTextEditorProxy);
-            m_imeTextEditorProxy = nullptr;
-        }
+        // m_imeTextEditorProxy stays alive and registered: the IME service can
+        // still deliver async callbacks (OnInputStop) that read its function
+        // table, and AttachImeLocked reuses it on the next attach.
         m_wantsIme = false;
         m_imePreviewActive = false;
+    }
+
+    // Called only when the host itself dies: unhook the callback routing and
+    // park the proxy forever (see g_retiredImeProxies for why it never dies).
+    void RetireImeProxyLocked()
+    {
+        if (m_imeTextEditorProxy == nullptr) {
+            return;
+        }
+        UnregisterImeHost(m_imeTextEditorProxy);
+        {
+            std::lock_guard<std::mutex> lock(g_retiredImeProxiesMutex);
+            g_retiredImeProxies.push_back(m_imeTextEditorProxy);
+        }
+        m_imeTextEditorProxy = nullptr;
     }
 
     void ResetImeSessionLocked()
@@ -2303,13 +2971,14 @@ private:
             m_imeInputMethodProxy = nullptr;
             ForgetProcessImeOwnerLocked();
         }
-        if (m_imeTextEditorProxy != nullptr) {
-            UnregisterImeHost(m_imeTextEditorProxy);
-            OH_TextEditorProxy_Destroy(m_imeTextEditorProxy);
-            m_imeTextEditorProxy = nullptr;
-        }
+        // NEVER destroy m_imeTextEditorProxy here: the IME service may still
+        // be dispatching async callbacks (OnInputStop -> SendKeyboardStatusV2)
+        // that walk the proxy's function table on an IPC thread. Destroying it
+        // was the UAF behind the OS_IPC SIGSEGV crash after IME_ERR_DETACHED.
+        // The proxy stays registered and AttachImeLocked reuses it.
         m_imeVisible = false;
         m_imePreviewActive = false;
+        InvalidateImeReportCacheLocked();
     }
 
     void ShowImeLocked(InputMethod_RequestKeyboardReason reason)
@@ -2318,6 +2987,10 @@ private:
         if (!m_imeActive.load(std::memory_order_relaxed)) {
             return;
         }
+        // A show request means the keyboard is (re)appearing; drop the throttle
+        // cache so the next NotifyImeStateLocked re-anchors the caret rect even
+        // if the geometry happens to match the previously reported values.
+        InvalidateImeReportCacheLocked();
         ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr) {
             if (!AttachImeLocked(true, reason)) {
@@ -2475,8 +3148,12 @@ private:
                 m_terminal->updateSelection(m_terminal->getRows(), m_terminal->getCols());
                 break;
             case IME_EXTEND_ACTION_COPY:
-            case IME_EXTEND_ACTION_CUT:
+                QueueCopyRequest();
+                break;
             case IME_EXTEND_ACTION_PASTE:
+                QueuePasteRequest();
+                break;
+            case IME_EXTEND_ACTION_CUT:
             default:
                 break;
         }
@@ -2587,12 +3264,25 @@ private:
         std::u16string surrounding;
         int32_t cursorIndex = 0;
         CaptureImeSurroundingText(surrounding, cursorIndex);
-        OH_InputMethodProxy_NotifySelectionChange(
-            m_imeInputMethodProxy,
-            surrounding.empty() ? nullptr : surrounding.data(),
-            surrounding.size(),
-            cursorIndex,
-            cursorIndex);
+        // Throttle the selection binder IPC: the render loop calls this every
+        // frame while the keyboard is up. Only push when the surrounding text or
+        // caret index actually changed (or the cache was invalidated by a
+        // show/attach/session-reset that needs a fresh push).
+        const bool selectionChanged =
+            !m_lastImeSelectionValid ||
+            m_lastImeSurroundingCursor != cursorIndex ||
+            m_lastImeSurrounding != surrounding;
+        if (selectionChanged) {
+            OH_InputMethodProxy_NotifySelectionChange(
+                m_imeInputMethodProxy,
+                surrounding.empty() ? nullptr : surrounding.data(),
+                surrounding.size(),
+                cursorIndex,
+                cursorIndex);
+            m_lastImeSelectionValid = true;
+            m_lastImeSurrounding = surrounding;
+            m_lastImeSurroundingCursor = cursorIndex;
+        }
 
         if (m_windowScreenOriginKnown || m_surfaceScreenOriginKnown || m_lastImeBaseKnown) {
             double baseLeft = 0.0;
@@ -2727,13 +3417,44 @@ private:
                 m_lastLoggedFallbackToLastBase = fallbackToLastImeBase;
                 m_lastLoggedSurfaceLooksWindowLocal = surfaceLooksWindowLocal;
             }
-            InputMethod_CursorInfo* cursorInfo =
-                OH_CursorInfo_Create(left, top, static_cast<double>(cursorWidth), static_cast<double>(cursorHeight));
-            if (cursorInfo != nullptr) {
-                OH_InputMethodProxy_NotifyCursorUpdate(m_imeInputMethodProxy, cursorInfo);
-                OH_CursorInfo_Destroy(cursorInfo);
+            // Throttle the cursor-rect binder IPC the same way: only push when the
+            // rect drifts by more than 1px on any edge (or the cache was
+            // invalidated). Sub-pixel jitter from the render loop must not turn
+            // into a per-frame cross-process NotifyCursorUpdate.
+            const double sentWidth = static_cast<double>(cursorWidth);
+            const double sentHeight = static_cast<double>(cursorHeight);
+            const bool cursorRectChanged =
+                !m_lastImeCursorRectValid ||
+                std::fabs(m_lastImeCursorLeft - left) > 1.0 ||
+                std::fabs(m_lastImeCursorTop - top) > 1.0 ||
+                std::fabs(m_lastImeCursorWidth - sentWidth) > 1.0 ||
+                std::fabs(m_lastImeCursorHeight - sentHeight) > 1.0;
+            if (cursorRectChanged) {
+                InputMethod_CursorInfo* cursorInfo =
+                    OH_CursorInfo_Create(left, top, sentWidth, sentHeight);
+                if (cursorInfo != nullptr) {
+                    OH_InputMethodProxy_NotifyCursorUpdate(m_imeInputMethodProxy, cursorInfo);
+                    OH_CursorInfo_Destroy(cursorInfo);
+                }
+                m_lastImeCursorRectValid = true;
+                m_lastImeCursorLeft = left;
+                m_lastImeCursorTop = top;
+                m_lastImeCursorWidth = sentWidth;
+                m_lastImeCursorHeight = sentHeight;
             }
         }
+    }
+
+    // Force the next NotifyImeStateLocked to re-push both the selection and the
+    // cursor rect even if the values match the throttle cache. Called whenever a
+    // show/attach/session hand-off invalidates the IME service's mirror of our
+    // state so the keyboard re-anchors to the caret immediately.
+    void InvalidateImeReportCacheLocked()
+    {
+        m_lastImeSelectionValid = false;
+        m_lastImeSurroundingCursor = -1;
+        m_lastImeSurrounding.clear();
+        m_lastImeCursorRectValid = false;
     }
 
     bool OwnsProcessImeProxyLocked() const
@@ -2763,6 +3484,7 @@ private:
         }
         m_imeInputMethodProxy = nullptr;
         m_imeVisible = false;
+        InvalidateImeReportCacheLocked();
     }
 
     std::string m_id;
@@ -2774,6 +3496,10 @@ private:
     std::string m_rendererError;
     float m_density = 1.0f;
     float m_fontSize = 14.0f;
+    // Requested scrollback depth from the ETS TerminalConfig. Captured in
+    // SetConfig and fed into the Terminal constructor (ghostty_vt only honors
+    // scrollback at creation time), so the ETS value truly takes effect.
+    int m_scrollbackLines = Terminal::kDefaultMaxScrollback;
 
     float m_lastTouchY = 0.0f;
     bool m_isTouching = false;
@@ -2798,6 +3524,38 @@ private:
     float m_touchStartY = 0.0f;
     float m_touchScrollRemainderY = 0.0f;
     double m_axisScrollRemainderY = 0.0;
+    // Trackpad swipe velocity tracker (input thread only).
+    float m_axisVelocityY = 0.0f;
+    // Smooth-scroll pixel pool: input threads add travel, the render thread
+    // consumes it (full lines -> scrollView, remainder -> blit fraction) in
+    // one step per frame so the fraction can never wrap out of sync with the
+    // line scroll. m_smoothScrollFracPx is render-thread private.
+    // Selection-drag edge auto-scroll: while a selection drag hovers in the
+    // top/bottom edge band the render loop keeps scrolling (through the
+    // smooth pixel pool) and extends the selection toward the last pointer
+    // position -- long copies no longer stall at the viewport edge.
+    std::atomic<float> m_selAutoScrollVel { 0.0f };  // px/s, + = toward bottom
+    std::atomic<float> m_selPointerX { 0.0f };
+    std::atomic<float> m_selPointerY { 0.0f };
+    std::atomic<double> m_smoothScrollPendingPx { 0.0 };
+    std::atomic<bool> m_smoothSnapRequested { false };
+    double m_smoothScrollFracPx = 0.0;
+    std::mutex m_notificationMutex;
+    std::vector<std::string> m_pendingNotifications;
+    uint64_t m_lastAxisSampleMs = 0;
+    // Swipe velocity tracker (touch thread only).
+    float m_touchVelocityY = 0.0f;
+    uint64_t m_lastTouchMoveSampleMs = 0;
+    // Fling animation state, guarded by m_renderMutex and advanced by the
+    // render thread. Positive velocity scrolls downward (finger swiped up).
+    bool m_flingActive = false;
+    bool m_flingAsWheel = false;
+    float m_flingVelocityY = 0.0f;
+    float m_flingRemainderY = 0.0f;
+    std::chrono::steady_clock::time_point m_selScrollLastTick = std::chrono::steady_clock::now();
+    float m_flingPointerX = 0.0f;
+    float m_flingPointerY = 0.0f;
+    std::chrono::steady_clock::time_point m_flingLastTick {};
     uint64_t m_touchStartTime = 0;
     uint64_t m_lastClickTimeMs = 0;
 
@@ -2825,11 +3583,28 @@ private:
     double m_lastLoggedSentTop = 0.0;
     bool m_lastLoggedFallbackToLastBase = false;
     bool m_lastLoggedSurfaceLooksWindowLocal = false;
+    // IME IPC throttle cache: last values actually pushed to the input-method
+    // service, so unchanged frames skip the NotifySelectionChange /
+    // NotifyCursorUpdate binder round-trips (software keyboard in place otherwise
+    // fires 2 cross-process IPCs every rendered frame). Invalidated on
+    // show/attach/session hand-off via InvalidateImeReportCacheLocked().
+    bool m_lastImeSelectionValid = false;
+    std::u16string m_lastImeSurrounding;
+    int32_t m_lastImeSurroundingCursor = -1;
+    bool m_lastImeCursorRectValid = false;
+    double m_lastImeCursorLeft = 0.0;
+    double m_lastImeCursorTop = 0.0;
+    double m_lastImeCursorWidth = 0.0;
+    double m_lastImeCursorHeight = 0.0;
     std::string m_filesDir;
     std::mutex m_inputMutex;
     std::string m_pendingInput;
     std::string m_pendingLinkActivation;
     std::string m_pendingContextMenuRequest;
+    std::string m_pendingCopyRequest;
+    std::string m_pendingPasteRequest;
+    std::mutex m_osc52Mutex;
+    std::string m_pendingOsc52Sequence;
     napi_threadsafe_function m_inputTsfn = nullptr;
     InputMethod_TextEditorProxy* m_imeTextEditorProxy = nullptr;
     InputMethod_InputMethodProxy* m_imeInputMethodProxy = nullptr;
@@ -3168,6 +3943,15 @@ static napi_value DrainPendingTitle(napi_env env, napi_callback_info info) {
     return result;
 }
 
+static napi_value DrainPendingNotification(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    napi_value result;
+    const std::string pending = host ? host->DrainPendingNotification() : std::string();
+    napi_create_string_utf8(env, pending.c_str(), pending.length(), &result);
+    return result;
+}
+
 static napi_value DrainPendingLinkActivation(napi_env env, napi_callback_info info) {
     size_t argc = 0;
     TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
@@ -3289,6 +4073,55 @@ static napi_value ScrollView(napi_env env, napi_callback_info info) {
     }
     return nullptr;
 }
+
+static napi_value GetScrollbarState(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    const TerminalScrollbarState state = host ? host->GetScrollbarState() : TerminalScrollbarState {};
+    napi_value result;
+    napi_create_object(env, &result);
+    napi_value totalVal;
+    napi_create_int32(env, state.total, &totalVal);
+    napi_set_named_property(env, result, "total", totalVal);
+    napi_value offsetVal;
+    napi_create_int32(env, state.offset, &offsetVal);
+    napi_set_named_property(env, result, "offset", offsetVal);
+    napi_value visibleVal;
+    napi_create_int32(env, state.visible, &visibleVal);
+    napi_set_named_property(env, result, "visible", visibleVal);
+    return result;
+}
+
+static napi_value ScrollToOffset(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, args);
+    if (host && argc >= 1) {
+        int32_t offset = 0;
+        napi_get_value_int32(env, args[0], &offset);
+        host->ScrollToOffset(offset);
+    }
+    return nullptr;
+}
+
+static napi_value DrainPendingCopyRequest(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    napi_value result;
+    const std::string content = host ? host->DrainPendingCopyRequest() : std::string();
+    napi_create_string_utf8(env, content.c_str(), content.length(), &result);
+    return result;
+}
+
+static napi_value DrainPendingPasteRequest(napi_env env, napi_callback_info info) {
+    size_t argc = 0;
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, nullptr);
+    napi_value result;
+    const std::string content = host ? host->DrainPendingPasteRequest() : std::string();
+    napi_create_string_utf8(env, content.c_str(), content.length(), &result);
+    return result;
+}
+
 
 static napi_value ResetScroll(napi_env env, napi_callback_info info) {
     size_t argc = 0;
@@ -3551,7 +4384,9 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     napi_value cursorStyleVal;
     napi_value cursorBlinkVal;
     napi_value bgOpacityVal = nullptr;
+    napi_value fontFamilyVal = nullptr;
     napi_get_named_property(env, args[0], "fontSize", &fontSizeVal);
+    napi_get_named_property(env, args[0], "fontFamily", &fontFamilyVal);
     napi_get_named_property(env, args[0], "scrollbackLines", &scrollbackVal);
     napi_get_named_property(env, args[0], "bgColor", &bgColorVal);
     napi_get_named_property(env, args[0], "fgColor", &fgColorVal);
@@ -3560,14 +4395,20 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     napi_get_named_property(env, args[0], "bgOpacity", &bgOpacityVal);
 
     int32_t fontSize = 14;
-    int32_t scrollbackLines = 10000;
+    // Fallback when the ETS config omits scrollbackLines; kept aligned with the
+    // native Terminal default and the ETS value so no path silently caps lower.
+    int32_t scrollbackLines = Terminal::kDefaultMaxScrollback;
     uint32_t bgColor = 0xFF000000;
     uint32_t fgColor = 0xFFFFFFFF;
     int32_t cursorStyle = 0;
     bool cursorBlink = true;
     double bgOpacity = 1.0;
+    std::string fontFamily = "FusionTerm Maple Mono";
 
     napi_get_value_int32(env, fontSizeVal, &fontSize);
+    if (fontFamilyVal != nullptr) {
+        TryReadStringArg(env, fontFamilyVal, fontFamily);
+    }
     napi_get_value_int32(env, scrollbackVal, &scrollbackLines);
     napi_get_value_uint32(env, bgColorVal, &bgColor);
     napi_get_value_uint32(env, fgColorVal, &fgColor);
@@ -3579,7 +4420,7 @@ static napi_value SetConfig(napi_env env, napi_callback_info info) {
     if (!(bgOpacity >= 0.0 && bgOpacity <= 1.0)) {
         bgOpacity = 1.0;
     }
-    host->SetConfig(fontSize, scrollbackLines, bgColor, fgColor, cursorStyle, cursorBlink, bgOpacity);
+    host->SetConfig(fontSize, scrollbackLines, bgColor, fgColor, cursorStyle, cursorBlink, bgOpacity, fontFamily);
     return nullptr;
 }
 
@@ -3665,11 +4506,14 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"setImeActive", nullptr, SetImeActive, nullptr, nullptr, nullptr, napi_default, host},
         {"registerCustomFont", nullptr, RegisterCustomFont, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingTitle", nullptr, DrainPendingTitle, nullptr, nullptr, nullptr, napi_default, host},
+        {"drainPendingNotification", nullptr, DrainPendingNotification, nullptr, nullptr, nullptr, napi_default, host},
         {"feedOutput", nullptr, FeedOutput, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingInput", nullptr, DrainPendingInput, nullptr, nullptr, nullptr, napi_default, host},
         {"setInputCallback", nullptr, SetInputCallback, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingLinkActivation", nullptr, DrainPendingLinkActivation, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingContextMenuRequest", nullptr, DrainPendingContextMenuRequest, nullptr, nullptr, nullptr, napi_default, host},
+        {"drainPendingCopyRequest", nullptr, DrainPendingCopyRequest, nullptr, nullptr, nullptr, napi_default, host},
+        {"drainPendingPasteRequest", nullptr, DrainPendingPasteRequest, nullptr, nullptr, nullptr, napi_default, host},
         {"resizeTerminal", nullptr, ResizeTerminal, nullptr, nullptr, nullptr, napi_default, host},
         {"getScreenContent", nullptr, GetScreenContent, nullptr, nullptr, nullptr, napi_default, host},
         {"getCursorPosition", nullptr, GetCursorPosition, nullptr, nullptr, nullptr, napi_default, host},
@@ -3678,6 +4522,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, host},
         {"setResourceManager", nullptr, SetResourceManager, nullptr, nullptr, nullptr, napi_default, host},
         {"scrollView", nullptr, ScrollView, nullptr, nullptr, nullptr, napi_default, host},
+        {"getScrollbarState", nullptr, GetScrollbarState, nullptr, nullptr, nullptr, napi_default, host},
+        {"scrollToOffset", nullptr, ScrollToOffset, nullptr, nullptr, nullptr, napi_default, host},
         {"resetScroll", nullptr, ResetScroll, nullptr, nullptr, nullptr, napi_default, host},
         {"getScrollbackSize", nullptr, GetScrollbackSize, nullptr, nullptr, nullptr, napi_default, host},
         {"startSelection", nullptr, StartSelection, nullptr, nullptr, nullptr, napi_default, host},
@@ -3705,6 +4551,41 @@ static napi_value Init(napi_env env, napi_value exports) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Cross-.so direct output sink (PTY/SSH native direct-connect).
+//
+// The entry module's PTY/SSH reader thread resolves this symbol via
+// dlsym(RTLD_DEFAULT) — the mirror of the ExampleDriverWriteInputUtf8 bridge
+// libghostty already uses in the reverse direction — and hands decoded UTF-8
+// chunks straight to the owning surface's FeedOutput. That bypasses the
+// NAPI + JS string round trip (native -> threadsafe fn -> ArkTS outputListener
+// -> controller.feed -> native feedOutput) that otherwise floods the UI thread
+// when a large file is `cat`ed.
+//
+// FeedOutput is the same thread-safe entry point the JS `feedOutput` NAPI uses:
+// Terminal::feedOutput takes m_stateMutex and the OSC 52/OSC 9 captures run
+// inside it, so a foreign reader thread may call this directly. The only locks
+// taken here are g_hostsMutex (via FindHostById, released before FeedOutput)
+// and then m_stateMutex, so no libghostty lock is ever nested with another.
+//
+// Returns false when no surface named `surfaceId` is currently registered so
+// the caller falls back to its threadsafe-function path — output produced
+// before the ETS side wires up the direct target is never dropped, and the two
+// paths never double-feed the same chunk.
+extern "C" __attribute__((visibility("default")))
+bool LibghosttyFeedOutputUtf8(const char* surfaceId, const uint8_t* data, size_t len)
+{
+    if (surfaceId == nullptr || data == nullptr) {
+        return false;
+    }
+    TerminalHost* host = FindHostById(std::string(surfaceId));
+    if (host == nullptr) {
+        return false;
+    }
+    host->FeedOutput(std::string(reinterpret_cast<const char*>(data), len));
+    return true;
+}
 
 EXTERN_C_START
 static napi_module terminalModule = {

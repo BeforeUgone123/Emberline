@@ -25,15 +25,18 @@ public:
 
     bool loadFontAtlas(NativeResourceManager* resourceManager, const std::string& filesDir) override;
     bool registerCustomFont(const std::string& fontPath) override;
+    void setFontFamily(const std::string& family) override;
 
     void beginFrame() override;
     void renderGrid(const std::vector<Cell>& cells, int cols, int rows,
                     int cursorRow, int cursorCol, bool cursorVisible,
                     const std::vector<uint8_t>& dirtyRows) override;
+    void shiftOffscreen(int rowDelta) override;
     void endFrame() override;
 
 protected:
     void updateCellDimensions() override;
+    void onFontMetricsChanged() override;
 
 private:
     enum class LineStyle : uint8_t {
@@ -105,6 +108,7 @@ private:
     OH_Drawing_FontCollection* m_fontCollection = nullptr;
 
     std::unordered_map<GlyphKey, GlyphLayout, GlyphKeyHash> m_glyphCache;
+    std::string m_preferredFontFamily = "FusionTerm Maple Mono";
     std::string m_primaryFontFamily = "libghostty Mono";
     std::string m_symbolFontFamily = "libghostty Nerd Symbols";
     bool m_fontsConfigured = false;
@@ -119,5 +123,43 @@ private:
     int32_t m_offscreenFormat = -1;
     bool m_offscreenValid = false;
 
+    // Persistent scratch marking which cells drew a built-in (box/line) glyph
+    // in the first pass so the text pass can skip them. Reused across frames
+    // (resized only when the grid geometry changes) and cleared per dirty row
+    // instead of reallocated and zeroed every frame.
+    std::vector<uint8_t> m_geometryMask;
+
+    // --- Scroll-damage + partial-present bookkeeping ------------------------
+    // Which offscreen grid rows actually changed *this* frame. Set by
+    // renderGrid (dirty rows it repainted) / shiftOffscreen (whole offscreen
+    // moved); consumed by endFrame to age each rotating window buffer.
+    bool m_frameOffscreenFull = false;   // whole offscreen changed this frame
+    bool m_shiftedThisFrame = false;     // shiftOffscreen ran this frame
+    std::vector<uint8_t> m_frameOffscreenRows;  // per grid row, size == m_offscreenRows
+    int m_offscreenRows = 0;             // grid rows behind the offscreen
+    float m_offscreenRowHeight = 0.0f;   // cell height used for row->pixel mapping
+
+    // Per rotating window buffer (keyed by OH_NativeBuffer_GetSeqNum): the set
+    // of offscreen rows that changed since that buffer was last presented, plus
+    // the smooth-scroll shift baked into it. A buffer whose content is unknown
+    // or was shifted is marked full and gets a whole-surface blit.
+    struct BufferBlitState {
+        bool full = true;
+        int lastShift = 0;
+        std::vector<uint8_t> staleRows;  // size == m_offscreenRows; ignored when full
+    };
+    std::unordered_map<uint32_t, BufferBlitState> m_bufferBlit;
+
+    // Smooth-scroll shift baked into the most recently *presented* frame. When
+    // this frame's shift differs, every on-screen row changed relative to the
+    // last flush, so the whole surface must be blitted and damaged.
+    int m_lastPresentedShift = 0;
+
+    // Damage rectangles handed to FlushBuffer; kept alive across the call.
+    std::vector<Region::Rect> m_damageRects;
+
     bool ensureOffscreen(uint32_t width, uint32_t height);
+    void resetBufferBlitHistory();
+    uint32_t backgroundFillPixel() const;
+    void pixelRowSpan(int row, int rowsTotal, int32_t& top, int32_t& bottom) const;
 };

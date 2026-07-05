@@ -2,9 +2,10 @@ import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 
 // Persisted appearance customization: user font, background image, acrylic
-// blur, terminal background opacity, theme, and font size.
+// blur, terminal background opacity, theme, font family, and font size.
 export interface AppearanceSettings {
   fontSize: number;
+  fontFamily: string;
   themeName: string;
   customFontPath: string;
   backgroundImagePath: string;
@@ -12,19 +13,22 @@ export interface AppearanceSettings {
   backgroundBlur: number;
   cursorStyle: number;
   cursorBlink: boolean;
+  pasteDirUri: string;
 }
 
 // Defaults mirror the desktop Ghostty profile (font-size 13,
 // background-opacity 0.91, background-blur 12, Catppuccin Mocha).
 export const DEFAULT_APPEARANCE: AppearanceSettings = {
   fontSize: 13,
+  fontFamily: 'FusionTerm Maple Mono',
   themeName: 'Catppuccin_Mocha',
   customFontPath: '',
   backgroundImagePath: '',
   backgroundOpacity: 0.91,
   backgroundBlur: 12,
   cursorStyle: 2,
-  cursorBlink: false
+  cursorBlink: false,
+  pasteDirUri: ''
 };
 
 const STORE_NAME: string = 'fusionterm_appearance';
@@ -36,13 +40,15 @@ export class AppearanceStore {
     this.prefs = await preferences.getPreferences(context, STORE_NAME);
     const loaded: AppearanceSettings = {
       fontSize: await this.readNumber('fontSize', DEFAULT_APPEARANCE.fontSize),
+      fontFamily: await this.readString('fontFamily', DEFAULT_APPEARANCE.fontFamily),
       themeName: await this.readString('themeName', DEFAULT_APPEARANCE.themeName),
       customFontPath: await this.readString('customFontPath', DEFAULT_APPEARANCE.customFontPath),
       backgroundImagePath: await this.readString('backgroundImagePath', DEFAULT_APPEARANCE.backgroundImagePath),
       backgroundOpacity: await this.readNumber('backgroundOpacity', DEFAULT_APPEARANCE.backgroundOpacity),
       backgroundBlur: await this.readNumber('backgroundBlur', DEFAULT_APPEARANCE.backgroundBlur),
       cursorStyle: await this.readNumber('cursorStyle', DEFAULT_APPEARANCE.cursorStyle),
-      cursorBlink: await this.readBoolean('cursorBlink', DEFAULT_APPEARANCE.cursorBlink)
+      cursorBlink: await this.readBoolean('cursorBlink', DEFAULT_APPEARANCE.cursorBlink),
+      pasteDirUri: await this.readString('pasteDirUri', DEFAULT_APPEARANCE.pasteDirUri)
     };
     return loaded;
   }
@@ -52,6 +58,7 @@ export class AppearanceStore {
       return;
     }
     await this.prefs.put('fontSize', settings.fontSize);
+    await this.prefs.put('fontFamily', settings.fontFamily);
     await this.prefs.put('themeName', settings.themeName);
     await this.prefs.put('customFontPath', settings.customFontPath);
     await this.prefs.put('backgroundImagePath', settings.backgroundImagePath);
@@ -59,6 +66,7 @@ export class AppearanceStore {
     await this.prefs.put('backgroundBlur', settings.backgroundBlur);
     await this.prefs.put('cursorStyle', settings.cursorStyle);
     await this.prefs.put('cursorBlink', settings.cursorBlink);
+    await this.prefs.put('pasteDirUri', settings.pasteDirUri);
     await this.prefs.flush();
   }
 

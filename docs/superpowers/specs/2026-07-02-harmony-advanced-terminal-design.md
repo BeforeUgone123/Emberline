@@ -8,7 +8,8 @@ VM, while keeping the renderer library reusable and unpolluted by app chrome.
 
 ## Product Positioning
 
-FusionTerm is the app/product codename inside the `HMG` GitHub repository. The
+Emberline is the current app/product name and GitHub repository name. Earlier
+notes used `FusionTerm` as the app codename inside the `HMG` repository. The
 first product promise is a native-feeling HarmonyOS developer terminal for the
 Fusion Development Engine Linux VM, not a full Ghostty desktop GUI port and not
 a general SSH manager.

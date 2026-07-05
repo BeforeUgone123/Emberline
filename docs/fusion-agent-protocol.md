@@ -200,8 +200,10 @@ its `ready.capabilities` list:
 The agent should terminate the PTY process group, flush remaining output, emit
 `exit` when possible, and close the WebSocket. FusionTerm does not send this
 JSON control to stock `wand-agent` because unknown text frames may be forwarded
-to the PTY. For stock compatibility, closing a tab sends terminal bytes for
-Ctrl-C followed by `exit` before closing the socket.
+to the PTY. It also must not synthesize terminal bytes such as Ctrl-C or `exit`
+when closing a tab: if the user is attached to tmux, those bytes can interrupt
+the foreground task running inside tmux. Stock compatibility is passive socket
+close only; the agent owns whatever socket-close cleanup policy it implements.
 
 ### Exit
 

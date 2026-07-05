@@ -11,7 +11,7 @@ assert.match(
 
 assert.match(
   renderer,
-  /families\.push_back\(kDefaultTerminalFontFamily\);\s*families\.push_back\(m_primaryFontFamily\.c_str\(\)\);/s,
+  /PushUniqueFontFamily\(families, kDefaultTerminalFontFamily\);\s*PushUniqueFontFamily\(families, m_primaryFontFamily\.c_str\(\)\);/s,
   'PingFang SC must be requested before the registered terminal fallback family'
 );
 

@@ -1,0 +1,637 @@
+{
+ "code": [
+  {
+   "finder": "渲染管线",
+   "findings": [
+    {
+     "title": "行级滚动强制全屏重栅格化——持久离屏+脏行体系在滚动时被完全绕过(2.5K 90-120Hz 撑不住的根因)",
+     "detail": "机理:terminal.cpp:2020-2024 把 `viewportTopRow != m_lastViewportTopRow` 纳入 fullRepaint 判定。拖动/fling 每跨一行(快滑时几乎每帧都跨行)→ fullRepaint=true → renderGrid 走全量路径:native_drawing_renderer.cpp:630 CanvasClear 整块 ~16MB 离屏 + 647-793 对所有行重刷背景并重排/重绘全部文字 run。离屏保活+脏行跳过(627-628 判定、648/717 `continue`)只在静止态(打字/光标闪)生效,恰在平滑滚动这个团队最在意的场景失效。滚屏时上万格里其实只有 1 行是真正新内容(其余只是整体上移一行,run 字符串不变、缓存命中),却把整屏重刷了。修复思路:检测『纯 viewport 位移 N 行、无 selection/search、VT 内容未变』时,对 m_offscreenPixels 整体 memmove 上/下移 N*cellHeight(或引入滚动原点 ring 离屏),只把新暴露的 N 行标脏交给 renderGrid;进一步把整行位移折进 endFrame 已有的像素 shift blit(825-846),做到每滚动帧=渲染1行+一次 blit。",
+     "impact": "预算实测:一帧线交叉现状≈CanvasClear 16MB + 全屏背景填充 ~16MB + endFrame 读写 32MB ≈ >64MB 内存流量 + 10 万+ 绘制调用;120Hz 需 ~7.8GB/s 单核带宽,MatePad Edge 2.5K(2560×1600×4=16.4MB/缓冲)的 LPDDR5 单核撑不住 → 90-120Hz 平滑滚动无法维持,快速 flick/长滚会中段掉帧、机身发烫。shift 化后每帧降到 ~16-32MB 流量+个位数行渲染,才可能进 90-120Hz。这是滚动流畅度的头号瓶颈。",
+     "effort": "large",
+     "priority": "P0"
+    },
+    {
+     "title": "endFrame 每帧无条件全屏 16MB blit,与脏行无关",
+     "detail": "机理:native_drawing_renderer.cpp:805-848,无论本帧只脏 1 行(光标闪/单键回显)还是全屏,都把整块离屏 memcpy 进窗口 buffer(shift==0 时 816 单次 16MB memcpy;stride≠rowBytes 时 818 逐行);且 850-852 dirtyRegion 恒 {nullptr,0},FlushBuffer 不告诉合成器变化区域 → 合成器可能整面重合成。因 buffer queue 轮转(注释 569)不能天真跳过未变行。修复思路:按 OH_NativeBuffer seqNum 维护每个轮转 buffer 的『上次呈现内容版本』,只拷贝自该 buffer 上次 flush 以来变化的行(3 缓冲通常≤最近 3 帧脏行并集);同时给 FlushBuffer 传真实 dirtyRegion。滚动场景整屏都变故此项对滚动无益,但对打字/光标闪/待机是纯削减。",
+     "impact": "光标每 250ms 闪一次、每次打字回显、平滑滚动每个子行 tick 都要拷 2.5K 整块(~1.6ms/帧固定成本,占 120Hz 预算 8.3ms 的约 20%),纯空转 → 打字回显延迟与待机功耗/发热偏高。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "renderGrid 每格单独 DrawRect 画背景 + 每格 attach/detach 画刷,无同色背景横向合并",
+     "detail": "机理:native_drawing_renderer.cpp:684 每个 cell 调 paintCellBackground;其内 1132-1139 每次都 BrushSetBlendMode(SRC)+AttachBrush+RectSet×4+DrawRect+DetachBrush ≈ 9 次 OH_Drawing 调用/格。全屏 200×60≈12000 格 → 光背景就 ~10 万绘制调用/全量帧,且画刷每格 attach/detach(blend 恒 SRC、只有颜色变)。文字 run 已做同 style 合并(754-781),背景却没有。修复思路:仿文字 run,把同 bg 的横向连续格合并成一个 DrawRect;整行(或整帧)只 attach 一次画刷,循环内只 BrushSetColor。",
+     "impact": "全量帧(=每个滚动帧、每次全屏程序重绘)绘制调用数量级下降,直接减轻滚动与大量输出时的 CPU 占用与掉帧。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "drawFrame 每帧分配并清零 ~1.15MB Cell 数组 + geometryMask,即使只脏一行",
+     "detail": "机理:terminal.cpp:1973 `std::vector<Cell> cells(m_cols*m_rows)`——Cell 内含 text[64](kGhosttyTextCapacity=64,terminal.cpp:100),单 Cell≈96B,200×60≈12000 格 ≈1.15MB,每帧堆分配+值初始化(清零),且分配落在 stateMutex 持锁段内(1961-2192)。非脏行的 cell 构造后 renderGrid 根本不读(648/717 跳过)。native_drawing_renderer.cpp:645 geometryMask 同样每帧 new rows*cols 并清零。修复思路:cells 与 geometryMask 改为持久成员 buffer(仅 cols*rows 变化时 resize),每帧只重写脏行、只 memset 脏行对应的 geometryMask。",
+     "impact": "每一帧(含每次打字、每 250ms 光标闪、每个滚动 tick)都做 ~1.15MB memset + 堆 churn,抬高打字回显延迟与待机开销;在持锁期做大分配还额外延长锁占用(见争锁项)。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "每脏行为搜索构建 rowText/rowByteStart/rowByteEnd,但仅 searchActive 时才用到",
+     "detail": "机理:terminal.cpp:2043-2046 每脏行分配 rowText(reserve m_cols,>SSO→堆)+ rowByteStart + rowByteEnd 两个 size_t 向量;2064-2070 每格 push_back 并做 UTF-8 编码填充;而这些数据只在 2125-2150 的 `if (searchActive && !searchQuery.empty())` 分支被读取。非搜索态(绝大多数时间,尤其滚动 fullRepaint 帧)= 每脏行 3 次堆分配 + 每格一次 UTF-8 编码,全白烧。修复思路:整段(rowText/rowByte* 的构建)用 `if (searchActive)` 包起,非搜索路径不建。",
+     "impact": "滚动与大量输出时每帧 rows×(3 次分配 + cols 次编码)纯浪费 CPU,直接吃掉滚动帧预算。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "平滑滚动子行 fraction 的呈现依赖光标闪烁开启;稳定光标(vim/less/关闭闪烁)下退化为逐行跳",
+     "detail": "机理:滚动的子行位移只改 setScrollFraction(napi_init.cpp:2257),不产生任何 VT 脏行/viewport 变化。drawFrame 在 terminal.cpp:2174 `if (!fullRepaint && !anyDirtyRow && !cursorMoved && !m_renderer->cursorBlinkEnabled()) return;`——闪烁开(默认 m_cursorBlink=true)时此条恒为假不早退,靠『每帧都渲染』把 fraction blit 出去;一旦 app 下 DECSCUSR 切稳定光标或用户关闭闪烁(cursorBlink=false,由渲染态经 napi_init.cpp:1977 驱动),无内容变化的 fling/拖动 tick 会命中早退 → 新 fraction 不被 blit → 平滑滚动变成一顿一顿逐行跳。修复思路:记录 scrollFraction 相对上帧是否变化,变了就不早退(至少走一次 beginFrame/endFrame blit)。",
+     "impact": "在 vim/less/htop 等稳定光标全屏程序里滑动明显发涩/顿挫,而这恰是最常滚动的场景;体感与『平滑滚动』宣称直接矛盾。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "整屏 cell 快照全程在 m_stateMutex 内,与键盘/鼠标/PTY feed 争锁",
+     "detail": "机理:terminal.cpp:1961 加锁直到 2192 才 unlock;其间 2029-2160 对每脏行每 col 做 ~6 次 ghostty_cell_get/style FFI + 颜色解析 + 搜索匹配。全量帧(滚动)= rows×cols≈上万格 × ~6 FFI ≈ 10 万次 FFI 全在锁内。该锁与键盘输入、鼠标、feedOutput(PTY 读线程喂输出)共享。注释(1958)只保证像素工作在锁外,但昂贵的 cell 快照本身在锁内。修复思路:主要靠降低全量帧频率(见 shift 化项)与砍搜索构建(见上项)缩短持锁;彻底根治需把行迭代原始结果批量拷出后再在锁外解析样式/颜色。",
+     "impact": "大量输出(cat 大文件)或快速滚动时,按键回显与触摸响应被整屏快照阻塞,手感发黏;feedOutput 被堵还拖慢终端吞吐。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "glyph 缓存把 fg 颜色纳入 key + 淘汰非 LRU(按 hash 桶顺序隔一删一)",
+     "detail": "机理:GlyphKey 含 fg(native_drawing_renderer.h:57;key 组装于 .cpp:1014-1018)——同字不同色各占一条缓存并各自 shape+layout,而 shaping 与颜色无关(颜色本可绘制时设,但 OH_Drawing 段落 API 把颜色烘进 TextStyle,属结构约束)。cap=kMaxGlyphCacheEntries=4096;trimGlyphCache(984-1003)按迭代(hash 桶)顺序隔一删一,非按最近使用 → 可能删掉当前可见 glyph、留下冷条目,注释所称『keep hot set warm』名不副实。修复思路:淘汰改真 LRU(带访问序戳);颜色维度难解耦时至少减小其影响(run 合并只用于绘制、单字排版层单独缓存)。",
+     "impact": "彩色/动画 TUI(语法高亮、进度条、spinner)会灌满缓存并随机淘汰,触发当前可见 glyph 反复重排,滚动/刷新时出现零星卡顿。",
+     "effort": "small",
+     "priority": "P2"
+    }
+   ],
+   "verdicts": [
+    {
+     "title": "行级滚动强制全屏重栅格化——持久离屏+脏行体系在滚动时被完全绕过(2.5K 90-120Hz 撑不住的根因)",
+     "verdict": "confirmed",
+     "note": "代码与机理都核实。terminal.cpp:2020-2024 fullRepaint 判定里确有 `viewportTopRow != m_lastViewportTopRow` 这一项;scrollView(1129,加 m_stateMutex 锁)改 scrollbar.offset→drawFrame:1997-2001 重算 viewportTopRow→与 m_lastViewportTopRow(2184 保存)不等→fullRepaint=true。drawFrame:2197-2198 用 `fullRepaint ? std::vector<uint8_t>() : dirtyRows` 调 renderGrid,空 vector 语义=repaint everything(renderer.h:25-27),native_drawing_renderer.cpp:627-628 令 fullRepaint=true→630 CanvasClear 整块离屏、647-793 全行重画。全代码库无对 m_offscreenPixels 做整体 memmove/ring 位移的分支;endFrame 的 shift blit(824-846)只处理 sub-line fraction,不搬全行内容。napi_init.cpp:2237-2240 fling 每跨一行就 scrollView(lines),高速快滑几乎每帧跨行→每帧走全量路径。持久离屏+脏行跳过(648/717 continue)在滚动时确实被绕过。带宽数字是估算但方向成立,这是真实且未实现的头号优化点。"
+    },
+    {
+     "title": "endFrame 每帧无条件全屏 16MB blit,与脏行无关",
+     "verdict": "confirmed",
+     "note": "核实无误。native_drawing_renderer.cpp:805-848,只要 offscreen 有效且尺寸匹配就 blit 整块:shift==0 时 816 单次 `memcpy(dst, srcPixels, rowBytes*m_offscreenHeight)`(全屏),stride≠rowBytes 时 818-822 逐行拷全屏;完全不看 dirtyRows,连只脏 1 行的打字/光标闪帧也拷整块。850-852 `dirtyRegion{nullptr,0}` 恒空,859 FlushBuffer 传空 region→合成器不知变化区。注释 569-571 确证因 buffer queue 轮转不能天真跳过。发现也诚实指出对滚动无益、仅对打字/光标闪/待机是纯削减。时间估算(~1.6ms)是估值,但结论成立。"
+    },
+    {
+     "title": "renderGrid 每格单独 DrawRect 画背景 + 每格 attach/detach 画刷,无同色背景横向合并",
+     "verdict": "confirmed",
+     "note": "核实无误。native_drawing_renderer.cpp:684 每 cell 调 paintCellBackground;其体 1127-1140 每次 BrushSetColor+BrushSetBlendMode(SRC)+CanvasAttachBrush+RectSetLeft/Top/Right/Bottom(4)+CanvasDrawRect+CanvasDetachBrush ≈9 次 OH_Drawing 调用/格,blend 恒 SRC、只颜色变却每格 attach/detach。文字 run 确有同 style 横向合并(754-781 while 循环拼 runText),背景层却是每格独立 DrawRect、无同 bg 合并。全屏 full/滚动帧背景就 ~cols×rows×9 次调用,机理与影响成立。"
+    },
+    {
+     "title": "drawFrame 每帧分配并清零 ~1.15MB Cell 数组 + geometryMask,即使只脏一行",
+     "verdict": "confirmed",
+     "note": "核实无误。terminal.cpp:1973 `std::vector<Cell> cells(m_cols*m_rows)` 每帧堆分配+值初始化;Cell 含 text[64](kGhosttyTextCapacity=64,terminal.cpp:100;SetCellTextFromCodepoints/ClearCellText 操作 cell.text/textLen)+codepoint/width/attrs/selected,单 Cell≈88-96B,200×60×96≈1.15MB。非脏行不进内层 col 循环(2035-2039 needRow=false→continue),renderGrid 又 648/717 跳过非脏行,故其 cell 被 memset 后从不读。该分配在 m_stateMutex 持锁段内(1961-2192)。native_drawing_renderer.cpp:645 `std::vector<uint8_t> geometryMask(rows*cols,0)` 同样每帧 new+清零。持久成员 buffer 的修复思路成立。单帧绝对开销偏小(~0.1-0.3ms),但确是每帧真实浪费且叠加锁占用。"
+    },
+    {
+     "title": "每脏行为搜索构建 rowText/rowByteStart/rowByteEnd,但仅 searchActive 时才用到",
+     "verdict": "confirmed",
+     "note": "核实无误。terminal.cpp:2043-2046 每脏行分配 rowText(reserve m_cols)+rowByteStart+rowByteEnd 两个 vector<size_t>(m_cols);2064-2070 每格 push_back 并 AppendCodepointUtf8 编码填 rowByteStart/End;而这些量只在 2125-2139 的 `if (searchActive && !searchQuery.empty())` 分支被读(ByteRangesOverlap 用 cellStartByte/cellEndByte)。非搜索态整段纯浪费,滚动 fullRepaint 帧所有行都脏→rows×(3 次分配+cols 次 UTF-8 编码)。用 `if(searchActive)` 包起的修复成立。绝对开销不大,但确为可白拿的浪费;P1 略偏高但性质属实。"
+    },
+    {
+     "title": "平滑滚动子行 fraction 的呈现依赖光标闪烁开启;稳定光标(vim/less/关闭闪烁)下退化为逐行跳",
+     "verdict": "dubious",
+     "note": "代码级机理属实但影响场景描述有误。早退条件 terminal.cpp:2174 `if(!fullRepaint && !anyDirtyRow && !cursorMoved && !m_renderer->cursorBlinkEnabled()) return;` 确在;纯 fraction tick 只改 setScrollFraction(napi_init.cpp:2257),不产生 VT 脏行/viewport 变化,故 cursorBlink 关时会命中早退→新 fraction 不 blit→顿挫。但关键错误:cursorBlinkEnabled() 读 renderer 的 m_cursorBlink,全代码库仅由 setCursorStyle 设置,而 setCursorStyle 只在 napi_init.cpp:1977 的 SetConfig(用户配置)路径被调用——grep 全树无 DECSCUSR/渲染态→setCursorStyle 的接线。故 vim/less 下 DECSCUSR 切稳定光标**不会**改 cursorBlinkEnabled(),渲染器照常按默认 true 闪(4192/renderer.h:161 默认 true),这类程序里根本不触发该 bug。真实触发仅限用户显式配置 cursorBlink:false,属非默认窄化场景;发现把 napi_init.cpp:1977 说成『由渲染态驱动』、把主要影响归到 vim/less/htop『稳定光标全屏程序』均与代码不符。底层 bug(blink 关→fraction tick 早退)真实存在,但主打影响场景错误,故判 dubious。"
+    },
+    {
+     "title": "整屏 cell 快照全程在 m_stateMutex 内,与键盘/鼠标/PTY feed 争锁",
+     "verdict": "confirmed",
+     "note": "核实无误。drawFrame 于 terminal.cpp:1961 加 m_stateMutex,直到 2192 才 unlock;其间 2029-2159 对每脏行每 col 做多次 ghostty_cell_get/style/color FFI,全量帧=rows×cols×~6 FFI 全在锁内(注释 1958-1960 只承诺像素工作在锁外,cell 快照本身在锁内属实)。共享锁确证:feedOutput(PTY 读线程,520 加锁 ghostty_terminal_vt_write)、sendMouseEvent(1244 起)、scrollView(1129)、键盘编码经 cursorKeysApplicationMode(1197)→queryPrivateMode(1183 加锁)、bracketedPasteEnabled 均加同一 m_stateMutex。drawFrame 在渲染线程、feedOutput 在 PTY 线程,cat 大文件/快滑时确会互堵。P2 定级恰当,机理成立。"
+    },
+    {
+     "title": "glyph 缓存把 fg 颜色纳入 key + 淘汰非 LRU(按 hash 桶顺序隔一删一)",
+     "verdict": "confirmed",
+     "note": "核实无误。GlyphKey 含 fg(native_drawing_renderer.h:57,operator== 也比 fg:63),getGlyphLayout 于 .cpp:1016 `key.fg=attrs.fg` 组 key→同字不同色各占一条并各自建 typography+layout(shaping 本与色无关,但 1041 SetTextStyleColor 把色烘进 TextStyle,属 OH_Drawing 段落 API 结构约束)。cap kMaxGlyphCacheEntries=4096(.cpp:26)。trimGlyphCache(984-1002)在 size>4096 时 `for(...) if((index++&1)==0) erase` 按 unordered_map 迭代(hash 桶)顺序隔一删一,与最近使用无关,注释所称 keep hot set warm 名不副实、可能删掉当前可见 glyph。仅在累计>4096 个 (text,fg,style,span) key 时触发,需相当彩色/多样(尤其 CJK×多色)内容,影响自评『零星卡顿』诚实、P2 定级恰当。机理与影响成立。"
+    }
+   ]
+  },
+  {
+   "finder": "输入与线程",
+   "findings": [
+    {
+     "title": "终端输出每个 chunk 绕 JS 主线程一圈(TSFN→JS feed→feedOutput→native),是打字回显与 cat 吞吐的头号瓶颈",
+     "detail": "机理:PTY 读线程(terminal_driver.cpp:283 LocalReadLoop 每读 4096B;SSH 为阻塞读)→ EmitOutput(terminal_driver.cpp:347)做完 UTF-8 边界缓冲后 napi_call_threadsafe_function(:376 nonblocking)把整块投给 JS 事件循环 → outputListener(FusionTerminalDriver.ets:51)→ controller.feed(TerminalController.ets:363)→ native.feedOutput(:367)→ napi FeedOutput(napi_init.cpp:3640,把 JS string 再 marshal 回 native)→ host->FeedOutput(napi_init.cpp:1539)→ m_terminal->feedOutput。每个 chunk 代价:native→JS 一次字符串 marshal、一次 JS 事件循环调度跳、JS→native 再一次 marshal,外加 EmitOutput 里 m_pendingUtf8+=/substr/new std::string 若干次拷贝。整条输出热路径压在与 UI 布局/动画/16ms 轮询共享的 JS 主线程上。修复:照抄已有的输入侧 native sink(napi_init.cpp:43-59 dlsym 解析 ExampleDriverWriteInputUtf8,:972 读线程直接调)做对称的输出 native 通路——libghostty_ohos 导出 EmberlineFeedOutputUtf8(sessionId,ptr,len),terminal_driver 端 dlsym 后在读线程直接喂,按 sessionId→TerminalHost 注册表(仿 g_hostsById)路由,host 未就绪时回退现有 TSFN 路径。FeedOutput 内部只碰 m_terminal->feedOutput(自带 stateMutex)与各自 mutex,从读线程调用线程安全。",
+     "impact": "cat 大文件、编译刷屏、SSH 快速输出时,输出成块发涩、一顿一顿;当 JS 主线程正忙(切 tab、开抽屉、跑动画)时连物理键盘打字的回显都被这条链路拖慢。这是全程常开的成本,影响面最大。",
+     "effort": "large",
+     "priority": "P0"
+    },
+    {
+     "title": "DispatchKeyEvent 仅为读两个 bool 抢 m_surfaceMutex,与渲染线程整帧持锁(光栅化+全屏 blit)硬撞 → 刷屏时打字回显滞后",
+     "detail": "机理:渲染线程在 napi_init.cpp:2264-2279 用 lock_guard 持 m_surfaceMutex(recursive)跑完一整帧——drawFrame 的像素光栅化 + endFrame 的全屏 blit 全部在这把锁内(drawFrame 内部只有快照阶段短持 stateMutex,像素工作并不释放 surfaceMutex)。而 DispatchKeyEvent(napi_init.cpp:950-955)为读 m_wantsIme / m_imePreviewActive 两个普通 bool(声明在 :3402-3403)也要抢同一把 m_surfaceMutex。于是帧背靠背时,一次按键在被送进 PTY 之前必须等当前帧光栅化+全屏 blit 结束(2.5K 下可达数 ms 到十几 ms)。修复:把 m_wantsIme、m_imePreviewActive 改成 std::atomic<bool>(或用一把独立轻锁),让 DispatchKeyEvent 读它们不再触碰 m_surfaceMutex,按键路由与渲染线程彻底解耦。",
+     "impact": "cat/编译刷屏时用物理键盘打字明显滞后、回显一顿一顿——越刷屏越卡;这条即使软键盘没弹出也存在(纯 bool 读也被整帧持锁挡住)。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "NotifyImeStateLocked 每帧无条件发 2 次 IME binder 跨进程 IPC(软键盘在场时),吃掉渲染帧预算",
+     "detail": "机理:render loop 每帧(napi_init.cpp:2277)在 m_surfaceMutex 内调 NotifyImeStateLocked(:3119)。只要软键盘挂着(m_imeInputMethodProxy!=nullptr),它每帧无条件执行:CaptureImeSurroundingText 分配 u16string、OH_InputMethodProxy_NotifySelectionChange(:3129,跨进程 binder IPC)、一大段几何计算、OH_CursorInfo_Create + OH_InputMethodProxy_NotifyCursorUpdate + OH_CursorInfo_Destroy(:3269-3274,又一次 binder IPC)。fling/滚动/cat 且软键盘在场时 = 每秒最多约 90 对 IPC + 每帧堆分配,全在渲染线程 surfaceMutex 内完成,直接抬高每帧耗时、更易掉 vsync,并持续唤醒输入法服务进程。修复:代码里已为日志算好了变化判定(shouldLogImeRect,:3223-3230);复用同样的 diff,只有光标行列/选区/几何真正变化时才发这两个 IPC,否则整段 return。",
+     "impact": "软键盘弹出时滚动、fling、快速输出掉帧发烫耗电;与 finding 2 叠加进一步加剧打字延迟。平板上触摸聚焦即弹软键盘,命中概率高。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "endFrame 每帧全屏 memcpy blit + 传空 dirtyRegion;含 250ms 光标闪烁把空闲终端也变成 4fps 全帧",
+     "detail": "机理:endFrame(native_drawing_renderer.cpp:799)每帧把整张离屏 buffer 全屏 memcpy 到 NativeWindow buffer(:816 单次大 memcpy 或 :818 逐行),并给 OH_NativeWindow_NativeWindowFlushBuffer 传空 dirtyRegion(:850-852 rectNumber=0),等于每帧告知合成器整面脏。脏行优化只省了'把未变行重新光栅进离屏',blit 与 flush 始终整屏。2.5K≈2560×1600×4≈16MB/帧,cat/滚动 ~90fps 时≈1.5GB/s 纯 blit 带宽 + 每帧整表面重合成。空闲态:光标闪烁(napi_init.cpp:2146-2161,CURSOR_BLINK_TICK=250ms;shouldRender 因 animateCursor 恒真,:2208)让完全空闲的终端每 250ms 也做一次 16MB 全屏 blit(软键盘在场时再叠 2 个 IME IPC),4 次/秒长期空转。修复:(a) 给 FlushBuffer 传真实 dirtyRegion(变化行/光标 cell 矩形),让合成器跳过未变区域——便宜的直接收益;(b) shift==0 路径按 per-buffer 脏行追踪只 blit 变化行(受 buffer 轮转影响较复杂);(c) 后台/失焦时降低或停掉闪烁节拍。",
+     "impact": "持续输出/滚动时机身发烫、续航掉得明显、sustained fps 上不去;空闲挂着闪烁光标也在偷电发热(风扇/无风扇平板尤其可感)。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "16ms 输入轮询每帧发 6 个独立 napi drain(多数返回空),常驻挤占 JS 主线程",
+     "detail": "机理:TerminalController.ets:588-629 的 16ms setInterval 每次触发 6 个独立 napi 调用——drainPendingLinkActivation / drainPendingTitle / drainPendingNotification / drainPendingContextMenuRequest / drainPendingCopyRequest / drainPendingPasteRequest,每个都跨 JS→native 边界、各取一次 native 锁,而绝大多数时刻返回空串。约 360 次/秒的空跨线程调用常驻 JS 主线程,与输出 feed(finding 1)争同一线程。修复:合并为单个 drainPendingEvents() 一次 napi 调用返回结构体一次性带回全部;或把这些低频事件(copy/paste/context/link)改成 TSFN 主动 push 取代 60Hz 轮询。",
+     "impact": "输出繁忙时这层空轮询进一步挤占 JS 主线程,间接放大刷屏顿挫与回显延迟;空闲时也是持续 CPU/耗电底噪。",
+     "effort": "small",
+     "priority": "P2"
+    },
+    {
+     "title": "渲染/feed 热路径的每帧堆分配与冗余加锁(drawFrame 每帧 new 整栅格 / OSC 每 chunk 双全串扫描 / 滚动帧多取一次 stateMutex)",
+     "detail": "机理三处:(a) drawFrame 每帧 new 一个整表 std::vector<Cell> cells(m_cols*m_rows)(terminal.cpp:1973),90fps cat 下每秒约 90 次整栅格堆分配,可复用成员缓冲免重分配;(b) FeedOutput 对每个 chunk 各扫两遍整串——CaptureOsc52ClipboardRequests + CaptureOsc9Notifications(napi_init.cpp:1541-1542,内部多次 find/substr),在(当前 JS 线程的)输出热路径上叠 O(n) 扫描,可合并单遍/仅当 chunk 内出现 ESC ] 才扫;(c) 平滑滚动消费段每个滚动帧除 m_terminal->scrollView(stateMutex,napi_init.cpp:2240)外,又单独 m_terminal->getScrollbarState()(:2250)再抢一次 stateMutex 去读 scrollView 刚改过的状态,可让 scrollView 直接回传结果的 scrollbar state 省掉这次加锁。修复:复用 Cell 缓冲 / OSC 单遍扫描 / scrollView 回传状态。",
+     "impact": "cat 与惯性滑动时的额外 CPU、堆分配抖动与锁往返,单项都不大,叠起来吃掉一点持续帧预算与电;属边际清理,可随 finding 1/4 一并做。",
+     "effort": "small",
+     "priority": "P2"
+    }
+   ],
+   "verdicts": [
+    {
+     "title": "终端输出每个 chunk 绕 JS 主线程一圈(TSFN→JS feed→feedOutput→native),是打字回显与 cat 吞吐的头号瓶颈",
+     "verdict": "confirmed",
+     "note": "全链路逐环核实。terminal_driver.cpp:283 LocalReadLoop read(4096)→EmitOutput(:347,m_pendingUtf8+=/substr 拷贝)→:376 napi_call_threadsafe_function(nonblocking,每完整 chunk 一次,无跨 read 合并)。JS 侧 FusionTerminalDriver.ets:51-54 outputListener→controller.feed→TerminalController.ets:363-367 native.feedOutput。回 native 的 napi FeedOutput(napi_init.cpp:3640-3652)是同步 callback,双次 napi_get_value_string_utf8(:3649 量长 + :3651 拷贝)+ std::vector<char> 分配 + std::string 构造,再 host->FeedOutput(:1539)。两次字符串 marshal + 一次 JS 事件循环调度 + FeedOutput 全部落在同一 ArkTS 主线程(16ms poll setInterval 也在此线程)。本地 echo 也走这条输出路径,故 JS 主线程忙时回显被拖慢,机理成立。fix 前提属实:输入侧对称 native sink 已存在(ResolveExampleDriverWriteInput dlsym ExampleDriverWriteInputUtf8,napi_init.cpp:53,DispatchKeyEvent:972-975 直接调),g_hostsById 注册表已存在(:3418)。‘头号瓶颈’系作者排序断言,但代码与机理无误。"
+    },
+    {
+     "title": "DispatchKeyEvent 仅为读两个 bool 抢 m_surfaceMutex,与渲染线程整帧持锁硬撞 → 刷屏时打字回显滞后",
+     "verdict": "confirmed",
+     "note": "m_wantsIme/m_imePreviewActive 确为普通 bool(napi_init.cpp:3403-3404)。DispatchKeyEvent 在 :950-955 用 lock_guard<recursive_mutex>(m_surfaceMutex) 无条件包住对这两个 bool 的读取(在写 PTY 之前)。渲染线程在 :2264 用同一把 m_surfaceMutex 的 lock_guard 包住整帧:m_terminal->drawFrame()(:2276,内部 beginFrame/renderGrid/endFrame 全屏光栅+16MB memcpy blit,terminal.cpp:2196-2199)+ NotifyImeStateLocked(:2277)。drawFrame 的 stateMutex 在 terminal.cpp:2192 lock.unlock() 后才做像素工作,故像素/blit 阶段确实只被 surfaceMutex 挡住。按键与渲染线程分属两线程,存在真实持锁竞争,一次按键须等当前帧光栅+blit 结束才能读到 bool 并路由。改 atomic 解耦的修法成立。"
+    },
+    {
+     "title": "NotifyImeStateLocked 每帧无条件发 2 次 IME binder 跨进程 IPC(软键盘在场时),吃掉渲染帧预算",
+     "verdict": "confirmed",
+     "note": "render loop 每渲染帧在 m_surfaceMutex 内调 NotifyImeStateLocked(napi_init.cpp:2277)。函数体仅在 m_imeInputMethodProxy==nullptr 时早退(:3122);proxy 挂着时无条件:CaptureImeSurroundingText 分配 u16string(:3128→Utf8ToUtf16:3115)、OH_InputMethodProxy_NotifySelectionChange(:3129,binder IPC)、几何计算、OH_CursorInfo_Create+OH_InputMethodProxy_NotifyCursorUpdate+OH_CursorInfo_Destroy(:3269-3274,又一次 binder IPC)。已算好的变化判定 shouldLogImeRect(:3223-3230)确实只 gate OH_LOG(:3231-3268),两个 IPC 不受其约束。复用该 diff 门控 IPC 的修法成立。注:‘每帧’精确说是‘每渲染帧’,滚动/fling/cat 时接近帧率、空闲光标闪烁时约 4/s。"
+    },
+    {
+     "title": "endFrame 每帧全屏 memcpy blit + 传空 dirtyRegion;含 250ms 光标闪烁把空闲终端也变成 4fps 全帧",
+     "verdict": "confirmed",
+     "note": "native_drawing_renderer.cpp:799 endFrame:shift==0 走 std::memcpy(dst,srcPixels,rowBytes*m_offscreenHeight)(:816)单次全缓冲 blit(或逐行 :818-822),始终整屏。dirtyRegion.rects=nullptr/rectNumber=0(:851-852)传给 OH_NativeWindow_NativeWindowFlushBuffer(:859),等于整面脏。脏行优化只在离屏光栅生效(renderGrid:648/717 dirtyRows[row]==0 跳过),blit/flush 不受益,与描述一致。空闲态:shouldRender=...||animateCursor(:2208),animateCursor=m_renderer->cursorBlinkEnabled()(:2146),render loop 每 CURSOR_BLINK_TICK 唤醒(:2154)→ 光标闪烁使完全空闲终端每 250ms 做一次整屏 blit,4fps 空转成立。2.5K≈16MB/帧带宽估算合理。属真实发热/耗电,用户可感。"
+    },
+    {
+     "title": "16ms 输入轮询每帧发 6 个独立 napi drain(多数返回空),常驻挤占 JS 主线程",
+     "verdict": "confirmed",
+     "note": "机理成立但数字略有高估。TerminalController.ets:588-629 的 16ms setInterval 每 tick 对各事件类型逐个跨 JS→native drain,且每个 drain 均由对应 listener 是否注册的三元守卫 gate(:593/598/604/606/618/624);needsInputPolling(:304-307)门控整个 interval。实测应用注册了 5 个 listener:link(TerminalSurface.ets:69)/copy(:72)/paste(:75)/title(Index.ets:269)/notification(:273),但 contextMenuListener 全项目未注册(grep 无命中),故 drainPendingContextMenuRequest 被守卫短路、不发 napi 调用——每 tick 实际是 5 个 drain 约 300 次/秒,而非声称的 6 个/360 次。‘60Hz 空轮询低频事件、每个跨 JS→native 各取一次 native 锁、多数返回空、与 feed 争同一主线程’的核心机理与影响方向正确,仅计数偏高一个,不影响 P2 定性。"
+    },
+    {
+     "title": "渲染/feed 热路径的每帧堆分配与冗余加锁(drawFrame 每帧 new 整栅格 / OSC 每 chunk 双全串扫描 / 滚动帧多取一次 stateMutex)",
+     "verdict": "confirmed",
+     "note": "三处均属实。(a) terminal.cpp:1973 drawFrame 内 std::vector<Cell> cells(m_cols*m_rows) 为栈上每帧分配整栅格,90fps 下持续 alloc/free,可复用成员缓冲。(b) FeedOutput(napi_init.cpp:1539-1544)对每 chunk 各调一次 CaptureOsc52ClipboardRequests(:1541)与 CaptureOsc9Notifications(:1542),后者内部 data.find(osc9Prefix) 循环扫全串(:1555),即两遍 O(n) 全串扫描(各自 find 未命中时早返回,但仍是两次独立扫描),可合并/仅遇 ESC ] 才扫。(c) 平滑滚动帧先 m_terminal->scrollView(napi_init.cpp:2240)取 stateMutex(terminal.cpp:1129),后又 getScrollbarState(napi_init.cpp:2250)再取一次 stateMutex(terminal.cpp:1638)读刚改的状态,确为两次独立加锁,可由 scrollView 回传省掉。三项单看均属边际清理,与作者 P2/‘叠起来吃一点帧预算’的定性一致。"
+    }
+   ]
+  },
+  {
+   "finder": "ETS层",
+   "findings": [
+    {
+     "title": "PTY 输出经 JS 字符串在 UI 线程双跨 NAPI 再喂回 vt(输出风暴主负载)",
+     "detail": "机理:PTY 字节流 terminal_driver.cpp:232 在输出 TSFN 里 napi_create_string_utf8 把原始字节(已是 UTF-8)拷成一个 JS 字符串(UTF-8→UTF-16),TSFN 默认派发到 UI/主线程;driver 回调再调 TerminalController.feed(TerminalController.ets:363-367)→ native.feedOutput(string)→ napi_init FeedOutput 把 UTF-16 再转回 UTF-8 → terminal.cpp:519 feedOutput(bytes) 喂 vt。也就是每个输出 chunk 都在 UI 线程上分配一个瞬时 JS 堆字符串 + 做两次 UTF 编码转换,数据其实从没在 ETS 里被真正使用(标题/通知另有 pending 队列)。同时 feedOutput 对超大 chunk 无分帧,单次巨块(如 cat 大文件一次 read)在 UI 线程同步解析整段。修复:(a)最小改动——EmitOutput 改传 ArrayBuffer(napi_create_external_arraybuffer 零拷贝),feedOutput 收 bytes,去掉两次 UTF 转换与字符串分配;(b)彻底——用 surfaceId 注册表让 terminal_driver 直接 native→native 喂 vt,数据路径完全不进 ETS,ETS 只经现有 pending+poll 收 title/notification;并在 native 侧对超大 feed 分块让出。",
+     "impact": "cat 大文件 / codex 流式刷屏 / 编译日志刷屏时,UI 线程被字符串分配+两次编码+GC 与同步 vt 解析占满,与渲染和触摸争抢 → 输入延迟、掉帧、持续发热;单次巨块还会丢整帧、按键无响应。这是「输出风暴」场景的真正主负载,远超 16ms 轮询本身。",
+     "effort": "large",
+     "priority": "P0"
+    },
+    {
+     "title": "主题面板 458 行用非懒 ForEach 全量渲染,搜索每键全量重建 + 逐字节解码",
+     "detail": "机理:buildThemePane(Index.ets:1081-1087)用 List + 普通 ForEach(this.filteredThemes()),grep 确认全仓无 LazyForEach。ForEach 不虚拟化,首次切到主题页会一次性建 458×buildThemeRow(每行 Stack+Text+Column+最多 8 个 Circle 的内层 ForEach,约 12-13 节点)≈ 6000 个 UI 节点。themeFilter 是 Index 上的 @State,搜索框 onChange(Index.ets:1077)每敲一个字符就 filteredThemes()(1888)重算数组 + ForEach 按过滤结果整体 diff 重建。另外 loadThemePreviews(1943)顺序 await 读 458 个文件,parseThemePreview(1965-1969)用 text += String.fromCharCode(raw[i]) 逐字节拼字符串解码,慢且在 UI 线程。修复:List 改 LazyForEach(用 IDataSource 包 filteredThemes)只建可视 ~15 行;预览解码改 util.TextDecoder 且按需(仅可视行)解析;搜索可加 100ms 去抖。",
+     "impact": "打开主题设置页首开卡顿数百毫秒(记忆里已注意到首开阻塞,此处是节点创建这条,与文件解析是两回事);在搜索框打字每个字符都明显顿一下。属设置页非核心循环,但卡顿很可感。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "打开抽屉/标签编辑会把仍在屏上的前台终端降级为后台轮询",
+     "detail": "机理:buildTerminalLayer 给每个 surface 传 active = session.id===activeSessionId && !drawerOpen && !tabEditOpen(Index.ets:529-531)。抽屉一开,可见终端的 active 翻 false → TerminalSurface.onActiveChanged(TerminalSurface.ets:378-396)→ controller.setPollingSuspended(true)(TerminalController.ets:252-264):停 16ms 输入轮询、停滚动条轮询、关 IME,title 掉到 500ms 的后台慢轮询。而后台慢轮询只 drain title+notification,不 drain copy/link/paste(startBackgroundTitlePolling:286-294 vs startInputPolling:588-628)。把「IME 输入焦点」和「辅助 drain 轮询」耦合在同一个 active 标志上是架构味道。注:native 渲染线程独立,终端画面本身在抽屉开着时仍全速渲染,不受影响——这是好的一面。修复:拆分 active(仅管 IME 焦点)与 pollingSuspended(只按标签「是否可见/前台」gate,不受 drawer 影响),抽屉开时前台标签保持正常 drain。",
+     "impact": "抽屉开着看输出时,可见终端的标签标题 spinner 冻结(掉到 500ms),远端 OSC52 复制、超链接点击、Ctrl+V drain 在抽屉开着期间完全不响应,要关抽屉才恢复。影响面窄但可感,且修复顺带理清一个耦合。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "16ms 常驻 pull-poll 承载 5 路低频 NAPI drain,拥塞时与 feed 互相排队",
+     "detail": "机理:startInputPolling(TerminalController.ets:588-629)每 16ms 对活动 surface 做 link/title/notification/copy/paste 共 5 路 NAPI drain(contextMenu 未接线,gated 掉),约 312 次/秒,绝大多数返回空串。直接 CPU 开销其实很小(空串 NAPI 往返,~1-2ms/秒),不是掉帧主因——这点要如实说。但它是 pull 模型:title/copy 的延迟被绑死在 UI 线程拥塞上,输出风暴(见 P0)时 setInterval 被推迟且成批触发,title spinner 卡住、Ctrl+V/复制快捷键 drain 被延后。真正低频的 title/link/notification 不需要 60Hz。修复:把这些和 keystroke 一样改 native→JS push(native 有 pending 时用 TSFN 主动通知),彻底去掉 pull-poll;过渡方案是 title/notification 降到 ~120ms、copy/paste 保留快速 drain。补充:codex 高频改标题这条本身已被 @Observed/@ObjectLink 正确隔离——500ms/16ms 的 title 更新只重渲 TerminalTabChip 里那一个 Text,不会重建抽屉或终端层,标题风暴不是 rebuild 问题。",
+     "impact": "直接开销可忽略(别夸成掉帧);真实影响是输出风暴下标题/复制/超链接响应延迟、抽屉状态不同步等延迟耦合,以及每活动 surface 恒定 ~312 次/秒空 NAPI 的架构浪费。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "巨型单 @Component:抽屉与当前面板常挂载,面板级 @State 全堆在 Index",
+     "detail": "机理:buildDrawer(Index.ets:684-758)整棵常在树里(靠 translate 移出屏,不是 if 卸载),里面 if/else 只切当前 pane 内容但当前 pane 始终 build——首启默认 appearance pane 就被预建,用户上次停在 conn pane 则关抽屉后那一堆 TextInput(1146-1325)常驻。同时 themeFilter、draftHost/draftPort/draftAgentToken 等面板级 @State 全挂在 2363 行的 @Entry Index 上,任何一处输入都参与 Index 的渲染作用域评估。修复:把 Drawer / ThemePane / ConnPane / TabEditor 拆成独立 @Component,各自 @State 内聚(themeFilter/draft* 离开 Index),并用 if(this.drawerOpen) 包裹面板内容(外层容器留着做滑动动画),按需首访才建。这是拆分收益最大的一档:既降常驻节点/内存,又缩小 Index 的状态扇出面。",
+     "impact": "非致命但持续:关着的抽屉常驻一个面板(含多个 TextInput)的节点与内存;巨型组件让每次改动的状态影响范围难推理、后续维护易踩重建。拆分后收益排序:抽屉/面板拆组件 > themeFilter 内聚 > draft* 内聚。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "右键菜单 builder 序列化整屏仅为判空,并多次重复取选区",
+     "detail": "机理:buildTerminalContextMenu(TerminalSurface.ets:580-616)里 hasTerminalSelection() 被调用 4 次,每次 getSelectedText() 走一次 NAPI 全选区序列化;hasTerminalScreenContent()(671-673)为了判断「屏幕非空」直接 getScreenContent() 把整屏内容序列化成字符串再 .trim().length。scrollback/整屏很大时这些都是大字符串跨 NAPI。修复:菜单弹出前取一次 selectedText / screenContent 存字段,菜单项复用;给 native 加一个返回 bool 的轻量「屏幕/选区是否非空」判空接口,避免为判空序列化整屏。",
+     "impact": "scrollback 很长时右键弹菜单有可感延迟(序列化整屏 + 4 次取选区),偶发卡一下。低频操作,优先级低但修复简单。",
+     "effort": "small",
+     "priority": "P2"
+    }
+   ],
+   "verdicts": [
+    {
+     "title": "PTY 输出经 JS 字符串在 UI 线程双跨 NAPI 再喂回 vt(输出风暴主负载)",
+     "verdict": "confirmed",
+     "note": "数据路径逐段核实无误。terminal_driver.cpp:232 EmitOutput 的 TSFN call_js 里 napi_create_string_utf8(callbackEnv, output->c_str(), output->size(), &argv[0]) 把 UTF-8 字节拷成 JS 字符串(UTF-8→UTF-16,第一次转换)。TSFN 由 FusionTerminalDriver.ets:159 nativeDriver.setOutputCallback(...) 在 ArkTS 主线程注册,故 call_js 派发到主线程。JS 回调 outputListener(FusionTerminalDriver.ets:51-55)只做 `if(data.length>0 && this.controller) this.controller.feed(data)`——数据在 ETS 里确实从不被使用(title/notification 走另外的 pending+poll)。feed→TerminalController.ets:363-367 native.feedOutput(surfaceId,data)→napi_init.cpp:3648-3652 napi_get_value_string_utf8 把 JS UTF-16 再转回 UTF-8(第二次转换)→terminal.cpp:519-524 feedOutput 里 ghostty_terminal_vt_write 在 m_stateMutex 下同步整段解析,对超大 chunk 无分帧/无让出。两次编码转换 + UI 线程瞬时 JS 堆字符串分配 + 同步 vt 解析全部属实。P0 定性(输出风暴主负载)是合理工程判断而非可精确度量的事实,但机理完全成立。"
+    },
+    {
+     "title": "主题面板 458 行用非懒 ForEach 全量渲染,搜索每键全量重建 + 逐字节解码",
+     "verdict": "confirmed",
+     "note": "全仓 grep LazyForEach = 0 命中,虚拟化确实缺失。Index.ets:1081-1086 为 List{ForEach(this.filteredThemes(), ...)},buildThemeRow(1098-1143)=Row+[Stack+Text]+[Column+Text+[Row+最多8个Circle(palette slot 0-7,parseThemePreview:1970/1997-2002 恰好8槽)]]+Row,约12-15节点/行,与「12-13」吻合。themeFilter 是 @State(211),TextInput.onChange(1077-1078)每键 this.themeFilter=value → filteredThemes()(1888-1894 对全表 .filter)重算 + ForEach 按结果 diff。loadThemePreviews(1943-1963)对 themeList 顺序 await 读文件,parseThemePreview(1965-1969)`text += String.fromCharCode(raw[i])` 逐字节拼串。唯一不能证实的是「458」这一具体数字——本恢复快照里 themes rawfile 目录缺失(getThemeList 于 napi_init.cpp:1944-1966 运行时从 rawfile 目录枚举),但 ForEach 无条件渲染整张过滤表,数量为几百量级时机理成立与否与精确值无关。注:预览解码有 once 守卫(1944 themePreviewsLoading/size>0)且 await 分片,首开阻塞主因是节点创建这条,finding 已正确区分二者。P1 设置页卡顿属实。"
+    },
+    {
+     "title": "打开抽屉/标签编辑会把仍在屏上的前台终端降级为后台轮询",
+     "verdict": "confirmed",
+     "note": "机理完全属实。buildTerminalLayer 传 active = session.id===activeSessionId && !this.drawerOpen && !this.tabEditOpen(Index.ets:529-531);TerminalSurface.onActiveChanged(378-379)首行即 controller.setPollingSuspended(!this.active)。setPollingSuspended(TerminalController.ets:252-264)true 分支 stopInputPolling+startBackgroundTitlePolling。后台慢轮询(286-294)500ms 只 drainPendingTitleOnce+drainPendingNotificationOnce,不含 copy/link/paste/contextMenu;而 startInputPolling(588-629)才 drain 那5路。故抽屉开着时可见前台终端 title 掉到500ms、远端 OSC52 复制(远端推送,可在抽屉开时到达)不 drain,属实且可感。轻微修正:link 点击 / Ctrl+V 属用户输入路径,抽屉开时 hitTest=Default 已把触摸/键盘夺走,那两条本就无法触发,真正用户可见的是 title spinner 冻结 + 远端 OSC52 复制延迟到关抽屉——不改变「前台可见终端被降级为后台轮询、且 IME 焦点与辅助 drain 耦合在同一 active 标志」这个核心结论。原生渲染线程独立、画面不受影响,finding 也如实指出。P1 定性合理。"
+    },
+    {
+     "title": "16ms 常驻 pull-poll 承载 5 路低频 NAPI drain,拥塞时与 feed 互相排队",
+     "verdict": "confirmed",
+     "note": "startInputPolling(TerminalController.ets:588-629)确为 16ms setInterval,循环内 drain link/title/notification/contextMenu/copy/paste。核实接线:link/copy/paste 在 TerminalSurface.ets:69/72/75,title/notification 在 Index.ets:269/273;setContextMenuListener 全仓无非空调用,故 contextMenu 分支被 `this.contextMenuListener ?` gate 掉——即有效5路,与 finding「5路(contextMenu 未接线)」吻合。62.5次/秒×5≈312次/秒空 NAPI 数学正确。finding 明确自陈「直接开销可忽略、不是掉帧主因」,不夸大。标题风暴隔离说法也核实:TerminalTabChip 为 @Observed(Index.ets:76)+@ObjectLink session(117),title 更新只重渲 chip 内 Text,不重建抽屉/终端层。P2 架构浪费+延迟耦合定性诚实准确。"
+    },
+    {
+     "title": "巨型单 @Component:抽屉与当前面板常挂载,面板级 @State 全堆在 Index",
+     "verdict": "confirmed",
+     "note": "buildDrawer(684-758)面板容器 .translate({x: this.drawerOpen ? 0 : DRAWER_WIDTH})(734)移出屏,非 if 卸载,常在树里。面板切换 705-728:`if drawerPane==='theme' buildThemePane() else Scroll{if appearance/font/help/else conn}`——当前 pane 无 if(drawerOpen) 守卫,始终 build;drawerPane 默认 'appearance'(194),故首启即预建 appearance pane;若停在 conn,buildConnPane(1146+)的6个 TextInput 关抽屉后仍常驻。themeFilter(211)/draftHost(202)/draftPort(203)/draftAgentToken(204)等面板级 @State 全挂 Index,全组件共29个 @State(2362行 @Entry)。机理与「关着抽屉常驻一个面板节点+状态扇出面大」均属实。非致命 P2 架构/可维护性,定性准确;注意一次只 build 当前一个 pane(非全部),finding 表述正确。"
+    },
+    {
+     "title": "右键菜单 builder 序列化整屏仅为判空,并多次重复取选区",
+     "verdict": "dubious",
+     "note": "冗余属实但影响轴错、次数略高估。buildTerminalContextMenu(580-616)里 hasTerminalSelection() 实为3次(586/592/602),非「4次」;每次 hasTerminalSelection(618-620)走 getSelectedText() NAPI。hasTerminalScreenContent(671-673)确实 getScreenContent().trim().length 为判空而序列化。关键反驳:terminal.cpp:992-1028 getScreenContent 只遍历 m_rows×m_cols(可见视口,result.reserve(m_rows*(m_cols+1)),逐行 iterator next 到 m_rows 止),与 scrollback 长度无关——故 finding 核心影响论「scrollback 很长时序列化整屏、右键弹菜单有可感延迟」的量级判断不成立:整屏≈行×列≈几 KB 且恒定,不随 scrollback 增长。且触发方式 bindContextMenu(...,ResponseType.RightClick)(180)在移动终端属低频。getSelectedText 仅当选区极大才大。冗余优化本身合理(可缓存一次+加轻量判空 bool 接口),但影响被显著夸大、次数记错,故 dubious。"
+    }
+   ]
+  },
+  {
+   "finder": "内存功耗",
+   "findings": [
+    {
+     "title": "endFrame 每帧全屏 memcpy + 全表面刷新,浪费脏行优化(2.5K 屏持续功耗)",
+     "detail": "机理:native_drawing_renderer.cpp:805-848 endFrame 无论本帧脏了几行,都把整块 offscreen(m_offscreenHeight 整屏)memcpy 到窗口 buffer(shift==0 分支 816 行的 memcpy 覆盖全屏),并在 850-852 行用空脏区(dirtyRegion.rects=nullptr, rectNumber=0)调 OH_NativeWindow_NativeWindowFlushBuffer(858)。renderGrid 明明已经按 dirtyRows 只画脏行到 offscreen(terminal.cpp:2198 传 dirtyRows),但 endFrame 把这个收益全丢了:空脏区会被 RenderService 当成整表面 damage,合成器只能全屏重合成。MatePad Edge 2.5K 物理约 2900×1900×4 ≈ 20MB/帧。修复:renderGrid 里记录本帧最小/最大脏行 [minRow,maxRow],endFrame 在 shift==0 时只 memcpy 这段扫描线,并给 FlushBuffer 传一个覆盖该矩形的 Region;smooth-scroll(shift!=0)保持全屏。",
+     "impact": "打一个字符/光标每次闪烁都上传整块 ~20MB 表面并触发全屏合成;敲键盘时每帧全屏上传→输入回显发烫、GPU 占用高;空闲光标闪烁时 4 次/秒全屏上传 ≈ 80MB/s 内存带宽,电池持续掉电、机身温热。实测:DevEco Profiler 的 Frame/GPU 面板对比敲字前后 GPU 负载;hidumper -s RenderService 看 damage region 是否恒为全屏;在 memcpy 处加字节计数打点。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "渲染线程受光标闪烁常驻不归零,后台/隐藏页也不停唤醒(后台功耗)",
+     "detail": "机理:napi_init.cpp:2146 animateCursor 只看 m_renderer->cursorBlinkEnabled(),不看 m_surfaceReady;默认 cursorBlink=true(Index.ets:214)。于是渲染线程恒以 CURSOR_BLINK_TICK=250ms(napi_init.cpp:111,2154 行 wait_for)唤醒,每个 tab 一条线程,永不进 2158 行的无限期 park。OnSurfaceHide(napi_init.cpp:882)只置 m_surfaceReady=false、不停循环;EntryAbility.ets:69-71 onBackground 只设一个标志、什么都不 pause。后台/隐藏时 2275 行 m_surfaceReady 为假会跳过绘制,但线程仍 4 次/秒/tab 空唤醒(拿 m_surfaceMutex 判断再睡),阻止 SoC 进深睡;shouldRenderCursor(renderer.h:129)用墙钟相位,250ms tick 对 500ms 相位有 2/4 是重复渲染。修复:animateCursor 改为 `m_surfaceReady && cursorBlinkEnabled()`(一行,让隐藏/后台页彻底 park);onBackground 时对所有 session 调 setPollingSuspended(true) 并让 native 停渲染循环,onForeground 恢复。",
+     "impact": "开 5 个 tab 时,后台待机仍有约 20 次/秒线程唤醒 + 前台隐藏 tab 同样空转,CPU 无法休眠、装包里也在掉电;前台空闲(只显示一个 shell 提示符)也永远 4fps 全屏重绘,发热+续航差。实测:hiperf 采样渲染线程,对比修复前后 app 后台 30 分钟的唤醒次数;hidumper -s BatteryService / PowerStats 看后台待机功耗;SmartPerf-Device 看空闲 CPU 占用。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "前台活动 tab 的 16ms 输入轮询 + 100ms 滚动条轮询空闲不停,后台也不暂停",
+     "detail": "机理:TerminalController.ets:588-629 用 16ms setInterval,每 tick 打 7 次 NAPI drain(link/title/notification/contextMenu/copy/paste),完全空闲也 60 次/秒 = 420 次 NAPI/秒,而这些事件(点链接、右键菜单、Ctrl+Shift+C)都是用户主动触发、几十毫秒延迟完全够用;它由 tab 的 active 决定,不受 app 前后台影响——onBackground(EntryAbility.ets:69)不会挂起它。TerminalSurface.ets:15/441-443 另有 100ms(10Hz)滚动条轮询 getScrollbarState(每次 NAPI+锁),空闲也常转。修复:输入轮询降到 ~50ms 或改用 TSFN 推送(输入/输出回调已是推送模型,可照搬);滚动条状态改由 native 在 offset 变化时推送,或空闲/无输出时停轮询;onBackground 统一挂起两个轮询。",
+     "impact": "活动 tab 即使终端完全空闲,JS 线程也被 60Hz 定时器钉住无法休眠,叠加 native 锁竞争;系统未及时冻结后台时(分屏/刚切后台数秒),这两个轮询继续打 NAPI,后台掉电。实测:hidumper 看 JS 线程唤醒频率;在 drain 回调里计数确认绝大多数返回空;SmartPerf 看空闲 CPU。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "drawFrame 每帧堆分配 cells/dirtyRows/rowByte 向量 + 全量拷贝 searchMatches(重输出时功耗)",
+     "detail": "机理:terminal.cpp:1973 每帧 `std::vector<Cell> cells(m_cols*m_rows)` 全新分配并清零——Cell 含 char text[64](kGhosttyTextCapacity=64)+codepoint+attrs,约 88 字节,120×40=4800 格 ≈ 420KB/帧;还有 2025 的 dirtyRows、每个脏行 2044-2045 的 rowByteStart/rowByteEnd 两个向量、1992 行 `const std::vector<SearchMatch> searchMatches = m_searchMatches` 每帧整表拷贝(搜索命中多时几万条)。持续输出 60fps 下约 25MB/s 的 malloc+memset 抖动。修复:把 cells/dirtyRows/rowByte 提为成员缓冲,首帧 resize 之后复用不再堆分配;searchMatches 仅在搜索激活且变更时拷贝。",
+     "impact": "cat 大文件 / yes / 编译日志刷屏等持续输出场景,分配器抖动占额外 CPU,表现为刷屏卡顿、机身发热;搜索命中很多时每帧还多一次大向量拷贝。实测:hiperf/DevEco Profiler 的 Allocation 面板抓 malloc 频次;SmartPerf 跑 `yes` 时看 CPU。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "字形缓存把前景色纳入 key,真彩 TUI 下缓存抖动 + 内存膨胀",
+     "detail": "机理:native_drawing_renderer.h:55-67 GlyphKey 含 fg,getGlyphLayout(cpp:1014-1019)按 (text,fg,styleBits,span) 建缓存,每条缓存一个 OH_Drawing_Typography(已 shape 的段落,单个约数 KB)。同一个字符在 N 种颜色下会缓存 N 份 typography,很快撑满 kMaxGlyphCacheEntries=4096(cpp:26),trimGlyphCache(984)每次淘汰一半→真彩/渐变界面反复重 shape。而 shaping 与颜色无关,颜色是被 OH_Drawing_SetTextStyleColor(1041)在 layout 前烘进 typography 的。修复:让 shaping key 去掉 fg(neutral 色 shape、绘制时再上色),或缓存与颜色无关的 shaped run;受限于该 API 颜色在构建期烘入,需要重构上色路径。",
+     "impact": "跑 btop/htop、带主题的 vim、彩色 ls 这类多色内容时,缓存被同字不同色的副本挤爆,几乎每帧重 shape,表现为滚动/刷新卡顿、CPU 高;每 tab 缓存最坏 ~8-16MB 且利用率低。实测:打点日志输出 m_glyphCache.size() 与命中率,跑 btop 观察;SmartPerf 看该场景 CPU。",
+     "effort": "large",
+     "priority": "P2"
+    },
+    {
+     "title": "scrollbackLines 设置项是死代码,scrollback 硬编码 10000(内存/一致性)",
+     "detail": "机理:terminal.cpp:430 opts.max_scrollback=10000 写死;setMaxScrollback(cpp:1930-1933)是空实现 `(void)lines;`;Index.ets:262 每个新 tab 传 scrollbackLines:50000 被静默丢弃(SetConfig napi_init.cpp:1987 调的就是这个 no-op)。因此每 tab 常驻 scrollback 实际被封在 10000 而非 50000。副作用双向:当前内存比用户预期小(利好),但计划里的『scrollback 行数设置项』一旦真正接通、按 50000 行 × 多 tab 生效,scrollback 内存会 ~5×;且需先确认 ghostty max_scrollback 的单位(字节 vs 行)——若是字节,10000 意味着长回滚被悄悄截断(功能 bug)。修复:接通时通过重建/重配 vt 让值生效,给上限并在文档标明单位。",
+     "impact": "用户以为有 5 万行回滚实际只有 1 万(或按字节更少),向上翻历史时早早到顶找不到内容;将来接通设置若不设合理上限,多 tab 大回滚会显著抬高常驻内存。实测:hidumper --mem <pid> 看单 tab 在灌 10 万行前后 native heap;灌行观察 scrollback 到顶位置。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "输出缓冲/TSFN 队列在消费端停摆时无界增长(后台有产出源时的内存)",
+     "detail": "机理:terminal_driver.cpp:347-382 EmitOutput 在 TSFN 为空时把数据无界追加进 m_outputBuffer(:369),在 TSFN 存在时每块 `new std::string` 投递到最大队列 0(无限)的 threadsafe function(:375-376);当 app 被系统冻结/后台 JS 事件循环停摆时,TSFN 回调不执行、队列持续堆 new string。读线程 LocalReadLoop/SSH 读线程不受 app 生命周期门控,一直 read+EmitOutput。远端跑 `yes` 这类狂输出时,后台会无界吃 native 内存。修复:给待处理字节设上限,超阈值时施加背压——暂停 read(本地 PTY 让子进程阻塞在 write、SSH 靠 TCP 窗口),而不是无脑缓冲;终端语义下不能丢字节。",
+     "impact": "SSH 里跑刷屏命令后把 app 切后台并被系统冻结,native 内存无界上涨,可能被 LMK 杀进程或回前台时卡顿爆发。实测:SSH 跑 `yes`→切后台,hidumper --mem <pid> 观察 native heap/RSS 是否持续上涨。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "退休 IME proxy 列表每关一个带 IME 的 tab 泄漏一个,永不回收(慢速泄漏)",
+     "detail": "机理:napi_init.cpp:68-69 g_retiredImeProxies;RetireImeProxyLocked(2817-2828,仅 TerminalHost 析构即关 tab 时调用)把 m_imeTextEditorProxy push 进全局列表并置空、从不 free(注释说明是为规避 IME 服务异步回调走函数表的 UAF,是有意为之)。multiton 长会话里反复开关 tab,该列表单调增长,每条虽小(TextEditorProxy 句柄+函数表,几百字节量级)但无上限。修复:引入回收时机——例如 IME 服务确认 detach 后、或按 generation/时长阈值延迟释放;或设 horizon 上限、超出释放最老的。",
+     "impact": "长期不重启、频繁开关 tab 的重度用户,进程常驻内存缓慢爬升(数百个句柄级),数天使用后可感知的 native heap 抬升。实测:脚本开关 200 次带键盘的 tab,hidumper --mem 对比前后 native heap;加调试日志打印 g_retiredImeProxies.size()。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "非活动 tab 的 renderer + offscreen 缓冲全部常驻,内存随 tab 数线性增长",
+     "detail": "机理:Index.ets:540 非活动 session 用 Visibility.Hidden(不卸载),每个 session 都保留自己的 TerminalHost + NativeDrawingRenderer + m_offscreenPixels(native_drawing_renderer.h:119,width*height*4,2.5K 下约 20MB)+ 字形缓存(≤ ~16MB)+ ghostty scrollback。offscreen 生命周期=renderer,隐藏也不释放(ensureOffscreen cpp:497-511 只在尺寸变时重建)。活动表面另有 2-3× 表面大小的窗口 buffer 队列(隐藏表面经 OnSurfaceHide 应已释放各自队列)。修复:对长时间隐藏的 tab,在 OnSurfaceHide 释放 m_offscreenPixels 与字形缓存(destroyGlyphCache),重新显示时因 m_needFullRepaint 已置真会自然重建。",
+     "impact": "开 5 个 tab 常驻内存约 5 ×(offscreen 20MB + 字形缓存 + scrollback)≈ 150-300MB,内存紧张时后台被杀、切 tab 卡;多 tab 用户尤其明显。实测:hidumper --mem <pid> 对比 1 个 vs 5 个 tab 的 PSS/native heap。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "主题预览首开逐个读 458 文件 + 逐字符 O(n²) 解码,阻塞 UI(已知计划,补实现层面见解)",
+     "detail": "机理(已知,给实现新解):Index.ets:1943-1963 loadThemePreviews 顺序 await 遍历 themeList(可达 458)逐个 getRawFileContent;parseThemePreview(1965-1969)用 `text += String.fromCharCode(raw[i])` 逐字节拼整文件字符串——每文件 O(n²) 反复扩容,且在 UI 线程同步跑;而真正需要的只有 background/foreground/palette 0-7 共约 11 行。themePreviews Map 保留全部条目(~90KB,内存次要)。实现建议:用 util.TextDecoder 一次性解码 Uint8Array;解析到 palette 索引 7 就 early-break、不扫全文件;或构建期把所有预览预算成一个 JSON 资源(一次读取替代 458 次 IO)。",
+     "impact": "首次打开外观抽屉时 UI 线程被 458 次文件 IO + 逐字符解析拖住,抽屉打开明显卡顿/掉帧一下。实测:hitrace 打 loadThemePreviews 起止耗时;DevEco Profiler UI 线程看首开外观面板的 stall。",
+     "effort": "small",
+     "priority": "P2"
+    }
+   ],
+   "verdicts": [
+    {
+     "title": "endFrame 每帧全屏 memcpy + 全表面刷新,浪费脏行优化(2.5K 屏持续功耗)",
+     "verdict": "confirmed",
+     "note": "代码属实。native_drawing_renderer.cpp endFrame 正常路径(getScrollFraction()==0,line 813 shift==0)在 815-816 行 `std::memcpy(dst, srcPixels, rowBytes * m_offscreenHeight)` 一次拷贝整块 offscreen(整屏高),与本帧脏了几行无关;850-852 行 `dirtyRegion.rects=nullptr; rectNumber=0` 传给 859 行 FlushBuffer(空 Region 即整表面 damage)。而 renderGrid(619-797)确实按 dirtyRows 只重画脏行(647-650 `if(!fullRepaint && dirtyRows[row]==0) continue`),terminal.cpp:2197-2198 也把 dirtyRows 传了进来——脏行收益在 endFrame 被整帧拷贝+空脏区抹平。terminal.cpp:2174 的早退守卫只在『无变化且 blink 关』时跳过整帧,凡实际敲字/输出(anyDirtyRow)或 blink tick 都会走 endFrame 全屏拷贝。机理成立,是真 P1 优化点;功耗数值(~20MB/帧)为估算但方向正确。"
+    },
+    {
+     "title": "渲染线程受光标闪烁常驻不归零,后台/隐藏页也不停唤醒(后台功耗)",
+     "verdict": "dubious",
+     "note": "代码机理部分属实但关键前提错。napi_init.cpp:2146 `animateCursor = m_renderer && cursorBlinkEnabled()` 确实不看 m_surfaceReady;OnSurfaceHide(882-892)只置 m_surfaceReady=false 不停循环;EntryAbility.ets:69-71 onBackground 只设 wasBackgrounded。但发现称『默认 cursorBlink=true(Index.ets:214)』是错的——AppearanceStore.ets:30 `DEFAULT_APPEARANCE.cursorBlink: false`,Index.ets:214 取的就是它;SetConfig(napi_init.cpp:1977)调 setCursorStyle→renderer.h:100-102 把 m_cursorBlink 置为 false,覆盖 renderer.h:161 的原生默认 true。于是默认态 animateCursor=false,渲染线程走 2158 行 `m_renderCv.wait`(无限期 park),且 terminal.cpp:2174 drawFrame 直接早退。所述『默认后台/空闲 4fps 常驻唤醒』不会开箱发生,仅当用户手动开光标闪烁(Index.ets:850 开关)才成立。fix(加 m_surfaceReady 判断)本身有价值,但影响被显著高估。"
+    },
+    {
+     "title": "前台活动 tab 的 16ms 输入轮询 + 100ms 滚动条轮询空闲不停,后台也不暂停",
+     "verdict": "confirmed",
+     "note": "代码属实。TerminalController.ets:588-629 `setInterval(...,16)`,每 tick 打 6 个 NAPI drain(drainPendingLinkActivation/Title/Notification/ContextMenu/Copy/Paste,各由对应 listener 门控,监听器都注册时约 6×60≈360 次/秒空转)。TerminalSurface.ets:15/441-443 另有 `SCROLLBAR_POLL_INTERVAL_MS=100` 调 syncScrollbarState→getScrollbarState(NAPI+锁)。两者都仅由 tab active 驱动:setPollingSuspended 只在 TerminalSurface.ets:65/379 按 `!this.active` 调,onActiveChanged/onAppear 才 start/stop 滚动条轮询。app 前后台(EntryAbility.onBackground)不触碰任一轮询——活动 tab 即使终端全空闲仍 60Hz 钉住 JS 线程,系统冻结前后台继续掉电。机理与影响都成立。"
+    },
+    {
+     "title": "drawFrame 每帧堆分配 cells/dirtyRows/rowByte 向量 + 全量拷贝 searchMatches(重输出时功耗)",
+     "verdict": "confirmed",
+     "note": "代码属实。terminal.cpp:1973 `std::vector<Cell> cells(m_cols*m_rows)` 每帧新分配并值初始化(Cell 默认构造 `text{0}` 零填 64B);Cell 结构在 terminal_state.h:25-33=codepoint(4)+char text[64]+textLen+width+CellAttributes(fg/bg+7 bool)+selected≈88B,120×40≈420KB/帧。2025 行 dirtyRows、每脏行 2044-2045 的 rowByteStart/rowByteEnd 两向量、1992 行 `const std::vector<SearchMatch> searchMatches = m_searchMatches` 每帧整表拷贝(搜索未激活时为空拷贝,命中多时才贵)全部如描述。机理成立;但影响偏微优化——单帧 420KB malloc+memset 在现代 SoC 约数十微秒,『刷屏卡顿/发热』相对夸大,真正大头是 finding#1 的整帧 memcpy 与字形 shaping。作为复用缓冲的优化项确实成立。"
+    },
+    {
+     "title": "字形缓存把前景色纳入 key,真彩 TUI 下缓存抖动 + 内存膨胀",
+     "verdict": "confirmed",
+     "note": "代码属实。native_drawing_renderer.h:55-67 GlyphKey 含 `uint32_t fg`;getGlyphLayout(cpp:1014-1018)`key.fg=attrs.fg`;1041 行 `OH_Drawing_SetTextStyleColor(textStyle, attrs.fg)` 在 1085 CreateTypography / 1094 TypographyLayout 之前把颜色烘进 typography——shaping 与色无关但色进了 key,同字 N 色缓存 N 份。kMaxGlyphCacheEntries=4096(cpp:26),trimGlyphCache(984-1003)超限淘汰一半。缓存是 renderer 成员(header:109)故每 tab 一份。真彩/渐变 TUI(btop 渐变条因 774 行 SameVisualTextStyle 要求同 fg 才合并 run,相邻异色 cell 各成独立 1 字 key)可撑爆 4096 反复重 shape。机理成立;内存 8-16MB/tab 与命中率为估算,影响随场景(是否真彩)而定,但属实。"
+    },
+    {
+     "title": "scrollbackLines 设置项是死代码,scrollback 硬编码 10000(内存/一致性)",
+     "verdict": "confirmed",
+     "note": "代码属实。terminal.cpp:430 `opts.max_scrollback = 10000` 写死;setMaxScrollback(1930-1933)是 `(void)lines;` 空实现,注释『ghostty handles scrollback internally』;Index.ets:262 每 tab 传 `scrollbackLines: 50000`;napi_init.cpp SetConfig(1987)调的正是这个 no-op(且顶层 napi SetConfig 4188 默认 10000)。故 50000 被静默丢弃,实际封在 10000。这是确凿的死代码+一致性 bug(用户以为 5 万行实得 1 万)。发现自身也诚实标注当前对内存『利好』、并正确提示 ghostty max_scrollback 单位(字节 vs 行)待确认。verdict confirmed。"
+    },
+    {
+     "title": "输出缓冲/TSFN 队列在消费端停摆时无界增长(后台有产出源时的内存)",
+     "verdict": "confirmed",
+     "note": "代码属实但影响需保守。terminal_driver.cpp:213-235 napi_create_threadsafe_function 第 6 参 max_queue_size=0(无限队列);EmitOutput(347-382)在 TSFN 为空时 369 行 `m_outputBuffer += chunk` 无界追加,TSFN 存在时 375-376 行 `new std::string` + `napi_call_threadsafe_function(...nonblocking)` 投入无限队列;LocalReadLoop(270-296)/SSH 读线程持续 read+EmitOutput,不受 app 生命周期门控——确无背压。caveat:发现自设的『被系统冻结』场景下,HarmonyOS 进程级 freeze 通常连 native 读线程一并冻结,产出也会停,该窗口被收窄;最真实的无界增长其实是前台/刚切后台未冻结时远端 `yes` 产出快于 JS 消费者。无界+无背压的代码缺陷成立,LMK 杀进程为可能但依赖冻结时序,故 confirmed 但影响别当必然。"
+    },
+    {
+     "title": "退休 IME proxy 列表每关一个带 IME 的 tab 泄漏一个,永不回收(慢速泄漏)",
+     "verdict": "confirmed",
+     "note": "代码属实。napi_init.cpp:68-69 全局 `std::vector<InputMethod_TextEditorProxy*> g_retiredImeProxies`;RetireImeProxyLocked(2817-2828)push_back 后置空、从不 free;grep 全文该 vector 仅 push_back(2825)无任何 erase/clear,单调增长。仅 ~TerminalHost()(743 行)在关 tab 时调,且 2819 行 `if(m_imeTextEditorProxy==nullptr) return` 表示只有触发过 IME 的 tab 才泄漏一个——与『每关一个带 IME 的 tab 泄漏一个』完全吻合。注释(61-67)说明是刻意规避 IME 异步回调 UAF 的取舍。单条几百字节、无上限,长会话频繁开关 tab 缓慢抬升 native heap。机理成立,属慢速小泄漏。"
+    },
+    {
+     "title": "非活动 tab 的 renderer + offscreen 缓冲全部常驻,内存随 tab 数线性增长",
+     "verdict": "confirmed",
+     "note": "代码属实。Index.ets:520-541 ForEach 用稳定 key `String(session.id)` 渲染所有 session 的 TerminalSurface(各自 controller/TerminalHost/renderer),540 行 `.visibility(active? Visible: Hidden)`——隐藏非卸载。m_offscreenPixels(native_drawing_renderer.h:119,width*height*4,2.5K≈20MB)生命周期=renderer,ensureOffscreen(cpp:497-511)只在尺寸变时 reassign,OnSurfaceHide(napi_init.cpp:882-892)只置 m_surfaceReady=false 不释放 offscreen/字形缓存。故每隐藏 tab 常驻 ~20MB offscreen + ≤~16MB 字形缓存 + ghostty scrollback,随 tab 数线性增长。offscreen 20MB/tab 为确定大头;总量 150-300MB 为含 scrollback 的上界估算(ghostty scrollback 存储较紧凑),量级合理。fix(隐藏久时释放 offscreen+destroyGlyphCache,靠 m_needFullRepaint 重建)可行。机理成立。"
+    },
+    {
+     "title": "主题预览首开逐个读 458 文件 + 逐字符 O(n²) 解码,阻塞 UI(已知计划,补实现层面见解)",
+     "verdict": "confirmed",
+     "note": "代码属实。loadThemePreviews(Index.ets:1943-1963)在 for 循环里 `await resourceMgr.getRawFileContent('themes/'+theme)` 顺序遍历整个 themeList(getThemeList 经 napi_init.cpp:1944-1963 枚举 rawfile themes 全目录,ghostty 主题数百级,可达 458);parseThemePreview(1965-1969)`text += String.fromCharCode(raw[i])` 逐字节拼全文件、再 1973 行 split 整个文件,无 early-break,而实际只需 bg/foreground/palette0-7 约 11 行。触发点 prepareThemePane(342/784→1902)即打开外观面板;1944 行 `themePreviews.size>0` 守卫使仅首开一次。IO 本身 async 不直接卡 UI,但 458 次 await 往返 + 每次 O(n²) 同步 parse 在 JS 线程累积可致首开掉帧;O(n²) 严格程度依赖 ArkTS 引擎字符串实现(可能被 rope 优化),但逐字节解码+全文件 split 只取 11 行的浪费确凿。发现自身正确标注为『已知计划』并给出 TextDecoder/early-break/预构建 JSON 的实现建议。confirmed。"
+    }
+   ]
+  }
+ ],
+ "research": [
+  {
+   "dimension": "业界渲染实践",
+   "findings": [
+    {
+     "title": "引入渲染器自有的持久离屏位图 + 脏行级重绘(foot/ghostty 原理:只画变化的行)",
+     "detail": "机理:当前每帧走 beginFrame→RequestBuffer 取一块「轮转 swapchain 里的新后备缓冲」(native_drawing_renderer.cpp:288),再 CanvasClear 整屏(:355),renderGrid 无条件重绘所有 rows×cols 的背景矩形+字形 run(:380-515)。因为每帧拿到的是 3 块轮转 buffer 中的一块、内容是 3 帧前的陈旧像素,所以「不重绘就是脏数据」,逼着必须全清+全画,无法跳过未变行。这正是架构描述里「持久离屏 buffer/脏行重绘」在代码里其实不存在的地方(renderer.h 里只有 m_currentBuffer/m_currentPixels,指向当帧 NativeWindow buffer,没有任何自有 backing store)。修复:在 NativeDrawingRenderer 里持有一块自己拥有的 RGBA 离屏位图(尺寸 cols*cellW × rows*cellH),把 OH_Drawing canvas 绑到它上面增量绘制;drawFrame(terminal.cpp:1589 起)保留上一帧 Cell 网格,逐行 memcmp/按 run 比对得到「per-row dirty 位图」(ghostty 就是按『行』而非按『格』做 dirty,因为字体 shaping 本就以行为单位,粒度刚好);renderGrid 只重绘 dirty 行;endFrame 再把离屏位图(或仅 dirty 行区间)blit 进当帧 NativeWindow buffer。这是解锁下面滚动 blit / damage 上报 / 去分配 的地基。foot 官方 wiki:『only renders the cells that have been updated』;ghostty 1.3.0 靠 dirty 追踪让多数帧根本不持有终端锁。",
+     "impact": "打字/编辑/光标闪烁/tmux 状态栏刷新时,现在每一次都是 O(cols×rows) 全网格重排+全屏光栅化;2.5K 屏上按 ~200×60≈12000 格算,每帧上万次矩形填充+字形排版,直接吃满一个大核 → 高负载下掉帧、发热、续航差。改为只画变化行后,常见交互(改一行、光标移动)从「上万格」降到「一两行」,体感从『发烫卡顿』变『纹丝不动的即时』。",
+     "effort": "large",
+     "priority": "P0"
+    },
+    {
+     "title": "滚动改用「区域 blit(memmove 整块位移)+ 只重绘新露出行」(foot 原理:scroll damage)",
+     "detail": "机理:DispatchAxisEvent 把触控板/滚轮增量攒成整行数 scrollLines 后调 ghostty 视口滚动(napi_init.cpp:1013-1020),renderGrid 签名里根本没有滚动位移参数(renderer.h:29),于是「向下滚 N 行」时,屏幕上 N..end 行的内容其实和上一帧一模一样、只是整体上移了 N 行,却被完整重新光栅化。foot 对此的做法是:对自有 pixmap 用 memmove 把重叠区整体位移 N*cellH,只重绘因滚动新暴露出来的 N 行,并且只把这部分标记为 damage。修复(依赖上一条的持久离屏位图):滚动时先 memmove 离屏位图重叠区,再仅对新露出的 N 行调 renderGrid,damage 只含这 N 行 + 滚动 blit 区。这条同时点出「已做的平滑滚动像素池」的天花板:输入层虽然在 m_axisScrollRemainderY 里留了亚行余数(napi_init:1013),但渲染层仍是整行全量重画,像素池并没有真正减少渲染量。",
+     "impact": "tail -f 日志、cat 大文件、vim/less/tmux 翻页、终端疯狂刷屏这类『纯滚动』场景,是全终端最吃性能的负载;现在每滚一行都全屏重画 → 快速滚动直接掉到个位数帧、明显卡顿撕裂。改 blit 后滚动开销与「移动多少行」而非「屏上多少格」成正比,`yes`/日志刷屏也能跟手顺滑。",
+     "effort": "medium",
+     "priority": "P0"
+    },
+    {
+     "title": "endFrame 上报真实 damage Region,别再每帧 flush 全屏 damage(alacritty/foot 原理:present with damage)",
+     "detail": "机理:endFrame 里把 dirtyRegion.rects=nullptr、rectNumber=0 传给 OH_NativeWindow_NativeWindowFlushBuffer(native_drawing_renderer.cpp:524-533),这在图形合成语义里等于告诉 HarmonyOS 合成器『整块 surface 都脏了』,于是每一帧——哪怕只是光标闪了一下——合成器都要对整块 2.5K surface 做全量合成。alacritty(PR #5773 / v0.11.0)与 foot 都会把每行的『最左/最右变动格』攒成 damage 矩形上报给合成器,合成器只合成动的那块,省合成带宽、降功耗、也降远程/投屏延迟。修复:拿上一条得到的 per-row dirty 信息(退一步,连光标专属矩形 m_lastCursorLeft/Top/Width/Height 都是现成的,renderer.cpp:372-376),构造一组真实 Region rect 传给 FlushBuffer。即使先只做『变动行的并集』一个粗矩形,收益也立竿见影。",
+     "impact": "打字/光标闪烁这类『屏上 99% 没变』的高频场景,现在逼着合成器每帧全屏合成 2.5K → 白白烧 GPU 合成与电、外接屏/投屏时端到端延迟更高、续航更差。上报真实 damage 后,静息打字时合成器几乎不干活,续航与发热明显改善,输入延迟也更低。ROI 极高、代价极小(有了脏行信息几乎是白送)。",
+     "effort": "small",
+     "priority": "P0"
+    },
+    {
+     "title": "帧节流/合并 + 光标闪烁只脏光标行(kitty repaint_delay/input_delay 原理;修当前『闪烁=全帧重建』)",
+     "detail": "机理两处:(1)渲染线程只要开了光标闪烁,animateCursor 恒为 true,于是每个 CURSOR_BLINK_TICK 都 shouldRender=true(napi_init.cpp:1543-1561),无条件跑一次完整 drawFrame(全网格重建+全 repaint+全 flush)——哪怕整屏静止不动,也在以闪烁频率烧全帧。(2)终端疯狂输出时,每来一批数据就 RequestRender 一次,没有把一串输出合并进『不超过屏幕刷新率』的帧里。kitty 用 repaint_delay/input_delay 两个人工延迟把渲染与输入解析节流到刚好够用(默认约 100FPS),既不丢流畅度又不空烧 CPU,有待处理输入时才无视延迟立刻画。修复:(1)光标闪烁帧只把光标那一行(或那一格)标脏,不触发全网格重建;(2)在 RequestRender/渲染线程加一个『合并窗口』(如 8~16ms 或对齐屏幕 vsync),把窗口内多次 dirty 合成一帧,输出洪流时天然降到刷新率上限。",
+     "impact": "(1)现在终端摆着不动也在按闪烁节奏周期性全屏重画 → 静息功耗/发热无谓偏高、2in1 待机掉电快。(2)程序爆量输出时渲染线程被无节制的重画淹没 → 明明可以每 16ms 画一帧却在画几百帧的中间态,卡顿反而更重。节流+合并后静息几乎零渲染、爆量输出稳定贴刷新率。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "干掉 drawFrame/renderGrid 每帧的堆分配(cells 向量、每行 rowText/rowByteStart/End、geometryMask)",
+     "detail": "机理:drawFrame 每帧 new 一个 std::vector<Cell> cells(cols*rows)(terminal.cpp:1589);更狠的是内层每一行都新建 std::string rowText + 两个 std::vector<size_t>(cols)(rowByteStart/rowByteEnd,terminal.cpp:1632-1634),而这俩 byte 偏移数组只在 searchActive 时才用得上(:1714-1717)——非搜索态(绝大多数时间)是纯浪费的每行三次堆分配;renderGrid 里又每帧 new std::vector<uint8_t> geometryMask(rows*cols)(native_drawing_renderer.cpp:378)。这些都是每帧、每行的 malloc/free 抖动,落在最热的渲染路径上。修复:把 cells / geometryMask / rowText / rowByte 数组都提升为渲染器或 Terminal 的成员,resize 时按 cols*rows 一次性 reserve,每帧 clear 复用;rowByteStart/End 用 `if (searchActive)` 门控,非搜索态根本不分配。",
+     "impact": "属于『稳态每帧税』——无论画什么,每帧都在 heap 上翻搅几十~上百次分配,放大 GC/分配器压力、拉高帧时间方差(偶发长帧=偶发卡顿),快速滚动/爆量输出时尤其明显。消除后帧时间更平、卡顿毛刺减少。代价小、纯稳赚。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "字形缓存改为『单字形栅格 atlas』,取代按整段 run 文本缓存 Typography(kitty/alacritty/ghostty 原理:渲染成本 ∝ 唯一字形数而非字符数)",
+     "detail": "机理:现在 getGlyphLayout 缓存的是『整段合并 run 的 OH_Drawing_Typography 排版对象』,key=(run 文本, fg, 样式位, span)(native_drawing_renderer.cpp:629-644、505)。run 是把整行里同样式相邻格合并出来的字符串(:471-503),于是 key 几乎是『每一段词/每一行文本』——日志、代码、随机文本里这些 run 串近乎唯一,缓存命中率趋近 0,等于每帧为每个 run 现场 CreateTypographyHandler+Layout(一次完整 shaping+排版)。而且 trimGlyphCache 一旦超过 4096 条就 destroyGlyphCache 把整张缓存全毁(:621-627),造成周期性缓存踩踏。顶级终端的做法反过来:按『单个字形(codepoint+字重+斜体)』栅格化成 alpha 位图存进 atlas,一次栅格终身复用,绘制=按 fg 做 alpha-blend blit,成本只和屏上『唯一字形数』(几百个)相关,与文本内容无关。修复:建一层 codepoint+styleBits→alpha bitmap 的 atlas 缓存(用 OH_Drawing 把单字形画进小 bitmap 或直接取 glyph outline 栅格化),renderGrid 合成时对每格做着色 blit;连字/整形按 kitty/ghostty 那样以『多格字形组』为单位缓存以兼顾 ligature;trim 改成 LRU 局部淘汰,别整张清。",
+     "impact": "日志刷屏、编译输出、代码浏览、vim 大文件这类『文本几乎不重复』的场景,现在等于每帧对满屏文字重新 shaping+排版,CPU 直接见底、掉帧发热;改 atlas 后同样内容的渲染成本骤降一个量级,且不再有 4096 满额时的周期性大卡顿。这是 CPU 光栅路径下最『抄顶级终端』的一条。",
+     "effort": "large",
+     "priority": "P1"
+    },
+    {
+     "title": "建立 vtebench + 帧时/输入延迟 基准,让上面每条优化可量化(alacritty/vtebench 原理与其盲区)",
+     "detail": "机理:目前没有可复现的性能基线,优化全凭手感。alacritty/vtebench 提供标准 payload:scrolling(`yes` 式刷屏)、scrolling_region(tmux/vim 固定状态栏内滚动)、scrolling_fullscreen、以及 dense cells 全屏更新,直接压『终端从 PTY 吞数据的速度』。但要注意 vtebench 的公开盲区:它只测 PTY 读取吞吐,不测帧率、不测输入延迟(社区明确指出这点)。所以修复:(1)接 vtebench 四个 scrolling/更新用例作吞吐基线;(2)另加两个 vtebench 测不到但用户最能感知的指标——用 g_drawFrameCounter(terminal.cpp:1587)+时间戳打点算 p50/p99 帧时间;用『按键→对应像素上屏』打点算输入延迟。先立基线,再逐条验证 P0/P1 的实际收益,避免自嗨式微优化。",
+     "impact": "不是直接提速,而是防止把工时花在省纳秒的假优化上、并证明 blit/damage/atlas 这些大改真有收益;有了帧时 p99 和输入延迟数,才能量化『不卡了』到底改善了多少,也能防回归。建议早做,给后续每条当标尺。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "像素级平滑滚动:离屏渲染高于视口 + 按分数像素偏移采样 + lerp 动画(kitty 0.46 原理)",
+     "detail": "机理:即便做完整行 blit,滚动仍是『整行一跳一跳』,而非 kitty 0.46 的亚像素顺滑(DispatchAxisEvent 把余数攒进 m_axisScrollRemainderY 但渲染层丢弃了亚行部分,renderGrid 无 y-offset 参数)。kitty 0.46 的实现要点:渲染到一块比视口高若干行的离屏缓冲(上下各预渲染 scrollback 若干行),再把『视口大小的矩形』按分数像素偏移从离屏缓冲里采样/拷贝到屏上,并在滚动前后位置间做 lerp 动画,高分辨率触控板与离散滚轮都能顺滑过渡。修复(依赖 P0 的持久离屏位图):把离屏位图做成比视口高 N 行,renderGrid 填『视口+上下富余行』,endFrame blit 时按 (m_axisScrollRemainderY % cellH) 的亚行像素量做垂直偏移拷贝;fling 惯性阶段用同一偏移量按 11ms 节拍衰减推进。CPU 版就是『拷贝子矩形时带 y 余数』,比 GPU 版(uniform 传偏移给 shader)更直接。",
+     "impact": "触控板/触屏滚动从『逐行硬跳』升级到跟手的亚像素顺滑,MatePad 这种带触控板+触屏的 2in1 上体感差距非常直观(和系统级顺滑滚动看齐);也让 fling 惯性真正连续而非阶梯状。属体验升级,排在正确性/吞吐类 P0 之后。",
+     "effort": "large",
+     "priority": "P2"
+    },
+    {
+     "title": "行 blit / memmove 用 NEON 对齐拷贝,并考虑 foot 的 mmap 位移技巧(foot 原理)",
+     "detail": "机理:一旦走上『持久离屏位图 + 滚动区域 blit』(P0),核心热点就变成把整行像素在离屏位图内 memmove、以及把 dirty 行 blit 进 NativeWindow buffer。2.5K 宽一行 ≈ 2500*4≈10KB,滚动重叠区一次要搬几十~上百 KB。foot 明确记录:大距离滚动用 memmove 搬 pixmap,并在 64 位上用『虚拟地址空间/mmap 重映射』技巧避免大块物理拷贝。修复:保证离屏位图 stride 按 16/64 字节对齐,行拷贝走 arm64 NEON(或让编译器对对齐 memcpy 自动向量化),必要时对『整屏级滚动』借鉴 mmap 重映射避免真拷贝。注意这条只有在 P0 的 blit 路径落地后才有意义,否则是无处发力的空优化。",
+     "impact": "把滚动/刷屏时的像素搬运再压一截,进一步稳住快速滚动的帧时上限、降 CPU 占用与发热。收益中等且依赖前置改造,故列 P2;先做 P0/P1,再来榨这一层。",
+     "effort": "small",
+     "priority": "P2"
+    }
+   ]
+  },
+  {
+   "dimension": "鸿蒙性能工具",
+   "findings": [
+    {
+     "title": "FlushBuffer 每帧上报「全屏脏」+ 离屏 buffer 整屏 memcpy,在 2.5K 面板上是掉帧/发热主源",
+     "detail": "机理:renderer/native_drawing_renderer.cpp 的 endFrame 把持久离屏 buffer 整屏 memcpy blit 到 RequestBuffer 拿到的 NativeWindow buffer,再 FlushBuffer 提交。已核实官方 API 语义(external_window.h / OH_NativeWindow_NativeWindowFlushBuffer 第四参 Region{rects, rectNumber}):传 nullptr 或 rectNumber=0 时,系统把整个 buffer 当脏区,合成器每帧全屏合成。MatePad Edge 约 2560×1600×4B≈16MB/帧,60fps 即 ~1GB/s 的 CPU 拷贝带宽 + 全屏 GPU 合成——而终端每帧真实变化通常只有几行。等于已有的『脏行级重绘』在 present 阶段被作废。修复:①收集本帧脏行的 bounding rect 列表,构造 Region 传给 FlushBuffer,让合成器只合成脏区(改动小);②进一步把脏行直接光栅化进 RequestBuffer 的 window buffer、仅对脏区外做跨帧保留,省掉离屏→window 整屏 memcpy(多缓冲下 buffer 内容非连续,需累积跨帧脏区或退化为双缓冲,改动中/大)。文档:ArkGraphics/NativeWindow 开发指导、external_window.h。",
+     "impact": "快速滚动、cat 大文件、SSH 刷屏时掉帧和 GPU 占用飙升,机身发热;分辨率越高越明显,正是这台 2.5K 2in1 的痛点。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "整条 C++ 自绘热路径对 DevEco Frame 泳道不可见,必须先做 HiTraceMeter 埋点才能真机定位掉帧",
+     "detail": "机理:DevEco Profiler 的 Frame / ArkUI 泳道只覆盖 ArkUI 组件树的 measure/layout/draw。Emberline 掉帧的真实热路径全在 C++——terminal/terminal.cpp 的 drawFrame(快照+渲染)、native_drawing_renderer.cpp 光栅化、napi_init.cpp 渲染线程(条件变量驱动)与 fling 11ms 节拍、endFrame blit——这些在标准 Frame 泳道里是一段黑盒空白,不埋点根本看不到是快照慢、光栅化慢还是 blit 慢。修复:用 HiTraceMeter C API(hitrace_meter.h:OH_HiTrace_StartTrace/OH_HiTrace_FinishTrace,跨线程用 StartAsyncTrace)在 drawFrame、rasterize、endFrame/blit、fling tick、输入线程 CAS 投递每段打点,再用 SmartPerf-Host 抓 trace,自定义段即显示为独立泳道,可读每段耗时与跨线程时序;DevEco Profiler 的 User Trace 泳道同样能显示。这是后续所有渲染优化的测量前提。文档:HiTraceMeter(Performance Analysis Kit)、SmartPerf-Host 使用指南。",
+     "impact": "没有埋点=盲调,任何渲染优化都无法验证收益、也指认不出 60fps 的破点;有了它能精确定位是哪一段吃掉帧预算。",
+     "effort": "small",
+     "priority": "P1"
+    },
+    {
+     "title": "选错剖析工具会误判掉帧根因:锁/条件变量等待要用 SmartPerf-Host,不是 hiperf",
+     "detail": "机理:hiperf 是 on-CPU 采样(hdc shell hiperf record -p <pid> -f <freq> -s/--call-stack,出 CPU 热点火焰图),但看不到线程『在等锁/等条件变量』的 off-CPU 时间。Emberline 架构恰有多处跨线程同步:输入线程 CAS 投递像素池、渲染线程条件变量驱动、fling 11ms 节拍、SSH 读线程 TSFN。若掉帧源于渲染线程等条件变量唤醒延迟或锁竞争(而非算得慢),hiperf 火焰图会显示『一切正常』从而误导。适用判断:on-CPU 热点(光栅化/内核 vt 处理算得慢)→ hiperf;线程为何 idle/阻塞、锁 wait、调度延迟、跨线程时序 → SmartPerf-Host 的线程状态泳道(Running/Runnable/Sleeping/D 状态)+ 锁竞争泳道。二者配合使用。文档:hiperf 命令行工具、SmartPerf-Host《使用 SmartPerf-Host 分析应用性能》。",
+     "impact": "用错工具会把时间花在优化本来不慢的光栅化上,真正的条件变量唤醒/锁竞争延迟一直没解决,掉帧照旧。",
+     "effort": "small",
+     "priority": "P2"
+    },
+    {
+     "title": "主题面板首开 458 文件同步解析阻塞 UI 线程,应移到 TaskPool/@Concurrent",
+     "detail": "机理(已在计划内,补实现层):458 文件枚举+解析若在 build 或点击回调里同步跑,就压在 UI 线程上。用 DevEco Profiler 的 Frame + ArkTS Callstack 泳道会看到一根跨多个 vsync 的超长 UI 线程调用栈,对应一次肉眼可见的整页冻结(HiAppEvent 的 freeze 事件也会上报)。注意:用 async/await 包一个同步 fs 调用并不能解决——它仍在主线程执行。修复:用 TaskPool 提交 @Concurrent 标注的解析函数(官方推荐的轻量并发,自动线程池)或 Worker,把文件枚举+解析整体丢子线程,主线程只接收结果;或首开只解析首屏可见主题项、其余滚动到再懒解析。文档:TaskPool、@Concurrent、DevEco Profiler ArkTS Callstack 泳道。",
+     "impact": "首次打开主题面板整页冻结数百毫秒到秒级,点击无响应,体感很差。",
+     "effort": "medium",
+     "priority": "P1"
+    },
+    {
+     "title": "2200 行单 @Component 的 Index.ets 缺精细化更新:任一 @State 变化触发整树 build 重跑+diff",
+     "detail": "机理:标签栏/终端层/设置抽屉/帮助页/标签编辑弹层全在一个 @Component 的 build 里。ArkUI 的刷新粒度是『拥有该状态变量的自定义组件整个 build 重新执行并 diff』,不是精确到绑定点。于是终端标题 500ms 轮询回填、tab 切换、新会话等任一 @State 变化,都会让这 2200 行 build 全量 re-run + diff,连当前不可见的设置抽屉/帮助页/弹层也一起被遍历。修复(官方《开发高性能 ArkUI-UI 组件性能优化》核心即『控组件数、细化更新粒度』):①拆成 TabBar/TerminalLayer/SettingsDrawer/HelpPage/TabEditSheet 多个子 @Component,把各自 @State 下沉,变化只 diff 子树,顺带完成 build 函数瘦身与降嵌套;②对象型状态用 @Track 标注字段,只有被改字段的绑定才刷新;③隐藏的抽屉/帮助页/弹层用 @Component({freezeWhenInactive:true})(或 @ComponentV2),非激活时冻结状态更新、不参与 diff。文档:@Track、freezeWhenInactive、UI 组件性能优化最佳实践。",
+     "impact": "终端活跃时(标题轮询/持续输出)ArkTS 侧持续做无谓的整树 re-diff,与 native 渲染抢占 UI 线程,表现为输入回显延迟、偶发卡顿。",
+     "effort": "large",
+     "priority": "P1"
+    },
+    {
+     "title": "TerminalController 的 16ms 输入轮询让 UI 线程空闲期永不休眠,持续耗电发热",
+     "detail": "机理:TerminalController.ets 以 16ms(≈60Hz)定时轮询 native 取输入。native 侧已有 TSFN(terminal_driver.cpp EmitOutput→TSFN→ETS feed)可主动推送,轮询与推送并存时轮询是纯浪费:即便终端完全空闲无输出,也每帧唤醒 UI 线程做一次 napi 往返,60 次/秒的定时器阻止 UI 线程进入长 idle,持续耗电、无风扇 2in1 平板发热;息屏后若仍轮询更糟。修复:改事件驱动——native 有新输出/需要渲染时经 TSFN 唤醒 ETS,取消固定 16ms 轮询;若轮询是为光标闪烁或 pending flush,则改用 vsync 回调且仅在『有脏』时驱动,空闲时零唤醒。可用 SmartPerf-Host 线程状态泳道验证:空闲时 UI 线程应看到每 16ms 一次短 Running 毛刺,改造后消失。文档:官方后台功耗最佳实践、SmartPerf-Host 线程状态分析。",
+     "impact": "挂机/待机时持续耗电与温升,续航明显变差;这类『空转轮询』也是系统判定应用高功耗的典型特征。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "计划中的 taskKeeping 保活:2in1 专属类型 + 官方红线,选错类型会被系统取消并计滥用",
+     "detail": "机理(已在计划内,补实现层与红线):后台保活须走 Background Tasks Kit 的 ContinuousTask。官方硬约束:①申请的 continuous task 类型必须与真实业务匹配,类型不符会被系统直接取消并计入滥用统计;②必须先由前台 UIAbility 触发 startBackgroundRunning、并绑定一条用户可见的持续通知,否则申请失败;③无匹配业务长期空占会被降级/冻结。终端的本地 PTY / SSH 会话保活不属于 audioPlayback/location/dataTransfer 等既有语义,强行套用会被判滥用。关键设备判断:MatePad Edge 是 2in1 形态,ContinuousTask 有面向 PC/2in1 的 taskKeeping 类型正对应通用保活,终端应申请 taskKeeping;手机形态不支持该类型,故这条依赖 deviceType 判断、需运行时降级。实现:前台起时 backgroundTaskManager.startBackgroundRunning(taskKeeping + WantAgent 通知),会话全部关闭时立即 stopBackgroundRunning 释放,别长期空占。另:500ms 标题轮询只在 taskKeeping 生效期真正跑,切后台后可进一步降到秒级或暂停以控功耗。文档:Background Tasks Kit backgroundTaskManager.startBackgroundRunning、长时任务(ContinuousTask)、taskKeeping 类型。",
+     "impact": "保活不当→切后台被冻结导致 SSH/本地会话断连(用户切走回来会话没了);类型滥用→被系统降级、甚至影响上架审核。",
+     "effort": "medium",
+     "priority": "P2"
+    },
+    {
+     "title": "SSH/PTY 读线程 EmitOutput 若按 chunk 逐次触发 TSFN,高吞吐输出会淹没 UI 线程",
+     "detail": "机理:terminal_driver.cpp 读线程每次 read 到数据就 EmitOutput→TSFN→ETS feed。终端经典压力场景(cat 大文件、编译刷屏、tail -f)下 read 会高频返回小块,若每块一次 TSFN、一次 napi feed、并触发一次内核 vt 处理/渲染请求,就是『千刀万剐』式把 UI/JS 线程打满,渲染线程被 feed 抢占导致掉帧甚至输出回显滞后。修复:在 native 读线程侧做合并——用一个小环形缓冲累积,按时间窗(如 8-16ms)或字节阈值批量投递一次 TSFN,把 N 次跨语言调用压成 1 次;或让 feed 与渲染以 vsync 为节拍消费,读线程只补数据不逐块触发渲染。检测:用第 2 条的 HiTraceMeter 埋点在 EmitOutput/feed 打点,SmartPerf-Host 上若看到刷屏期 TSFN 回调密集成墙、UI 线程满载即确诊。文档:napi_threadsafe_function 用法、HiTraceMeter/SmartPerf-Host。",
+     "impact": "大量输出时界面卡死几百毫秒、滚动跟不上、输入回显延迟,是终端类应用最常被吐槽的『刷屏就卡』体感。",
+     "effort": "medium",
+     "priority": "P1"
+    }
+   ]
+  }
+ ],
+ "ux": [
+  {
+   "title": "字体预览按钮不用自己的字体渲染示例——「字体选择器」形同虚设",
+   "detail": "buildFontChoiceButton(Index.ets:2044)里示例文字 Text('ls -al → 终端 0Oo')(2047 行)只设了 fontSize/fontColor,唯独没有 .fontFamily(family)。传进来的 family 参数只被用在下方标签的高亮色和底部灯丝(2053/2058),示例文字本身一直用系统默认 UI 字体渲染。结果 Maple / JetBrains / Cascadia / 更纱 四个选项的预览一模一样,用户根本看不出 0 与 O、连字、字重的差异——而这行示例存在的唯一意义就是让人比对等宽字形。修复:给示例 Text 补 .fontFamily(family)(这些族已在 renderer 注册,系统族+Maple 至少能直出;若 ArkUI Text 解析不到自定义 slot,退化为默认也不比现状差)。",
+   "impact": "打开字体页想挑等宽字体,四个卡片预览字形完全相同,选择变成盲选,精心设计的 '0Oo' 对比样张沦为装饰噪点——一眼看穿的廉价感。",
+   "effort": "small",
+   "priority": "P1"
+  },
+  {
+   "title": "标签关闭 X 命中区仅 12×12vp,触屏几乎点不中",
+   "detail": "TerminalTabChip 的关闭图标(Index.ets:146-152)直接把 onClick 挂在 .width(12).height(12) 的 Image 上,外围只有 margin({left:4,right:2}) 没有可点 padding。12vp 命中区远低于 HarmonyOS 建议的 40-48vp 触控下限,在 2.5K 高密度屏上物理尺寸约 2mm。手指关标签基本靠运气,常误触到切换标签(整个 chip 的 onClick)。修复:把 onClick 从 Image 移到一个 .padding(10) 的包裹容器(或给 Image 加透明 padding 扩到 ~32vp),X 图标视觉仍 12,命中区放大到 32。顺带可考虑仅 active/hover 标签显示 X,减少非活动标签的视觉噪点。",
+   "impact": "触屏关标签频繁点空或误触切换,重度用户开十几个标签时关闭体验极其恼火。",
+   "effort": "small",
+   "priority": "P1"
+  },
+  {
+   "title": "复制成功没有任何反馈——最高频操作静默无声",
+   "detail": "copyToClipboard(TerminalSurface.ets:675)成功后只 requestTerminalFocus,无 toast/无闪烁。三个复制入口(辅助键条'复制' Index.ets:1847、右键菜单'复制' TerminalSurface.ets:593、'复制整屏' 610)复制后终端毫无变化,用户不知道到底复制没有,只能切到别处粘贴验证。终端用户对复制的确认预期极强。修复:在 copyToClipboard 成功分支加 promptAction.showToast({message:'已复制', duration:1200}),或做一次 60ms 的选区高亮闪动。粘贴因为会回显到终端可不加。",
+   "impact": "每次复制都要靠'粘贴一下看看'来确认,信任感缺失,这是最典型的'廉价 vs 精致'分水岭。",
+   "effort": "small",
+   "priority": "P1"
+  },
+  {
+   "title": "抽屉滑出 240ms 但遮罩瞬现瞬灭,开关时画面割裂",
+   "detail": "抽屉本体有 .animation({duration:240,curve:EaseOut}) 配合 translate(buildDrawer Index.ets:734-735),平滑滑入;但背后遮罩 buildDrawerScrim 是 build() 里 if(this.drawerOpen) 硬挂载(Index.ets:504),#80020305 半黑层瞬间出现/消失。开:黑幕先啪一下铺满,面板才慢慢滑进来;关:黑幕瞬间消失,面板却还要滑 240ms,这 240ms 面板悬浮在已经变亮的终端上,像两个不相干的动作。修复:遮罩改成常驻挂载(和抽屉一样),用 @State opacity 从 0↔1 走同一条 240ms EaseOut,与 translate 同帧;闭合时 hitTest 交给 drawerOpen 控制。",
+   "impact": "每次开关设置抽屉都能看到黑幕和面板不同步的'两段式'跳变,反复出现,精致度大打折扣。",
+   "effort": "medium",
+   "priority": "P1"
+  },
+  {
+   "title": "辅助键条出现是硬跳,且每次切换都触发终端整屏 reflow(SIGWINCH)",
+   "detail": "build() 里 if(this.accessoryVisible) buildAccessoryBar()(Index.ets:496)在正常流里挂载,终端层是 layoutWeight(1)。每次点键盘图标(602 行 toggle),44vp 高的键条瞬间插入/移除,终端被硬压缩/弹开——不只是视觉硬跳,还会改变 XComponent 尺寸→setSurfaceFrame→PTY resize→远端收到 SIGWINCH 重排整屏。为了'看一下方向键'付出一次全屏回流的代价,伴随可见闪烁。修复:把辅助键条改成绝对定位悬浮在终端底部之上(Stack 内 position 到底边,半透明),toggle 时只做 translateY 上滑(animateTo 220ms,curve friction/EaseOut),不改终端布局,既避免 reflow 又有滑入动画。",
+   "impact": "呼出/收起辅助键条时整个终端画面抖一下并重排,外接键盘用户切辅助键频繁,反复看到闪烁,体感廉价且干扰阅读。",
+   "effort": "medium",
+   "priority": "P1"
+  },
+  {
+   "title": "COLOR_TEXT_FAINT 对比度约 2.2:1,ghostty 键名与帮助脚注近乎不可读",
+   "detail": "COLOR_TEXT_FAINT='#454E5C'(Index.ets:52)贴在 #10141B 面板上,实测对比度仅 ~2.2:1(WCAG AA 正文要 4.5:1)。它承载的却是真实信息:buildRowLabel 里 10.5px 的 '= cursor-style' 等 ghostty 配置键(812-814)——正是团队引以为傲的'对照 ghostty 文档'卖点;还有外观页脚注(964-966)、帮助页脚注(1379-1382)。10.5px + 2.2:1 在 2.5K 亮屏或户外几乎隐形,功能等于没有。修复:键名色提到 ≥#6B7688(约 3.2:1),字号 10.5→11;脚注同样提亮。",
+   "impact": "想照着灰色小字对 ghostty 配置键、看粘贴/连接说明,却根本看不清,核心文档化特性形同虚设。",
+   "effort": "small",
+   "priority": "P1"
+  },
+  {
+   "title": "容器型 onClick 元素零按压/悬停反馈——触控板与触屏都没有'点中了'的确认",
+   "detail": "大量可点元素把 onClick 挂在裸 Row/Column/Stack 上,没有 stateStyles,也就没有 ArkUI Button 自带的按压水波:主题行(buildThemeRow Index.ets:1140)、抽屉导航项(781)、标签 chip(177)、字体卡片(2070)、灯丝色板(1467);而顶栏四个图标按钮虽是 Button 但 backgroundColor('#00000000')透明(577/598/614/630/645),默认按压反馈几乎不可见。MatePad 带触控板,却没有任何 hover 态。点主题、切标签、选字体全程没有触觉/视觉确认。修复:给这些元素加 .stateStyles({pressed:{...},[鼠标] hovered:{...}}) 或按下时 scale 0.97+背景微亮(animateTo 90ms);顶栏图标按压/悬停给个 #161B24 底。",
+   "impact": "点任何自定义控件都'没反应感',配合触控板悬停无高亮,整套设置界面像静态图,精致度直接掉档。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "灯丝(filament)连接变色是硬切换,信号靠字符串猜测——招牌隐喻被浪费",
+   "detail": "TerminalTabChip 的 filament()(Index.ets:123)返回色直接喂给 backgroundColor(160),连上瞬间从 COLOR_ASH 硬跳到 COLOR_EMBER,glow 阴影也是三元瞬切(162-164),opacity 0.45↔1 瞬跳(161)。'灯丝'这个命名本身就在暗示'通电升温慢慢亮起',现在却是开关式硬切。更糟的是 isPending() 靠 statusLabel.includes('重连')/('正在连接')(132-135)字符串嗅探判断'连接中';驱动措辞一变,半亮态直接失效,连接过程中灯丝显示为灰(像已断开)。修复:连接态变色用 animateTo(360ms,EaseOut) 过渡 backgroundColor+shadow radius(灯丝'升温'微光渐亮);pending 用驱动给的显式枚举/布尔而非 includes 匹配。",
+   "impact": "标签连上时灯丝'啪'一下变色缺乏生命感;更实际的是连接中常错显为灰色,用户以为没连上而重复操作。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "标签编辑弹层与其遮罩瞬现,模态入场毫无过渡",
+   "detail": "buildTabEditor(Index.ets:1437)及 buildTabEditScrim(1406)由 build() 中 if(this.tabEditOpen)(509-512)硬挂载,双击标签后弹层直接'啪'地出现在屏幕中央,没有缩放/淡入,遮罩也瞬黑。一个居中模态零入场动画是很扎眼的廉价信号。修复:弹层用 transition({type:Insert, scale:{x:0.92,y:0.92}, opacity:0}) + animateTo 180ms EaseOut(退出对称);遮罩 opacity 0→1 同步 160ms。另外点遮罩是 commitTabEditor(1412)即'保存'而非取消,改完名误触外部会静默保存,与常规模态'点外部取消'预期相反,建议点遮罩=取消、只有'完成'保存。",
+   "impact": "双击重命名标签,弹窗生硬蹦出;且点空白处会意外保存改名,行为反直觉。",
+   "effort": "small",
+   "priority": "P2"
+  },
+  {
+   "title": "首启/空态:新标签只甩出 ANSI 调色板 demo,没有任何连接引导",
+   "detail": "新标签 attach 后若未自动连接就 showStartupDemo()喂 buildAnsi256ColorDemo()(Index.ets:1637-1644),终端里铺一屏色块,标签名'新标签页'。首次使用的人看到一堆彩色方块,完全不知道怎么连服务器、怎么呼出键盘——没有空态引导浮层,没有指向🔗图标的提示。断开态同理:终端体里没有'已断开,点此重连'的可点入口,重连只能靠自动退避或翻抽屉。修复:demo/断开态终端上叠一层可关闭的空态提示(Stack 顶层半透明卡):'未连接 · 点击 🔗 连接 Agent / 本地 shell,单指上滑呼出键盘';断开时给一个居中'重新连接'按钮直接调 connectFusionAgentForSession。",
+   "impact": "第一次打开面对满屏色块一头雾水,不知从何下手;断线后也找不到就地重连的入口,只能盲翻设置。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "连接握手期间终端一片漆黑,无'正在连接'指示",
+   "detail": "connectFusionAgent/connectFusionVm 里先 drawerOpen=false 收起抽屉,再 clearTerminalForLiveSession()喂 ESC[2J 清屏(Index.ets:1605/1812)。SSH/Agent 握手可能耗数秒,这期间终端是纯黑,唯一线索是标签底部那根靠字符串嗅探的半亮灯丝(若驱动没及时发'正在连接'标签,灯丝还是灰的)。用户面对黑屏不知是卡死还是在连。修复:清屏后在终端 Stack 顶层叠一个居中'正在连接 172.16.100.2…'带小 spinner 的浮层(连上或失败时移除),或直接 feed 一行提示文本。",
+   "impact": "点连接后屏幕全黑好几秒毫无反馈,让人怀疑是不是卡死或闪退,反复重试。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "连接失败没有醒目呈现,错误被塞进被截断的标签标题",
+   "detail": "连接前 connectFusionAgent 就把抽屉关了(Index.ets:1591),失败时 composeTabTitle 走到最后返回 session.statusLabel(480)——错误文案(如 'Connection refused')变成标签标题,而标签宽度 maxWidth 210 且省略号截断,长错误只剩前几个字。抽屉已关,conn 面板的 activeConnStatusText 也看不到。用户只得到一个语焉不详的短标签,不知道为何失败。修复:连接失败时 promptAction.showToast 或在终端体顶部弹一条可点重试的错误横幅,展示完整 statusLabel;或失败时不自动关抽屉、在 conn 面板红字显示原因。",
+   "impact": "连不上时只看到标签上半截乱码般的错误,排查无门,体验挫败。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "标签增删无过渡,且新建标签不自动滚入视野",
+   "detail": "buildTabBar 的 Scroll(Index.ets:551)没有绑定 Scroller,ForEach 标签(553)增删也没有 insert/delete transition。开标签多了以后 addSession 新建的标签排在最右、可能在可视区外,标签条不会跟随滚动过去——新标签虽已激活(终端切过去了),但标签条视觉上'没动',用户以为没建成功;删标签时其余标签硬跳补位。修复:给 Scroll 绑 Scroller,addSession 后 scroller.scrollEdge(Edge.End) 或 scrollToIndex 平滑滚到新标签;ForEach item 加 transition({type:Insert/Delete, opacity, translate})做淡入淡出补位动画。",
+   "impact": "标签一多,新建的标签'看不见'(在可视区外),让人误以为没创建;关标签时其它标签生硬跳位。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "触控目标普遍小于 44vp——为鼠标设计却跑在触屏平板上",
+   "detail": "整套控件按桌面鼠标尺寸做,在触屏上偏小:字号 −/+ 步进钮 28×28(Index.ets:979/995,还是最高频的调字号)、光标样式段控 h28(829)、辅助键条 Esc/^C/方向键 h32(1824,恰恰是被狂点的键)、粘贴视角段控 h28(1420)、顶栏图标钮 30×34(574)、滚动条触控宽 SCROLLBAR_TOUCH_WIDTH=18(TerminalSurface.ets:17,4vp 粗的 thumb 挂在 18vp 区里,手指很难抓)。累积起来在 2.5K 屏上全是难点的小目标。修复:交互高度统一提到 ≥40-44vp(视觉尺寸可不变,靠透明 padding 扩命中区);滚动条触控区扩到 ~28-32vp、thumb 保持细。",
+   "impact": "用手指调字号、点辅助键、拖滚动条时频繁点偏、点空,和外接键盘/触控板混用时割裂感明显。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "键盘可达性缺口:查找仅右键可开、缺 Ctrl+F/Ctrl+T/W/Tab、字号无 Ctrl±,设置全 focusable(false)",
+   "detail": "从 ETS 侧看,查找只能通过右键上下文菜单'查找'进入(buildTerminalContextMenu TerminalSurface.ets:582),没有 Ctrl+F 之类键盘入口;帮助页快捷键(Index.ets:1375-1379)只列了复制/粘贴,没有新建标签(Ctrl+T)、关标签(Ctrl+W)、切标签(Ctrl+Tab/Ctrl+1..9)、字号缩放(Ctrl+ +/−)——这些是终端用户的肌肉记忆,MatePad 又是带硬件键盘的 2in1。同时所有 UI 元素统一 .focusable(false)(为保终端持焦,合理),意味着 Tab 键无法遍历、设置抽屉 100% 只能指针操作。修复:在原生键路由里补 Ctrl+Shift+F 开查找、Ctrl+T/W、Ctrl+Tab、Ctrl±缩放,并写进帮助页;若已在 C++ 实现则至少在 buildHelpPane 补文档。",
+   "impact": "外接键盘用户找不到查找快捷键、无法用键盘管理标签/缩放字号,只能回手去点屏幕,打断'键盘飞流'的终端体验。",
+   "effort": "medium",
+   "priority": "P2"
+  },
+  {
+   "title": "全程零触觉反馈——高端平板缺了'精致'的临门一脚",
+   "detail": "两份文件里没有任何 vibrator/haptic 调用。连接成功/失败、复制、关标签、选灯丝色、滚动到 scrollback 顶/回到实时边这些关键动作全靠视觉,而视觉反馈本身又多处缺失(见复制无 toast、灯丝硬切)。华为设备的马达素质很好,一次轻量 haptic(如连接成功=一次轻震、^C 中断=短促震、复制成功=极轻 tick)能显著提升'实感'。修复:封装一个 haptic 工具,在 connect 成功回调、copyToClipboard 成功、closeSession、pickFilament、滚动到边界处各触发对应强度的 HapticFeedback。",
+   "impact": "所有操作都'哑'的,和系统原生 app 的细腻触感一比就显得单薄,少了旗舰平板该有的分量感。",
+   "effort": "medium",
+   "priority": "P2"
+  }
+ ]
+}

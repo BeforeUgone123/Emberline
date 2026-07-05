@@ -39,6 +39,13 @@ export class FusionAgentDriver {
   private ready: boolean = false;
   private supportsTerminateControl: boolean = false;
   private terminateCloseTimer: number = -1;
+  // Auto-reconnect after an unexpected drop: armed by connect(), disarmed by
+  // every deliberate teardown (closeConnection), so manual disconnect, tab
+  // close, and a clean shell exit never trigger retries.
+  private autoReconnect: boolean = false;
+  private lastEndpoint: FusionAgentEndpoint | null = null;
+  private reconnectAttempt: number = 0;
+  private reconnectTimer: number = -1;
   // PTY output arrives in arbitrary WebSocket frame chunks, so a multi-byte
   // UTF-8 sequence can be split across frames; the incomplete tail is kept
   // here until the next frame arrives.
@@ -46,12 +53,26 @@ export class FusionAgentDriver {
 
   private readonly inputListener: TerminalInputListener = (input: string): void => {
     if (!this.socket || !this.connected || input.length === 0) {
+      // Typing into a dropped session should not be silently swallowed:
+      // treat any keystroke as "reconnect now" and skip the backoff wait.
+      if (input.length > 0) {
+        this.reconnectNowIfWaiting();
+      }
       return;
     }
 
     const data = this.encodeUtf8(input);
     this.sendSocketPayload(data);
   };
+
+  private reconnectNowIfWaiting(): void {
+    if (!this.autoReconnect || !this.lastEndpoint || this.reconnectTimer < 0) {
+      return;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = -1;
+    this.openSocket(this.lastEndpoint);
+  }
 
   private readonly sizeListener = (size: TerminalSize): void => {
     const cols = Math.max(1, size.cols || DEFAULT_AGENT_COLS);
@@ -74,10 +95,45 @@ export class FusionAgentDriver {
     this.controller.setSizeListener(this.sizeListener);
   }
 
+  // Passive teardown: closing a tab or replacing the driver must not disturb
+  // whatever runs inside the remote PTY (tmux, codex, long builds).
   detach(): void {
-    this.terminate();
+    if (this.controller) {
+      this.controller.setInputListener(null);
+      this.controller.setSizeListener(null);
+    }
+    this.closeConnection(false, 0);
+    this.controller = null;
   }
 
+  // Hand-off detach for tab drag-out: drop the controller input/size listeners
+  // but keep the live WebSocket, autoReconnect state and the controller
+  // reference untouched. Remote PTY output keeps feeding the SAME controller
+  // grid across the move (no direct-output sink on the agent path), so tmux /
+  // codex output is never dropped and rebind() re-hooks input with zero
+  // reconnect. Never call closeConnection here.
+  softDetach(): void {
+    if (this.controller) {
+      this.controller.setInputListener(null);
+      this.controller.setSizeListener(null);
+    }
+  }
+
+  // Re-attach a (possibly new-window) controller to the same live socket:
+  // re-hook input/size and swap the controller. The WebSocket is left exactly
+  // as-is -- no disconnect, no reconnect, no capability re-handshake.
+  rebind(controller: TerminalController): void {
+    if (this.controller && this.controller !== controller) {
+      this.controller.setInputListener(null);
+      this.controller.setSizeListener(null);
+    }
+    this.controller = controller;
+    this.controller.setInputListener(this.inputListener);
+    this.controller.setSizeListener(this.sizeListener);
+  }
+
+  // Explicit termination: only used when the user asks to end the remote
+  // session itself, and only advertised-capability agents receive it.
   terminate(): void {
     if (this.controller) {
       this.controller.setInputListener(null);
@@ -93,7 +149,18 @@ export class FusionAgentDriver {
   }
 
   connect(endpoint: FusionAgentEndpoint): void {
-    this.closeConnection(true, 0);
+    this.closeConnection(false, 0);
+    this.lastEndpoint = endpoint;
+    this.autoReconnect = true;
+    this.reconnectAttempt = 0;
+    this.openSocket(endpoint);
+  }
+
+  private openSocket(endpoint: FusionAgentEndpoint): void {
+    if (this.socket) {
+      this.closeSocket(this.socket);
+      this.socket = null;
+    }
     const endpointHost = endpoint.host.trim();
     const endpointLabel = endpointHost.length === 0 || endpointHost === DEFAULT_FUSION_AGENT_HOST ?
       DEFAULT_FUSION_ENGINE_VM_LABEL : endpointHost;
@@ -141,10 +208,12 @@ export class FusionAgentDriver {
   }
 
   disconnect(): void {
-    this.closeConnection(true, 0);
+    this.closeConnection(false, 0);
   }
 
   private closeConnection(terminateRemote: boolean, closeDelayMs: number): void {
+    this.autoReconnect = false;
+    this.cancelReconnectTimer();
     this.stopTerminateCloseTimer();
     const socketToClose = this.socket;
     if (terminateRemote) {
@@ -193,6 +262,30 @@ export class FusionAgentDriver {
     this.terminateCloseTimer = -1;
   }
 
+  private cancelReconnectTimer(): void {
+    if (this.reconnectTimer < 0) {
+      return;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = -1;
+  }
+
+  private maybeScheduleReconnect(): void {
+    if (!this.autoReconnect || !this.lastEndpoint || this.reconnectTimer >= 0) {
+      return;
+    }
+    this.reconnectAttempt += 1;
+    const delayMs = Math.min(30000, 1000 * Math.pow(2, this.reconnectAttempt - 1));
+    this.emitStatus(false, `连接断开,${Math.round(delayMs / 1000)} 秒后重连(第 ${this.reconnectAttempt} 次)`, '');
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = -1;
+      if (!this.autoReconnect || !this.lastEndpoint) {
+        return;
+      }
+      this.openSocket(this.lastEndpoint);
+    }, delayMs) as number;
+  }
+
   requestCurrentDirectory(): void {
     if (!this.socket || !this.connected) {
       return;
@@ -221,6 +314,7 @@ export class FusionAgentDriver {
       }
       this.connected = true;
       this.ready = true;
+      this.reconnectAttempt = 0;
       this.emitStatus(true, this.currentEndpointLabel, '');
       this.requestCurrentDirectory();
     });
@@ -240,8 +334,11 @@ export class FusionAgentDriver {
       this.connected = false;
       this.ready = false;
       this.pendingUtf8Tail = [];
-      if (wasConnected) {
-        this.emitStatus(false, 'Agent 已断开', '');
+      if (wasConnected || this.reconnectAttempt > 0) {
+        this.maybeScheduleReconnect();
+        if (this.reconnectTimer < 0 && wasConnected) {
+          this.emitStatus(false, 'Agent 已断开', '');
+        }
       }
     });
 
@@ -249,11 +346,15 @@ export class FusionAgentDriver {
       if (this.socket !== ownSocket) {
         return;
       }
+      const wasConnected = this.connected;
       this.connected = false;
       this.ready = false;
       this.pendingUtf8Tail = [];
       const errorText = err && err.message ? err.message : '连接失败';
       this.emitStatus(false, 'Agent 错误', errorText);
+      if (wasConnected || this.reconnectAttempt > 0) {
+        this.maybeScheduleReconnect();
+      }
     });
   }
 
@@ -282,7 +383,7 @@ export class FusionAgentDriver {
         break;
       case 'exit': {
         // The remote shell is gone: tear the socket down so stale input can
-        // no longer be sent, then report the exit label (disconnect() nulls
+        // no longer be sent, then report the exit label (closeConnection nulls
         // the socket first, so the late 'close' event cannot overwrite it).
         const exitLabel = message.message || 'Shell 已退出';
         this.closeConnection(false, 0);
@@ -345,13 +446,10 @@ export class FusionAgentDriver {
 
     if (this.supportsTerminateControl) {
       this.sendSocketPayload(stringifyFusionAgentMessage(createTerminateMessage()));
-      return;
     }
-
-    // Stock wand-agent forwards unknown text frames to the PTY, so the fallback
-    // must stay on the terminal byte path: interrupt the foreground process and
-    // ask the shell to exit before the WebSocket closes.
-    this.sendSocketPayload(this.encodeUtf8('\u0003exit\r'));
+    // Stock wand-agent has no safe termination control. Never fall back to
+    // injecting Ctrl-C/exit bytes into the PTY: that would interrupt tmux or
+    // codex foreground tasks the user intends to keep running.
   }
 
   private hasTerminateCapability(capabilities?: Array<string>): boolean {

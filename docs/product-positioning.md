@@ -1,8 +1,8 @@
-# FusionTerm Product Positioning
+# Emberline Product Positioning
 
 ## One-Line Position
 
-FusionTerm is a HarmonyOS developer terminal for connecting to the Fusion
+Emberline is a HarmonyOS developer terminal for connecting to the Fusion
 Development Engine Linux VM with a Ghostty-grade renderer and a native-feeling
 ArkUI shell.
 
@@ -91,5 +91,6 @@ proves it reliable.
 
 ## Naming
 
-`HMG` is the GitHub repository name. `FusionTerm` is the current app/product
-codename in source, README, and UI resources.
+`Emberline` is both the GitHub repository name and the current app/product name
+in source, README, and UI resources. Earlier project notes may refer to the
+app as `FusionTerm` or to the repository as `HMG`.

@@ -39,9 +39,21 @@ struct TerminalSearchStatus {
     std::string query;
 };
 
+struct TerminalScrollbarState {
+    int total = 0;
+    int offset = 0;
+    int visible = 0;
+};
+
 class Terminal {
 public:
-    Terminal(int cols, int rows);
+    // ghostty_vt only honors max_scrollback at ghostty_terminal_new time (there
+    // is no runtime option in ghostty_terminal_option_t), so this is the single
+    // source of truth for the creation-time default and is kept aligned with the
+    // ETS TerminalConfig value pushed from Index.ets.
+    static constexpr int kDefaultMaxScrollback = 50000;
+
+    Terminal(int cols, int rows, int maxScrollback = kDefaultMaxScrollback);
     ~Terminal();
 
     bool start();
@@ -59,10 +71,16 @@ public:
     // nothing new arrived since the last drain).
     std::string drainPendingTitle();
 
+    // True when at least one BEL rang since the last drain (used for
+    // task-finished system notifications on background tabs).
+    bool drainPendingBell();
+
     // Scrollback
     void scrollView(int delta);
+    void scrollToOffset(int offset);
     void resetViewScroll();
     int getScrollbackSize() const;
+    TerminalScrollbarState getScrollbarState() const;
 
     // Terminal private-mode state used for key encoding and paste handling.
     bool cursorKeysApplicationMode() const;
@@ -106,7 +124,14 @@ public:
     int getCols() const { return m_cols; }
     int getRows() const { return m_rows; }
 
-    void setRenderer(Renderer* renderer) { m_renderer = renderer; }
+    // Swapping/nulling the renderer must be serialized with every reader
+    // (feedOutput/writeInput touch it from the direct-output and IME IPC
+    // threads under m_stateMutex); a bare assignment raced OnSurfaceDestroyed
+    // deleting the renderer mid-noteActivity (UAF).
+    void setRenderer(Renderer* renderer) {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_renderer = renderer;
+    }
     void setMaxScrollback(int lines);
     void setTheme(const TerminalTheme& theme);
     const TerminalTheme& getTheme() const;
@@ -137,6 +162,7 @@ private:
     static bool HandleDeviceAttributes(ghostty_terminal_t terminal, void* userdata, ghostty_device_attributes_t* out_attrs);
     void normalizeSelectionBounds(int& startRow, int& startCol, int& endRow, int& endCol) const;
     ghostty_terminal_scrollbar_t getScrollbarLocked() const;
+    void adjustSelectionForViewportMoveLocked(int64_t movedTowardBottom);
     void scrollViewportLocked(ghostty_terminal_scroll_viewport_tag_t tag, int64_t delta = 0);
     int64_t determineScrollStepTowardsBottomLocked();
     std::vector<std::string> captureScrollbackSnapshotLocked(size_t& viewportTopRow);
@@ -145,6 +171,9 @@ private:
 
     int m_cols;
     int m_rows;
+    // Requested scrollback depth. ghostty_vt consumes this only at construction;
+    // setMaxScrollback records later requests but cannot resize a live VT.
+    int m_maxScrollback = kDefaultMaxScrollback;
 
     std::atomic<bool> m_running;
 
@@ -186,6 +215,7 @@ private:
     std::mutex m_titleMutex;
     std::string m_pendingTitle;
     bool m_titleDirty = false;
+    std::atomic<int> m_pendingBellCount { 0 };
 
     bool m_forceFullFrame = true;
     int m_lastCursorRow = -1;
@@ -194,4 +224,10 @@ private:
     bool m_lastSelectionActive = false;
     bool m_lastSearchActive = false;
     size_t m_lastViewportTopRow = static_cast<size_t>(-1);
+
+    // Persistent per-frame cell snapshot buffer. Reused across frames so an
+    // idle blink tick does not allocate and zero the whole grid every frame
+    // (~cols*rows Cells inside the state lock); only dirty rows are reset and
+    // refilled. Render-thread-only: drawFrame is the sole accessor.
+    std::vector<Cell> m_frameCells;
 };

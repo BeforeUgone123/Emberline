@@ -18,5 +18,9 @@ oh_modules/
 local.properties
 entry/.preview/
 jscrash-*.log
+docs/cppcrash-*.log
+docs/*.csr
+docs/*.p12
+docs/*.p7b
 third_party/libssh2/
 third_party/mbedtls/

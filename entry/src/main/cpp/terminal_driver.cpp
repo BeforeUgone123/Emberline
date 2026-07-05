@@ -3,8 +3,10 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +14,10 @@
 #include <unordered_map>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <libssh2.h>
+#include <libssh2_sftp.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include "pty/pty_handler.h"
 #include "ssh/ssh_session.h"
 
@@ -27,6 +33,25 @@ enum class DriverMode {
     LocalPty,
     RemoteSsh,
 };
+
+// libghostty exports LibghosttyFeedOutputUtf8 so a session can feed PTY/SSH
+// output straight into the renderer surface across the .so boundary, skipping
+// the NAPI + JS string round trip that floods the ArkTS UI thread when a big
+// file is `cat`ed. Mirror of the reverse dlsym bridge libghostty uses for
+// ExampleDriverWriteInputUtf8. Resolved (positively or negatively) exactly
+// once; a missing symbol simply keeps every session on the fallback path.
+using LibghosttyFeedOutputFn = bool (*)(const char*, const uint8_t*, size_t);
+
+LibghosttyFeedOutputFn ResolveLibghosttyFeedOutput()
+{
+    static std::once_flag once;
+    static LibghosttyFeedOutputFn cached = nullptr;
+    std::call_once(once, []() {
+        void* symbol = dlsym(RTLD_DEFAULT, "LibghosttyFeedOutputUtf8");
+        cached = reinterpret_cast<LibghosttyFeedOutputFn>(symbol);
+    });
+    return cached;
+}
 
 class FusionTerminalDriver {
 public:
@@ -78,6 +103,10 @@ public:
                     const std::string& password, int cols, int rows)
     {
         Stop();
+        // Snapshot after Stop(): a later Stop() (tab closed while the
+        // handshake runs on the worker thread) bumps the generation and the
+        // fresh session is dropped instead of outliving the closed tab.
+        const uint64_t generation = m_generation.load();
         if (host.empty() || user.empty()) {
             EmitOutput("SSH target requires a host and user.\r\n");
             return false;
@@ -104,7 +133,14 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_sshSession = std::move(session);
+            if (m_generation.load() == generation) {
+                m_sshSession = std::move(session);
+            }
+        }
+        if (session) {
+            // Stopped while handshaking: tear the fresh session down.
+            session->disconnect();
+            return false;
         }
 
         EmitOutput("SSH connected to " + user + "@" + host + ":" + std::to_string(safePort) + "\r\n");
@@ -113,6 +149,7 @@ public:
 
     void Stop()
     {
+        m_generation.fetch_add(1);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_running = false;
@@ -250,6 +287,17 @@ public:
         }
     }
 
+    // Bind (surfaceId non-empty) or release (empty string) the native
+    // direct-output surface. When bound, EmitOutput ships decoded chunks
+    // straight into libghostty's FeedOutput and skips the threadsafe-function
+    // path. Held under its own mutex so the reader thread never contends with
+    // the output buffer lock.
+    void SetDirectOutputTarget(const std::string& surfaceId)
+    {
+        std::lock_guard<std::mutex> lock(m_directTargetMutex);
+        m_directOutputSurfaceId = surfaceId;
+    }
+
 private:
     void LocalReadLoop()
     {
@@ -346,20 +394,40 @@ private:
             m_pendingUtf8.erase(0, m_pendingUtf8.size() - tail);
         }
 
-        napi_threadsafe_function tsfn = nullptr;
+        // Native direct-connect fast path: when the ETS side has bound this
+        // session to a libghostty surface, ship the decoded chunk straight
+        // across the .so boundary into the renderer's FeedOutput. Falls through
+        // to the threadsafe-function path below when no target is set, the
+        // cross-so symbol is missing, or the surface is not (yet) registered —
+        // so output produced before the direct target is wired up is never
+        // dropped, and the direct and TSFN paths never double-feed one chunk.
+        std::string directTarget;
         {
-            std::lock_guard<std::mutex> lock(m_outputMutex);
-            if (m_outputTsfn == nullptr) {
-                m_outputBuffer += chunk;
+            std::lock_guard<std::mutex> lock(m_directTargetMutex);
+            directTarget = m_directOutputSurfaceId;
+        }
+        if (!directTarget.empty()) {
+            const LibghosttyFeedOutputFn sink = ResolveLibghosttyFeedOutput();
+            if (sink != nullptr &&
+                sink(directTarget.c_str(),
+                     reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size())) {
                 return;
             }
-            tsfn = m_outputTsfn;
         }
 
+        // Call inside the mutex: SetOutputCallback swaps the pointer under
+        // this lock and abort/releases the old TSFN only after the swap, so a
+        // call in flight can never race the release. nonblocking never enters
+        // JS, so holding the lock is safe (audit 2026-07-05, symmetric with
+        // the input TSFN fix in libghostty).
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+        if (m_outputTsfn == nullptr) {
+            m_outputBuffer += chunk;
+            return;
+        }
         auto* output = new std::string(std::move(chunk));
-        const napi_status status = napi_call_threadsafe_function(tsfn, output, napi_tsfn_nonblocking);
+        const napi_status status = napi_call_threadsafe_function(m_outputTsfn, output, napi_tsfn_nonblocking);
         if (status != napi_ok) {
-            std::lock_guard<std::mutex> lock(m_outputMutex);
             m_outputBuffer += *output;
             delete output;
         }
@@ -367,13 +435,16 @@ private:
 
     std::mutex m_mutex;
     std::mutex m_outputMutex;
+    std::mutex m_directTargetMutex;
     std::string m_outputBuffer;
     std::string m_pendingUtf8;
+    std::string m_directOutputSurfaceId;
     napi_threadsafe_function m_outputTsfn = nullptr;
     std::string m_filesDir;
     std::thread m_localReadThread;
     std::unique_ptr<SSHSession> m_sshSession;
     std::atomic<bool> m_running {false};
+    std::atomic<uint64_t> m_generation {0};
     DriverMode m_mode = DriverMode::LocalPty;
     int m_masterFd = -1;
     int m_writeFd = -1;
@@ -520,6 +591,65 @@ napi_value ConnectSsh(napi_env env, napi_callback_info info)
     return result;
 }
 
+// Async variant of ConnectSsh: the blocking TCP connect + libssh2 handshake
+// run on the libuv worker pool so a slow or unreachable host can no longer
+// freeze the ArkTS UI thread. Resolves with the same boolean as ConnectSsh.
+struct SshConnectContext {
+    int32_t sessionId = -1;
+    std::string host;
+    int32_t port = 22;
+    std::string user;
+    std::string password;
+    int32_t cols = DEFAULT_COLS;
+    int32_t rows = DEFAULT_ROWS;
+    bool connected = false;
+    napi_deferred deferred = nullptr;
+    napi_async_work work = nullptr;
+};
+
+void SshConnectExecute(napi_env, void* data)
+{
+    auto* ctx = static_cast<SshConnectContext*>(data);
+    if (auto session = FindSession(ctx->sessionId)) {
+        ctx->connected = session->ConnectSsh(ctx->host, ctx->port, ctx->user,
+                                             ctx->password, ctx->cols, ctx->rows);
+    }
+}
+
+void SshConnectComplete(napi_env env, napi_status, void* data)
+{
+    auto* ctx = static_cast<SshConnectContext*>(data);
+    napi_value result = nullptr;
+    napi_get_boolean(env, ctx->connected, &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+napi_value ConnectSshAsync(napi_env env, napi_callback_info info)
+{
+    size_t argc = 7;
+    napi_value args[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    auto* ctx = new SshConnectContext();
+    ctx->sessionId = argc >= 1 ? ReadIntArg(env, args[0], -1) : -1;
+    ctx->host = argc >= 2 ? ReadStringArg(env, args[1]) : "";
+    ctx->port = argc >= 3 ? ReadIntArg(env, args[2], 22) : 22;
+    ctx->user = argc >= 4 ? ReadStringArg(env, args[3]) : "";
+    ctx->password = argc >= 5 ? ReadStringArg(env, args[4]) : "";
+    ctx->cols = argc >= 6 ? ReadIntArg(env, args[5], DEFAULT_COLS) : DEFAULT_COLS;
+    ctx->rows = argc >= 7 ? ReadIntArg(env, args[6], DEFAULT_ROWS) : DEFAULT_ROWS;
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "fusionSshConnect", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, nullptr, name, SshConnectExecute, SshConnectComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
 napi_value Stop(napi_env env, napi_callback_info info)
 {
     size_t argc = 1;
@@ -588,6 +718,23 @@ napi_value SetOutputCallback(napi_env env, napi_callback_info info)
     return ReturnUndefined(env);
 }
 
+// Bind or release the libghostty surface that PTY/SSH output is fed straight
+// into (native direct-connect). Second arg empty/omitted releases the target
+// so subsequent output falls back to the threadsafe-function path.
+napi_value SetDirectOutputTarget(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc >= 1) {
+        if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
+            const std::string surfaceId = argc >= 2 ? ReadStringArg(env, args[1]) : "";
+            session->SetDirectOutputTarget(surfaceId);
+        }
+    }
+    return ReturnUndefined(env);
+}
+
 napi_value Resize(napi_env env, napi_callback_info info)
 {
     size_t argc = 3;
@@ -603,6 +750,178 @@ napi_value Resize(napi_env env, napi_callback_info info)
     return ReturnUndefined(env);
 }
 
+
+// ---------------------------------------------------------------------------
+// One-shot SFTP upload on a dedicated SSH connection (clipboard image paste).
+// Runs on the libuv worker pool via napi_async_work; resolves with the remote
+// path or rejects with a readable error.
+// ---------------------------------------------------------------------------
+struct SshUploadContext {
+    std::string host;
+    int port = 22;
+    std::string user;
+    std::string password;
+    std::string localPath;
+    std::string remotePath;
+    std::string error;
+    napi_deferred deferred = nullptr;
+    napi_async_work work = nullptr;
+};
+
+void RunSftpUpload(SshUploadContext* ctx)
+{
+    libssh2_init(0);
+
+    addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* resolved = nullptr;
+    const std::string portStr = std::to_string(ctx->port);
+    if (getaddrinfo(ctx->host.c_str(), portStr.c_str(), &hints, &resolved) != 0 || resolved == nullptr) {
+        ctx->error = "无法解析主机 " + ctx->host;
+        return;
+    }
+    int fd = -1;
+    for (addrinfo* it = resolved; it != nullptr; it = it->ai_next) {
+        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(resolved);
+    if (fd < 0) {
+        ctx->error = "无法连接 " + ctx->host + ":" + portStr;
+        return;
+    }
+
+    LIBSSH2_SESSION* session = libssh2_session_init();
+    LIBSSH2_SFTP* sftp = nullptr;
+    LIBSSH2_SFTP_HANDLE* handle = nullptr;
+    FILE* local = nullptr;
+    if (session == nullptr) {
+        ctx->error = "SSH 会话初始化失败";
+        close(fd);
+        return;
+    }
+    libssh2_session_set_blocking(session, 1);
+
+    do {
+        if (libssh2_session_handshake(session, fd) != 0) {
+            ctx->error = "SSH 握手失败";
+            break;
+        }
+        if (libssh2_userauth_password(session, ctx->user.c_str(), ctx->password.c_str()) != 0) {
+            ctx->error = "SSH 认证失败,请检查用户名或密码";
+            break;
+        }
+        sftp = libssh2_sftp_init(session);
+        if (sftp == nullptr) {
+            ctx->error = "SFTP 通道打开失败";
+            break;
+        }
+        handle = libssh2_sftp_open(sftp, ctx->remotePath.c_str(),
+                                   LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                                   LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
+                                   LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
+        if (handle == nullptr) {
+            ctx->error = "无法创建远端文件 " + ctx->remotePath;
+            break;
+        }
+        local = fopen(ctx->localPath.c_str(), "rb");
+        if (local == nullptr) {
+            ctx->error = "无法读取本地文件 " + ctx->localPath;
+            break;
+        }
+        char buffer[32768];
+        size_t bytes = 0;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), local)) > 0) {
+            const char* cursor = buffer;
+            size_t remaining = bytes;
+            while (remaining > 0) {
+                const ssize_t written = libssh2_sftp_write(handle, cursor, remaining);
+                if (written < 0) {
+                    ctx->error = "SFTP 写入失败";
+                    break;
+                }
+                cursor += written;
+                remaining -= static_cast<size_t>(written);
+            }
+            if (!ctx->error.empty()) {
+                break;
+            }
+        }
+    } while (false);
+
+    if (local != nullptr) {
+        fclose(local);
+    }
+    if (handle != nullptr) {
+        libssh2_sftp_close(handle);
+    }
+    if (sftp != nullptr) {
+        libssh2_sftp_shutdown(sftp);
+    }
+    libssh2_session_disconnect(session, "upload done");
+    libssh2_session_free(session);
+    close(fd);
+}
+
+void SshUploadExecute(napi_env, void* data)
+{
+    RunSftpUpload(static_cast<SshUploadContext*>(data));
+}
+
+void SshUploadComplete(napi_env env, napi_status, void* data)
+{
+    auto* ctx = static_cast<SshUploadContext*>(data);
+    if (ctx->error.empty()) {
+        napi_value value;
+        napi_create_string_utf8(env, ctx->remotePath.c_str(), NAPI_AUTO_LENGTH, &value);
+        napi_resolve_deferred(env, ctx->deferred, value);
+    } else {
+        napi_value message;
+        napi_value error;
+        napi_create_string_utf8(env, ctx->error.c_str(), NAPI_AUTO_LENGTH, &message);
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, ctx->deferred, error);
+    }
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+napi_value SshUploadFile(napi_env env, napi_callback_info info)
+{
+    size_t argc = 6;
+    napi_value args[6] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    auto* ctx = new SshUploadContext();
+    ctx->host = argc >= 1 ? ReadStringArg(env, args[0]) : "";
+    if (argc >= 2) {
+        int32_t port = 22;
+        napi_get_value_int32(env, args[1], &port);
+        ctx->port = port > 0 ? port : 22;
+    }
+    ctx->user = argc >= 3 ? ReadStringArg(env, args[2]) : "";
+    ctx->password = argc >= 4 ? ReadStringArg(env, args[3]) : "";
+    ctx->localPath = argc >= 5 ? ReadStringArg(env, args[4]) : "";
+    ctx->remotePath = argc >= 6 ? ReadStringArg(env, args[5]) : "";
+
+    napi_value promise;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name;
+    napi_create_string_utf8(env, "sshUploadFile", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, nullptr, name, SshUploadExecute, SshUploadComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+
 napi_value Init(napi_env env, napi_value exports)
 {
     SetNamedFunction(env, exports, "createSession", CreateSession);
@@ -610,10 +929,13 @@ napi_value Init(napi_env env, napi_value exports)
     SetNamedFunction(env, exports, "initialize", Initialize);
     SetNamedFunction(env, exports, "startLocal", StartLocal);
     SetNamedFunction(env, exports, "connectSsh", ConnectSsh);
+    SetNamedFunction(env, exports, "connectSshAsync", ConnectSshAsync);
+    SetNamedFunction(env, exports, "sshUploadFile", SshUploadFile);
     SetNamedFunction(env, exports, "stop", Stop);
     SetNamedFunction(env, exports, "writeInput", WriteInput);
     SetNamedFunction(env, exports, "drainOutput", DrainOutput);
     SetNamedFunction(env, exports, "setOutputCallback", SetOutputCallback);
+    SetNamedFunction(env, exports, "setDirectOutputTarget", SetDirectOutputTarget);
     SetNamedFunction(env, exports, "resize", Resize);
     return exports;
 }

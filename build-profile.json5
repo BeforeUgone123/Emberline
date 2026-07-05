@@ -26,11 +26,11 @@
       {
         "name": "default",
         "material": {
-          "storePassword": "00000020E0FE5B378CCCDD6417E71BDC0748B731809E20B3FC2A3ABECF22B6AC112D1231E2A9D9915B20604271DFD501",
+          "storePassword": "00000020E8EAF92973620CCB0E04F47FF73EE06E7AD3104FD51BD8A5FEA831B930301DDDE6185414FCA70096765DE754",
           "certpath": "/storage/Users/currentUser/appdata/el2/base/com.huawei.devecostudio/files/ohos/config/default_harmony-advanced-terminalQO-iisL2KWAtlgp6LMw5tQuo0gAm8Ae5-xZ00FEDe3g.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "00000020E0FE5B378CCCDD6417E71BDC0748B731809E20B3FC2A3ABECF22B6AC112D1231E2A9D9915B20604271DFD501",
-          "profile": "/storage/Users/currentUser/appdata/el2/base/com.huawei.devecostudio/files/ohos/config/default_harmony-advanced-terminalQO-iisL2KWAtlgp6LMw5tQuo0gAm8Ae5-xZ00FEDe3g.p7b",
+          "keyPassword": "00000020E8EAF92973620CCB0E04F47FF73EE06E7AD3104FD51BD8A5FEA831B930301DDDE6185414FCA70096765DE754",
+          "profile": "./docs/粘贴板Debug.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "/storage/Users/currentUser/appdata/el2/base/com.huawei.devecostudio/files/ohos/config/default_harmony-advanced-terminalQO-iisL2KWAtlgp6LMw5tQuo0gAm8Ae5-xZ00FEDe3g.p12"
         },

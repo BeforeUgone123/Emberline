@@ -2,7 +2,7 @@
   "string": [
     {
       "name": "app_name",
-      "value": "FusionTerm"
+      "value": "Emberline"
     },
     {
       "name": "module_desc",
@@ -10,11 +10,15 @@
     },
     {
       "name": "EntryAbility_desc",
-      "value": "FusionTerm"
+      "value": "Emberline"
     },
     {
       "name": "EntryAbility_label",
-      "value": "FusionTerm"
+      "value": "Emberline"
+    },
+    {
+      "name": "pasteboard_permission_reason",
+      "value": "用于在 PC/2in1 终端中通过物理键盘直接粘贴系统剪贴板文字"
     }
   ]
 }

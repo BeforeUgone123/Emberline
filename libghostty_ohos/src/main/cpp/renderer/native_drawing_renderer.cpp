@@ -57,8 +57,8 @@ constexpr std::array<const char*, 7> kPrivateFallbackFontRawFiles = {
     "fonts/FusionTerm-Regular.otf",
 };
 
-// A user-imported font registered at runtime always sits at the head of the
-// fallback chain (ghostty font-family semantics).
+// A user-imported font can be selected as the primary face, or used as a
+// later fallback when one of the bundled faces is selected.
 constexpr const char* kCustomTerminalFontFamily = "FusionTerm Custom";
 
 // Paragraph-level fallback chain for terminal cells. Bundled families first
@@ -108,6 +108,19 @@ constexpr std::array<const char*, 15> kTerminalFontFamilies = {
     "monospace",
     "sans-serif",
 };
+
+void PushUniqueFontFamily(std::vector<const char*>& families, const char* family)
+{
+    if (!family || family[0] == '\0') {
+        return;
+    }
+    const auto existing = std::find_if(families.begin(), families.end(), [family](const char* candidate) {
+        return candidate && std::strcmp(candidate, family) == 0;
+    });
+    if (existing == families.end()) {
+        families.push_back(family);
+    }
+}
 
 bool IsSuspiciousCodepoint(uint32_t codepoint)
 {
@@ -443,6 +456,9 @@ void NativeDrawingRenderer::cleanup()
     m_offscreenFormat = -1;
     m_offscreenValid = false;
     m_needFullRepaint = true;
+    resetBufferBlitHistory();
+    m_offscreenRows = 0;
+    m_offscreenRowHeight = 0.0f;
 }
 
 void NativeDrawingRenderer::resize(uint32_t width, uint32_t height)
@@ -493,6 +509,10 @@ bool NativeDrawingRenderer::ensureOffscreen(uint32_t width, uint32_t height)
         m_offscreenHeight = height;
         m_offscreenFormat = m_currentConfig.format;
         m_offscreenValid = false;
+        // Every rotating window buffer is now a different size/format, so their
+        // recorded staleness no longer applies: force whole-surface blits until
+        // each buffer has been fully repainted at least once.
+        resetBufferBlitHistory();
     }
     return true;
 }
@@ -504,6 +524,9 @@ void NativeDrawingRenderer::beginFrame()
     }
 
     m_currentFrameId = ++g_frameCounter;
+    // Reset this frame's offscreen-change accounting; shiftOffscreen may set it
+    // before renderGrid, and renderGrid records the rows it repaints.
+    m_shiftedThisFrame = false;
 
     if (m_currentFenceFd >= 0) {
         close(m_currentFenceFd);
@@ -629,12 +652,24 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
         m_lastCursorHeight = cellHeight;
         m_lastCursorRectValid = true;
     }
-    std::vector<uint8_t> geometryMask(static_cast<size_t>(rows * cols), 0);
+    // Persistent geometry mask: reused across frames and resized only when the
+    // grid geometry changes, so a partial repaint never reallocates/zeroes the
+    // whole rows*cols scratch. Each processed row is cleared just below.
+    const size_t geometryCells = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (m_geometryMask.size() != geometryCells) {
+        m_geometryMask.assign(geometryCells, 0);
+    }
+    uint8_t* geometryMask = m_geometryMask.data();
 
     for (int row = 0; row < rows; ++row) {
         if (!fullRepaint && dirtyRows[static_cast<size_t>(row)] == 0) {
             continue;
         }
+        // Clear only this row's marks before the first pass repopulates them;
+        // stale marks in non-dirty rows are never read (the text pass skips the
+        // same rows).
+        std::fill_n(geometryMask + static_cast<size_t>(row) * static_cast<size_t>(cols),
+                    static_cast<size_t>(cols), static_cast<uint8_t>(0));
         uint32_t rowBg = m_defaultBgColor;
         bool rowBgSeen = false;
         for (int col = 0; col < cols; ++col) {
@@ -781,6 +816,122 @@ void NativeDrawingRenderer::renderGrid(const std::vector<Cell>& cells, int cols,
 
     m_needFullRepaint = false;
     m_offscreenValid = true;
+
+    // Record which offscreen rows changed this frame so endFrame can age the
+    // rotating window buffers. A whole-surface repaint or an offscreen shift
+    // (scroll damage) touches the whole image; otherwise only the dirty rows
+    // renderGrid actually repainted changed.
+    m_offscreenRows = rows;
+    m_offscreenRowHeight = cellHeight;
+    if (fullRepaint || m_shiftedThisFrame) {
+        m_frameOffscreenFull = true;
+    } else {
+        m_frameOffscreenFull = false;
+        if (static_cast<int>(m_frameOffscreenRows.size()) != rows) {
+            m_frameOffscreenRows.assign(static_cast<size_t>(rows), 0);
+        }
+        // !fullRepaint implies dirtyRows.size() == rows (see the guard above).
+        for (int r = 0; r < rows; ++r) {
+            m_frameOffscreenRows[static_cast<size_t>(r)] = dirtyRows[static_cast<size_t>(r)] ? 1 : 0;
+        }
+    }
+}
+
+void NativeDrawingRenderer::resetBufferBlitHistory()
+{
+    m_bufferBlit.clear();
+    m_frameOffscreenFull = true;
+    m_frameOffscreenRows.clear();
+}
+
+uint32_t NativeDrawingRenderer::backgroundFillPixel() const
+{
+    const uint32_t c = m_defaultBgColor;  // 0xAARRGGBB
+    const uint32_t a = (c >> 24) & 0xFFu;
+    const uint32_t r = (c >> 16) & 0xFFu;
+    const uint32_t g = (c >> 8) & 0xFFu;
+    const uint32_t b = c & 0xFFu;
+    return m_currentConfig.format == NATIVEBUFFER_PIXEL_FMT_BGRA_8888
+        ? ((a << 24) | (r << 16) | (g << 8) | b)
+        : ((a << 24) | (b << 16) | (g << 8) | r);
+}
+
+// Half-open pixel span top..bottom covering grid row `row`. Over-covers the
+// boundaries via floor-top / ceil-bottom so a partial blit never leaves a seam,
+// pins row 0 to the top edge and the last row to the offscreen bottom so the
+// sub-row strip below the grid is always included.
+void NativeDrawingRenderer::pixelRowSpan(int row, int rowsTotal, int32_t& top, int32_t& bottom) const
+{
+    const float h = m_offscreenRowHeight > 0.0f ? m_offscreenRowHeight : getCellHeight();
+    int32_t ti = static_cast<int32_t>(std::floor(static_cast<float>(row) * h));
+    int32_t bi = static_cast<int32_t>(std::ceil(static_cast<float>(row + 1) * h));
+    if (row <= 0) {
+        ti = 0;
+    }
+    if (row >= rowsTotal - 1) {
+        bi = static_cast<int32_t>(m_offscreenHeight);
+    }
+    if (ti < 0) {
+        ti = 0;
+    }
+    if (bi > static_cast<int32_t>(m_offscreenHeight)) {
+        bi = static_cast<int32_t>(m_offscreenHeight);
+    }
+    top = ti;
+    bottom = bi;
+}
+
+void NativeDrawingRenderer::shiftOffscreen(int rowDelta)
+{
+    // Only shift when a buffer is actually bound this frame; if beginFrame
+    // failed (no m_currentPixels) renderGrid will bail too, so leaving the
+    // offscreen untouched keeps it consistent with what gets presented.
+    if (rowDelta == 0 || !m_offscreenValid || !m_currentPixels) {
+        return;
+    }
+    const float h = getCellHeight();
+    const int32_t pixelShift =
+        static_cast<int32_t>(std::lround(static_cast<double>(rowDelta) * static_cast<double>(h)));
+    const int32_t height = static_cast<int32_t>(m_offscreenHeight);
+    if (pixelShift == 0 || (pixelShift > 0 ? pixelShift : -pixelShift) >= height) {
+        return;
+    }
+
+    const size_t rowBytes = static_cast<size_t>(m_offscreenWidth) * 4;
+    uint8_t* base = m_offscreenPixels.data();
+    if (pixelShift > 0) {
+        // Content moves up: offscreen row y takes old row y + pixelShift; the
+        // bottom pixelShift rows are the newly exposed band (repainted later).
+        std::memmove(base,
+                     base + static_cast<size_t>(pixelShift) * rowBytes,
+                     static_cast<size_t>(height - pixelShift) * rowBytes);
+    } else {
+        const int32_t a = -pixelShift;
+        // Content moves down: offscreen row y takes old row y - a; the top a
+        // rows are the newly exposed band.
+        std::memmove(base + static_cast<size_t>(a) * rowBytes,
+                     base,
+                     static_cast<size_t>(height - a) * rowBytes);
+    }
+
+    // Keep the sub-row strip below the last grid row at the background color;
+    // the memmove otherwise drags scrolled content into it.
+    if (m_offscreenRows > 0 && m_offscreenRowHeight > 0.0f) {
+        int32_t gridBottom = static_cast<int32_t>(std::lround(
+            static_cast<double>(m_offscreenRows) * static_cast<double>(m_offscreenRowHeight)));
+        if (gridBottom < 0) {
+            gridBottom = 0;
+        }
+        if (gridBottom < height) {
+            const uint32_t fillPx = backgroundFillPixel();
+            for (int32_t y = gridBottom; y < height; ++y) {
+                uint32_t* px = reinterpret_cast<uint32_t*>(base + static_cast<size_t>(y) * rowBytes);
+                std::fill(px, px + m_offscreenWidth, fillPx);
+            }
+        }
+    }
+
+    m_shiftedThisFrame = true;
 }
 
 void NativeDrawingRenderer::endFrame()
@@ -789,32 +940,170 @@ void NativeDrawingRenderer::endFrame()
         return;
     }
 
-    if (m_currentPixels && m_offscreenValid &&
+    m_damageRects.clear();
+    bool fullDamage = true;  // default to whole-surface damage (always safe)
+
+    const bool dimsOk = m_currentPixels && m_offscreenValid &&
         m_offscreenWidth == static_cast<uint32_t>(m_currentConfig.width) &&
-        m_offscreenHeight == static_cast<uint32_t>(m_currentConfig.height)) {
+        m_offscreenHeight == static_cast<uint32_t>(m_currentConfig.height);
+    const uint32_t seqNum = m_currentNativeBuffer ? OH_NativeBuffer_GetSeqNum(m_currentNativeBuffer) : 0;
+    const int shift = static_cast<int>(std::lround(getScrollFraction()));
+
+    if (dimsOk) {
         const uint32_t rowBytes = m_offscreenWidth * 4;
         const uint32_t dstStride = static_cast<uint32_t>(m_currentConfig.stride);
         uint8_t* dst = static_cast<uint8_t*>(m_currentPixels);
         const uint8_t* srcPixels = m_offscreenPixels.data();
-        if (dstStride == rowBytes) {
-            std::memcpy(dst, srcPixels, static_cast<size_t>(rowBytes) * m_offscreenHeight);
-        } else {
-            for (uint32_t y = 0; y < m_offscreenHeight; ++y) {
-                std::memcpy(dst + static_cast<size_t>(y) * dstStride,
-                            srcPixels + static_cast<size_t>(y) * rowBytes,
-                            rowBytes);
+        const int32_t height = static_cast<int32_t>(m_offscreenHeight);
+        const int rows = m_offscreenRows;
+        // If the per-row change map is missing or mis-sized, treat this frame as
+        // a whole-surface change (safe over-report) rather than index into it.
+        const bool frameFull = m_frameOffscreenFull ||
+            static_cast<int>(m_frameOffscreenRows.size()) != rows;
+
+        // A healthy buffer queue rotates a handful of buffers; if their seq
+        // numbers ever churn without an offscreen resize, drop the history to
+        // bound memory (the next presents just fall back to full blits).
+        if (m_bufferBlit.size() > 32) {
+            m_bufferBlit.clear();
+        }
+
+        // Age every known rotating buffer by this frame's offscreen changes so
+        // each records exactly the rows that went stale while it was off screen.
+        for (auto& kv : m_bufferBlit) {
+            if (frameFull) {
+                kv.second.full = true;
+            } else if (!kv.second.full) {
+                if (static_cast<int>(kv.second.staleRows.size()) != rows) {
+                    kv.second.full = true;
+                } else {
+                    for (int r = 0; r < rows; ++r) {
+                        if (m_frameOffscreenRows[static_cast<size_t>(r)]) {
+                            kv.second.staleRows[static_cast<size_t>(r)] = 1;
+                        }
+                    }
+                }
             }
         }
+
+        BufferBlitState& cur = m_bufferBlit[seqNum];
+        if (static_cast<int>(cur.staleRows.size()) != rows) {
+            cur.staleRows.assign(static_cast<size_t>(rows > 0 ? rows : 0), 0);
+            cur.full = true;  // freshly sized / never seen -> unknown content
+        }
+
+        // A change in the presented shift moves every on-screen row relative to
+        // the previous flush, so partial damage would tear: force a full frame.
+        const bool needFull = cur.full || shift != 0 || cur.lastShift != shift ||
+            shift != m_lastPresentedShift || frameFull || rows <= 0;
+
+        if (needFull) {
+            if (shift == 0) {
+                if (dstStride == rowBytes) {
+                    std::memcpy(dst, srcPixels, static_cast<size_t>(rowBytes) * m_offscreenHeight);
+                } else {
+                    for (uint32_t y = 0; y < m_offscreenHeight; ++y) {
+                        std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                                    srcPixels + static_cast<size_t>(y) * rowBytes,
+                                    rowBytes);
+                    }
+                }
+            } else {
+                // Smooth-scroll presentation: dst row y shows offscreen row
+                // y + shift; rows shifted past the offscreen edge become default
+                // background (the gap is at most one cell tall and only visible
+                // while a scroll gesture or fling is in motion).
+                const uint32_t fillPx = backgroundFillPixel();
+                for (int32_t y = 0; y < height; ++y) {
+                    uint8_t* dstRow = dst + static_cast<size_t>(y) * dstStride;
+                    const int32_t srcY = y + shift;
+                    if (srcY >= 0 && srcY < height) {
+                        std::memcpy(dstRow, srcPixels + static_cast<size_t>(srcY) * rowBytes, rowBytes);
+                    } else {
+                        uint32_t* px = reinterpret_cast<uint32_t*>(dstRow);
+                        std::fill(px, px + m_offscreenWidth, fillPx);
+                    }
+                }
+            }
+            fullDamage = true;
+            if (!cur.staleRows.empty()) {
+                std::fill(cur.staleRows.begin(), cur.staleRows.end(), 0);
+            }
+            // A shifted blit is not a clean 1:1 copy of the offscreen, so the
+            // buffer must be fully rewritten when it is reused.
+            cur.full = (shift != 0);
+            cur.lastShift = shift;
+        } else {
+            // Partial present (shift == 0): copy only the rows that went stale
+            // in *this* buffer, and report them as the damage region.
+            fullDamage = false;
+            int r = 0;
+            while (r < rows) {
+                if (!cur.staleRows[static_cast<size_t>(r)]) {
+                    ++r;
+                    continue;
+                }
+                int r1 = r;
+                while (r1 + 1 < rows && cur.staleRows[static_cast<size_t>(r1 + 1)]) {
+                    ++r1;
+                }
+                int32_t ytop = 0;
+                int32_t dummy = 0;
+                int32_t ybot = 0;
+                pixelRowSpan(r, rows, ytop, dummy);
+                pixelRowSpan(r1, rows, dummy, ybot);
+                if (ytop < 0) {
+                    ytop = 0;
+                }
+                if (ybot > height) {
+                    ybot = height;
+                }
+                for (int32_t y = ytop; y < ybot; ++y) {
+                    std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                                srcPixels + static_cast<size_t>(y) * rowBytes,
+                                rowBytes);
+                }
+                if (ybot > ytop) {
+                    Region::Rect rect;
+                    rect.x = 0;
+                    rect.y = ytop;
+                    rect.w = m_offscreenWidth;
+                    rect.h = static_cast<uint32_t>(ybot - ytop);
+                    m_damageRects.push_back(rect);
+                }
+                r = r1 + 1;
+            }
+            std::fill(cur.staleRows.begin(), cur.staleRows.end(), 0);
+            cur.full = false;
+            cur.lastShift = 0;
+            // No rows actually differed for this buffer: fall back to a
+            // whole-surface damage flush (0 rects == full) since the API cannot
+            // express an empty region.
+            if (m_damageRects.empty()) {
+                fullDamage = true;
+            }
+        }
+    } else {
+        // Could not reconcile this buffer with the offscreen this frame; present
+        // whatever it holds and mark it stale so it gets a full blit later.
+        if (seqNum != 0) {
+            m_bufferBlit[seqNum].full = true;
+        }
+        fullDamage = true;
     }
 
     Region dirtyRegion {};
-    dirtyRegion.rects = nullptr;
-    dirtyRegion.rectNumber = 0;
+    if (fullDamage || m_damageRects.empty()) {
+        dirtyRegion.rects = nullptr;
+        dirtyRegion.rectNumber = 0;
+    } else {
+        dirtyRegion.rects = m_damageRects.data();
+        dirtyRegion.rectNumber = static_cast<int32_t>(m_damageRects.size());
+    }
     if (m_currentNativeBuffer) {
         OH_NativeBuffer_Unmap(m_currentNativeBuffer);
         m_currentPixels = nullptr;
     }
-    const uint32_t seqNum = m_currentNativeBuffer ? OH_NativeBuffer_GetSeqNum(m_currentNativeBuffer) : 0;
     const int32_t flushRet =
         OH_NativeWindow_NativeWindowFlushBuffer(m_window, m_currentBuffer, m_currentFenceFd, dirtyRegion);
     if (flushRet != 0) {
@@ -824,6 +1113,10 @@ void NativeDrawingRenderer::endFrame()
         if (m_currentFenceFd >= 0) {
             close(m_currentFenceFd);
         }
+    } else {
+        // Successfully presented: remember the shift now on screen so the next
+        // frame can detect a shift transition and damage the whole surface.
+        m_lastPresentedShift = shift;
     }
 
     m_currentFenceFd = -1;
@@ -854,6 +1147,24 @@ bool NativeDrawingRenderer::registerCustomFont(const std::string& fontPath)
     return true;
 }
 
+void NativeDrawingRenderer::setFontFamily(const std::string& family)
+{
+    const std::string nextFamily = family.empty() ? "FusionTerm Maple Mono" : family;
+    if (m_preferredFontFamily == nextFamily) {
+        return;
+    }
+
+    m_preferredFontFamily = nextFamily;
+    destroyGlyphCache();
+    updateCellDimensions();
+    m_needFullRepaint = true;
+}
+
+void NativeDrawingRenderer::onFontMetricsChanged()
+{
+    destroyGlyphCache();
+}
+
 void NativeDrawingRenderer::updateCellDimensions()
 {
     Renderer::updateCellDimensions();
@@ -870,7 +1181,13 @@ void NativeDrawingRenderer::updateCellDimensions()
     probeCell.attrs.fg = m_defaultFgColor;
     GlyphLayout* layout = getGlyphLayout("M", probeCell.attrs, 1);
     if (layout && layout->width > 0.0f && layout->height > 0.0f) {
-        m_cellWidth = std::ceil(std::max(layout->width, 1.0f));
+        // Keep the measured advance EXACT (no ceil): text runs are painted as
+        // one shaped paragraph whose glyphs step by the font's fractional
+        // advance, while the grid (run origins, cursor, selection) steps by
+        // m_cellWidth. Rounding up made every column drift ~1px apart, so
+        // long lines showed growing gaps between runs and the cursor floated
+        // away from the text -- worse at larger font sizes.
+        m_cellWidth = std::max(layout->width, 1.0f);
         m_cellHeight = std::ceil(std::max(layout->height * 1.05f, 1.0f));
     }
 }
@@ -997,14 +1314,15 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
     OH_Drawing_TextStyleAddFontFeature(textStyle, "calt", 0);
     std::vector<const char*> families;
     families.reserve(kBundledFamilyFallbackOrder.size() + kTerminalFontFamilies.size() + 3);
+    PushUniqueFontFamily(families, m_preferredFontFamily.c_str());
     for (const char* family : kBundledFamilyFallbackOrder) {
-        families.push_back(family);
+        PushUniqueFontFamily(families, family);
     }
-    families.push_back(kDefaultTerminalFontFamily);
-    families.push_back(m_primaryFontFamily.c_str());
-    families.push_back(m_symbolFontFamily.c_str());
+    PushUniqueFontFamily(families, kDefaultTerminalFontFamily);
+    PushUniqueFontFamily(families, m_primaryFontFamily.c_str());
+    PushUniqueFontFamily(families, m_symbolFontFamily.c_str());
     for (const char* family : kTerminalFontFamilies) {
-        families.push_back(family);
+        PushUniqueFontFamily(families, family);
     }
     OH_Drawing_SetTextStyleFontFamilies(textStyle,
                                         static_cast<int>(families.size()),
@@ -1060,8 +1378,13 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
     layout.width = static_cast<float>(std::max(0.0, OH_Drawing_TypographyGetLongestLine(typography)));
     layout.height = static_cast<float>(std::max(0.0, OH_Drawing_TypographyGetHeight(typography)));
 
-    auto [inserted, _] = m_glyphCache.emplace(key, layout);
+    // Trim BEFORE inserting: trimming after handed back a dangling pointer
+    // whenever the every-other-entry eviction happened to delete the entry
+    // just emplaced (~50% odds once the cache hits its cap), and the caller
+    // immediately painted the destroyed Typography — the recurring CFI abort
+    // in renderGrid after ~30 minutes of colorful TUI output.
     trimGlyphCache();
+    auto [inserted, _] = m_glyphCache.emplace(key, layout);
     return &inserted->second;
 }
 

@@ -2,8 +2,8 @@
 
 ## Product North Star
 
-FusionTerm lives in the GitHub repository `HMG`, but the app codename in this
-workspace remains `FusionTerm`.
+Emberline is the application and GitHub repository name. It was previously
+called `FusionTerm`, and the earliest GitHub repository name was `HMG`.
 
 Build a HarmonyOS developer terminal whose first useful job is connecting to the
 Fusion Development Engine Linux VM through a `ystyle/wand-agent`-compatible
@@ -99,14 +99,34 @@ Important decision cues from that thread:
   PTY", then refined the real target to the Fusion Development Engine Linux VM.
 - The user asked to create the Harmony advanced terminal project under
   `/mnt/linux_share/preview`.
-- The user later named the GitHub repository `HMG`.
+- The user later named the GitHub repository `HMG`, then aligned the repository
+  name with the app name `Emberline`.
 - The user approved using a hardened `ystyle/wand-agent`-style WebSocket PTY
   agent as the preferred VM transport, with SSH retained as fallback.
 
 Related earlier exploration threads discussed broader HarmonyOS ecosystem gaps
-and other product ideas, but they are not the current HMG product source:
+and other product ideas, but they are not the current Emberline product source:
 
 - `019e8d39-437f-7260-9b63-895bad7f4138`: HarmonyOS ecosystem and note/AI app
   exploration.
 - `019ea70e-87d9-76f1-831e-414bae920875`: HarmonyOS project brainstorming,
   including education and lifestyle app branches.
+
+## 动效不做清单
+
+守住 ghostty 式「没有设计的设计」。以下判决与「做什么」同等,挡住未来所有「加个动画更炫」的提案。**PR 门禁:每个动效必须回答「它传达什么状态」(连接/断开/连接中/失败/完成/选中/切换),答不出即删。**
+
+- **终端内容区切标签 → 0ms 硬切**。桌面终端(iterm/tmux)切标签必须瞬时;双 XComponent 叠化既贵又违直觉。反馈全放 chrome(tab active 底色/边框淡入)。
+- **终端调色板 / 主题颜色 tween → 硬换**。libghostty 不支持调色板插值;ArkUI 侧截图叠化又重又假。主题切换只让选中灯丝淡亮,不加全局暗幕(可选项本轮不做)。
+- **字号 / reflow 的终端网格重排 → 瞬切**。栅格重排动画=糊字+掉帧;只反馈控件读数(读数 Text 一次纵向 tick + ember 闪)。
+- **含 CJK 文字组件的 `transform scale`(标题/读数/按钮文案)→ 禁,一律 opacity + translateY**。scale 会栅格化糊字(项目铁律)。
+- **smooth caret / cursor trail / 打字期光标追随 → 不做,默认 instant**。每秒几十字符逐字追随必糊字掉帧(kitty trail 默认 0、VSCode cursorSmoothCaret 确诊追不上)。仅留「鼠标大跳」临界阻尼作**默认关闭**的配置项。
+- **终端自绘 fling 之上再叠 ArkUI 持续动画 → 不做**。别在终端渲染层上再压合成动画抢帧。
+- **呼吸 / 通知涌动之外的任何常驻循环动画 → 不做**。签名循环只留「呼吸」一处;任何持续动画必须状态门控,离态即收尾覆盖(withRepeat/animateTo 循环用完必停,否则整屏重绘)。
+- **ArkUI 侧复制光标闪烁 → 不做**。交渲染器 `cursorBlink` 状态机,别与终端渲染抢帧。
+- **按钮悬浮放大 / 涟漪扩散 / 页面级转场特效 → 不做**。严肃桌面气质,用默认按压态(唯一强调色主按钮 pressed opacity 0.82)。
+- **粒子动画 `Particle` → 全局禁用**。与近黑+唯一强调色气质冲突,且 CPU 大户踩终端渲染红线。
+- **geometryTransition 共享元素(标签↔分屏一镜到底)→ 延后,非默认**。仅「标签拖出成独立窗」等空间连续明确场景才评审采用,时长 ≤300ms 走 CURVE_DECEL。
+- **逐帧 relayout 属性补间:`width/height/margin/padding/fontSize/borderWidth/constraintSize/flex` → 禁补间**。每帧触发 measure/layout,与终端 XComponent 抢主线程。合成层安全属性只有 `opacity / translate / rotate / 颜色`(含文字禁 scale)。必须动 width 的非终端面板配 `renderFit` 且压低 expected 帧率。
+- **`setInterval` / 自建 `rAF` 常驻循环驱动动画 → 禁**。占 UI/JS 线程抢终端渲染;能用声明式 `.animation` / `keyframeAnimateTo`(合成线程)表达就别碰 `animator`,只有「进度→自绘参数」才上 `animator`。
+- **强调色(余烬铜)动效只出现在灯丝与主按钮**,不外扩。

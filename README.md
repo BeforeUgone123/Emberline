@@ -1,129 +1,178 @@
-# FusionTerm
+# Emberline
 
-FusionTerm is a HarmonyOS Stage app scaffold for an advanced terminal emulator.
-It embeds `libghostty-ohos` for rendering and owns the session layer for local
-PTY, SSH fallback, and Fusion Development Engine Linux VM agent sessions.
+**鸿蒙上的完整伪终端。**
 
-This repository is published as `HMG`; the current app/product codename remains
-`FusionTerm` in source files and UI labels.
+Emberline(原名 FusionTerm)是一款 HarmonyOS 原生终端模拟器,内核移植自
+[Ghostty](https://ghostty.org) 的终端引擎(libghostty-vt)。它不是 WebView
+套壳,也不是简化的命令行玩具——从 PTY 到转义序列解析再到逐格渲染,走的都是
+桌面级终端的完整链路。为 HarmonyOS 2in1 设备(键盘 + 触控板 + 触屏三形态)
+设计,像桌面终端一样严肃,像移动应用一样顺手。
 
-## Product Positioning
+界面只有一种颜色会发光:标签底缘那根**余烬铜灯丝**——亮着,你的会话就活着。
 
-FusionTerm is positioned as a developer terminal for HarmonyOS NEXT / 2-in-1
-devices, focused first on making the Fusion Development Engine Linux VM feel
-like a native terminal workspace. It is not a direct Ghostty GUI port. The
-product reuses the HarmonyOS `libghostty-ohos` renderer and keeps app-specific
-session orchestration in this project.
+> 本项目不是对上游的简单打包:渲染 HAR fork([libghostty-ohos](#1-libghostty_ohos--fork-beforeugone520libghostty-ohos基于-wiedymilibghostty-ohos))
+> 经过深度重写——滚动性能三件套(scroll-damage / buffer-age / 像素级平滑滚
+> 动)、完整的触控板 + 触屏 + 鼠标输入体系、系统 IME 接入以及多起内存安全
+> 加固都在 fork 中完成;VM 侧 [wand-agent fork](#2-vm-agent--fork-beforeugone520wand-agent基于-ystylewand-agent-v023)
+> 则补齐了鉴权、会话治理与进程生命周期语义。细目见「Fork 说明」一节。
 
-Primary goal: open the app and quickly connect to the Fusion Development Engine
-Linux VM through a `ystyle/wand-agent`-compatible WebSocket PTY with
-truecolor-friendly terminal settings. The app default targets the VM bridge
-address used by the openEuler container instead of a LAN/DNS host name.
+## 功能
 
-Secondary goal: keep SSH remote PTY and local PTY paths for environments where
-Fusion Agent is unavailable or local shell execution is allowed, without making
-those paths the first product promise.
+**终端仿真**
 
-Non-goals for this milestone: general SSH client breadth, SFTP, key-agent
-management, AI note workflows, full desktop Ghostty feature parity, and
-rewriting terminal rendering from scratch.
+- 真 PTY 本地会话(POSIX 语义:进程组 / 信号 / SIGWINCH)。
+- 完整 VT/xterm 兼容:256 色与真彩、DECCKM、bracketed paste、OSC 窗口标题、
+  Shift+Tab 反向补全,vim / htop / tmux 开箱即用。
+- 鼠标协议:tmux/vim 开鼠标模式后,触屏轻点是点击、长按拖动可直接拖 tmux
+  分栏、滑动是滚轮;鼠标与触控板各行其道。
+- OSC 52 远程复制(远端 tmux/vim 直写系统剪贴板)、OSC 9 与 BEL 桥接为
+  HarmonyOS 系统通知(后台标签任务完成会喊你,标签灯丝同步"复燃"提醒)。
 
-## What Is In This Project
+**渲染与手感**
 
-- `entry/src/main/ets/pages/Index.ets`: first-screen terminal workspace.
-- `entry/src/main/ets/drivers/FusionTerminalDriver.ets`: ArkTS session bridge.
-- `entry/src/main/cpp/terminal_driver.cpp`: native N-API driver for PTY and SSH.
-- `entry/src/main/cpp/pty`: local PTY helper copied from the current
-  `libghostty-ohos` experiment.
-- `entry/src/main/cpp/ssh`: libssh2 remote PTY helper.
-- `docs/fusion-agent-protocol.md`: wand-agent-compatible WebSocket PTY
-  contract.
-- `docs/superpowers/specs`: the approved product design.
-- `docs/superpowers/plans`: the implementation plan used for this scaffold.
-- `docs/product-positioning.md`: product goals, audience, and non-goals.
-- `docs/handoff.md`: current state, source thread, and next handoff steps.
-- `AGENTS.md`: project-specific instructions for future agent sessions.
+- C++ 原生渲染:脏行级重绘 + 持久离屏 + 滚动位移复用(scroll-damage)+
+  按脏行上屏(buffer-age),2.5K 屏长输出不掉帧。
+- 像素级平滑滚动:触屏 / 触控板逐像素跟手,松手惯性,选择拖到屏幕边缘
+  自动滚动续选,跨屏长复制完整无缺。
+- 字宽实测排版(非估算系数),任意字号下字距、光标、选区严格对齐;
+  中文等宽(默认 Maple Mono NF CN)无缺字。
+- 打字或有输出时光标保持实心,空闲才闪烁。
 
-## Local Dependency
+**连接**
 
-The app vendors the renderer HAR module inside this project:
+- 三类会话统一多标签:本地 shell、SSH(libssh2)、WebSocket Agent
+  (兼容 `wand-agent` 协议,面向 Fusion Development Engine Linux VM)。
+- 断线指数退避自动重连,断开后敲任意键立即重试;taskKeeping 后台保活,
+  切走 app 会话不断线。
+- 标签:动态宽度、拖动重排、双击改名、自定义灯丝颜色;关闭标签不打断
+  远端 tmux 里正在跑的任务。
 
-```json5
-"libghostty-ohos": "file:../libghostty_ohos"
-```
+**输入与剪贴板**
 
-This keeps DevEco sync self-contained when the project is copied to
-`/storage/Users/currentUser/Desktop/preview/harmony-advanced-terminal`.
+- 外接键盘:Ctrl+Shift+C / Ctrl+V 复制粘贴,Ctrl+C 永远是中断信号;
+  纯触屏有辅助键条(Esc / Tab / ^C / 复制 / 粘贴 / 方向键)。
+- 截图直达终端:任意处截图后 Ctrl+V,按会话视角粘出可用路径——本地给
+  本地路径、VM 会话走共享目录零上传、SSH 经 SFTP 送达远端,支持逐标签
+  覆盖粘贴视角。
+- 中文 IME 完整支持(native 自定义编辑框)。
 
-## Fusion Agent Transport
+**自定义**
 
-The preferred VM path is a small `wand-agent`-style process running inside the
-Fusion VM. It creates the Linux PTY and exchanges terminal bytes with the
-HarmonyOS app over WebSocket. The compatibility contract is in
-`docs/fusion-agent-protocol.md`.
+- 458 套 Ghostty 主题(真色板预览)、五款内置等宽字体 + ttf/otf 自由导入、
+  背景图与亚克力模糊、光标三态、回看搜索。
+- 每个设置项下方标注对应的 Ghostty 配置键,熟悉桌面 Ghostty 零学习成本。
 
-Development default:
+## 项目结构
 
 ```text
-ws://172.16.100.2:8765/ws?token=harmonyterm&cols=80&rows=24
+.
+├── AppScope/                # HarmonyOS 应用级配置
+├── entry/                   # 应用模块
+│   ├── src/main/ets/pages/Index.ets   # 主界面:标签栏 / 终端层 / 设置抽屉
+│   ├── src/main/ets/drivers/          # WebSocket Agent 与 native driver 桥接
+│   ├── src/main/ets/model/            # 会话句柄与跨窗口会话仓库
+│   └── src/main/cpp/                  # N-API:本地 PTY、libssh2 SSH、SFTP
+├── libghostty_ohos/         # 终端渲染 HAR(fork,见下文 Fork 说明)
+│   ├── src/main/cpp/        # 渲染器 / 输入 / IME / 终端核心包装
+│   └── prebuilt/            # libghostty-vt 预编译静态库
+├── third_party/             # 按需拉取的 native 依赖(libssh2 / mbedTLS)
+├── docs/                    # 协议、产品与维护文档
+└── tools/                   # 依赖拉取与结构断言检查脚本
 ```
 
-This matches the default openEuler VM address and token from
-`https://github.com/ystyle/wand-agent`. If the engine exposes a different VM
-gateway address on a device build, enter that address in the VM panel and update
-`DEFAULT_FUSION_AGENT_HOST`.
+## 使用方法
 
-SSH remains a fallback path until Fusion Agent is available in the VM image.
+### 环境要求
 
-## Third-Party Native Dependencies
+- DevEco Studio(含 HarmonyOS SDK、native 工具链 CMake/Ninja)、`ohpm`。
+- 真机安装需要签名配置(DevEco 自动签名即可;`READ_PASTEBOARD` 特权直贴
+  需要 AGC 手工 ACL profile,可选)。
+- Agent 会话需要 VM/远端 Linux 运行 `wand-agent`(见下文 fork 说明)。
 
-The SSH fallback driver expects libssh2 and mbedTLS sources under
-`third_party/`. Fetch them with:
+### 构建
 
 ```sh
-bash tools/fetch-third-party.sh
+git clone <repo-url> emberline && cd emberline
+
+# 可选:构建 SSH/SFTP 支持需要 native 依赖(仅首次)
+bash tools/fetch-third-party.sh   # 拉取 libssh2-1.11.1 与 mbedtls-3.6.6
+
+ohpm install --all                # 安装 HarmonyOS 依赖(含本地 HAR 引用)
 ```
 
-They are intentionally not vendored by default.
-
-## Build In DevEco Studio
-
-This machine intentionally does not have the local Harmony runtime tools
-installed right now. On a DevEco/Harmony SDK machine:
+然后用 DevEco Studio 打开工程直接构建运行,或命令行:
 
 ```sh
-ohpm install --all
 hvigorw assembleHap --mode module -p product=default -p module=entry@default --no-daemon
 ```
 
-Add signing material in root `build-profile.json5` before packaging for a
-device.
+改动 `libghostty_ohos/` 下的 C++ 后需要完整重编(HAR 会随 entry 一起构建)。
 
-## DevEco Sync Notes
+### 连接 Agent(可选)
 
-The root `build-profile.json5` uses Huawei HarmonyOS SDK version strings:
+在 Linux VM/远端主机部署 `wand-agent` 后,在应用内设置抽屉「连接」页填入
+WebSocket 地址与 token(默认示例 `ws://172.16.100.2:8765/ws`)。SSH 与本地
+shell 无需任何服务端组件。
 
-```json5
-"compatibleSdkVersion": "5.0.0(12)",
-"targetSdkVersion": "5.0.0(12)",
-"runtimeOS": "HarmonyOS"
+### 代码质量门
+
+`tools/check-*.mjs` 是一组结构断言脚本(node 22.7+),钉住关键代码结构与
+历史修复,任何结构性改动前建议全量跑一遍:
+
+```sh
+for f in tools/check-*.mjs; do node "$f" || echo "FAIL: $f"; done
 ```
 
-`compileSdkVersion` is intentionally omitted so DevEco can use the installed
-SDK. If sync reports an invalid SDK value again, install the matching HarmonyOS
-SDK in DevEco or change `compatibleSdkVersion` and `targetSdkVersion` to values
-shown in DevEco's SDK Manager.
+## Fork 说明
 
-## Security Notes
+本项目基于两个上游仓库的 fork,修改如下:
 
-This first native SSH fallback path supports password authentication and does
-not yet perform host-key pinning. Treat it as a working prototype; add known-host
-verification before using it as a general SSH client. Fusion Agent must also be
-hardened before it is exposed outside the trusted VM bridge network.
+### 1. `libghostty_ohos/` — fork [beforeugone520/libghostty-ohos](https://github.com/beforeugone520/libghostty-ohos)(基于 [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos))
 
-## Agent Handoff
+上游提供了 libghostty-vt 在 HarmonyOS 上的基础渲染 HAR;fork 仓库承载本项目
+的全部渲染层改动,并以内置形式随本仓库的 `libghostty_ohos/` 演进。相对上游
+的大规模重写与扩展主要包括:
 
-Future agents should start with `AGENTS.md`, then read
-`docs/product-positioning.md` and `docs/handoff.md` before changing code. The
-original product discussion thread is recorded in `docs/handoff.md` so the next
-agent can recover the decision context without guessing from code alone.
+- **渲染器**:脏行级重绘 + 持久离屏缓冲;视口滚动改 scroll-damage(离屏
+  memmove 位移复用,只重绘新露出的行);endFrame 按轮转缓冲的脏行差量上屏
+  并向合成器上报真实 dirtyRegion;像素级平滑滚动(blit 亚行偏移 + 输入线
+  程像素池);字形缓存与生命周期加固(修复多起 UAF 崩溃);字宽由排版引擎
+  实测(消除整数取整的累计漂移);光标活动门控。
+- **输入**:触控板双指滚动(ToolType 正向路由 / 惯性 / 120Hz 节拍);触屏
+  fling、长按选择、选择拖拽边缘自动滚动;鼠标拖选 / 双击选词 / 三击选行;
+  tmux/vim 鼠标协议桥(触屏合成鼠标);物理键盘快捷键与 DECCKM 应用光标键。
+- **IME**:基于 InputMethod C API 的自定义编辑框接入,含焦点管理、
+  生命周期加固(proxy 退休列表)与跨进程调用节流。
+- **终端核心包装**:选区视口位移补偿与绝对坐标跨屏文本提取;OSC 52 剪贴板
+  捕获;OSC 9 / BEL 通知事件;回看搜索;滚动条状态;标题与通知事件 drain。
+- **ETS 层**:TerminalController / TerminalSurface 重做(输出直连跨 so
+  投递、后台标签轮询门控、滚动条 overlay、安全粘贴、搜索 UI)。
+
+### 2. VM Agent — fork [beforeugone520/wand-agent](https://github.com/beforeugone520/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
+
+推荐使用加固 fork,相对上游的修改:WebSocket frame routing、Bearer 鉴权、
+Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为。应用同时保持
+对 stock 协议的兼容。
+
+## 开源协议
+
+本项目以 **MIT 协议**发布,见根目录 [LICENSE](./LICENSE)。
+
+第三方组件保留各自协议:
+
+| 组件 | 来源 | 引入方式 | 协议 |
+| --- | --- | --- | --- |
+| libghostty-ohos | fork `beforeugone520/libghostty-ohos`(上游 `wiedymi/libghostty-ohos`) | 内置于 `libghostty_ohos/` | MIT(`libghostty_ohos/LICENSE`) |
+| libghostty-vt | `ghostty-org/ghostty` | 预编译静态库 `libghostty_ohos/prebuilt/` | MIT |
+| wand-agent | `ystyle/wand-agent` 及其 fork | VM 侧独立部署,不随应用分发 | MIT |
+| libssh2 | `libssh2/libssh2` `libssh2-1.11.1` | 脚本拉取到 `third_party/` | BSD-3-Clause |
+| mbedTLS | `Mbed-TLS/mbedtls` `mbedtls-3.6.6` | 脚本拉取到 `third_party/` | Apache-2.0 |
+| Maple Mono 等内置字体 | 各自上游 | 打包于 HAR rawfile | 各自开源字体协议(OFL 等) |
+
+## 致谢
+
+- [Ghostty](https://ghostty.org) — 世界级的终端仿真内核与 458 套主题。
+- [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos) —
+  HarmonyOS 移植的起点。
+- [ystyle/wand-agent](https://github.com/ystyle/wand-agent) — 轻量 WebSocket
+  PTY agent。

@@ -14,6 +14,25 @@
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET"
+      },
+      {
+        "name": "ohos.permission.FILE_ACCESS_PERSIST"
+      },
+      {
+        "name": "ohos.permission.VIBRATE"
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
+      },
+      {
+        "name": "ohos.permission.READ_PASTEBOARD",
+        "reason": "$string:pasteboard_permission_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
       }
     ],
     "abilities": [
@@ -27,6 +46,9 @@
         "startWindowBackground": "$color:start_window_background",
         "launchType": "multiton",
         "orientation": "follow_desktop",
+        "backgroundModes": [
+          "taskKeeping"
+        ],
         "supportWindowMode": [
           "fullscreen",
           "split",

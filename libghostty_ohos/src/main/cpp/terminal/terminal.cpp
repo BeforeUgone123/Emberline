@@ -3,11 +3,13 @@
 #include "../include/ghostty_vt.h"
 #include "color_palette.h"
 #include <hilog/log.h>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstring>
 #include <inttypes.h>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 #include <vector>
@@ -419,13 +421,17 @@ bool ToGhosttyMouseButton(TerminalMouseButton button, GhosttyMouseButton& outBut
 }
 }
 
-Terminal::Terminal(int cols, int rows)
-    : m_cols(cols), m_rows(rows), m_running(false), m_vt(nullptr),
+Terminal::Terminal(int cols, int rows, int maxScrollback)
+    : m_cols(cols), m_rows(rows),
+      m_maxScrollback(maxScrollback > 0 ? maxScrollback : kDefaultMaxScrollback),
+      m_running(false), m_vt(nullptr),
       m_renderState(nullptr), m_rowIterator(nullptr), m_rowCells(nullptr), m_renderer(nullptr) {
     ghostty_terminal_options_t opts {};
     opts.cols = static_cast<uint16_t>(cols);
     opts.rows = static_cast<uint16_t>(rows);
-    opts.max_scrollback = 10000;
+    // ghostty_vt only accepts scrollback depth here at creation; keep it driven
+    // by the ETS-provided config value instead of a hardcoded constant.
+    opts.max_scrollback = static_cast<size_t>(m_maxScrollback);
     if (ghostty_terminal_new(nullptr, &m_vt, opts) != GHOSTTY_SUCCESS) {
         m_vt = nullptr;
         OH_LOG_ERROR(LOG_APP, "ghostty_terminal_new failed");
@@ -497,11 +503,15 @@ void Terminal::resize(int cols, int rows) {
     }
     if (cols == m_cols && rows == m_rows) return;
 
-    m_cols = cols;
-    m_rows = rows;
-
     {
+        // m_cols/m_rows MUST change inside the same critical section as the
+        // VT resize: drawFrame sizes m_frameCells from them once per frame
+        // but re-reads m_cols per row for addressing. A bare write here let a
+        // concurrent frame index a buffer sized for the old grid with the new
+        // column count -> heap overflow (crash-family audit, 2026-07-05).
         std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_cols = cols;
+        m_rows = rows;
         ghostty_terminal_resize(
             m_vt,
             static_cast<uint16_t>(cols),
@@ -518,6 +528,10 @@ void Terminal::feedOutput(const char* data, size_t len) {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (m_vt && data && len > 0) {
         ghostty_terminal_vt_write(m_vt, reinterpret_cast<const uint8_t*>(data), len);
+    }
+    // Program output counts as activity: keep the cursor solid while printing.
+    if (m_renderer && data && len > 0) {
+        m_renderer->noteActivity();
     }
     notifyRenderNeeded();
 }
@@ -591,7 +605,11 @@ void Terminal::HandleWritePty(ghostty_terminal_t, void* userdata, const uint8_t*
 
 void Terminal::HandleBell(ghostty_terminal_t, void* userdata)
 {
-    (void)userdata;
+    // Fires inside ghostty_terminal_vt_write while feedOutput holds
+    // m_stateMutex; the atomic counter keeps this callback lock-free.
+    if (userdata) {
+        static_cast<Terminal*>(userdata)->m_pendingBellCount.fetch_add(1, std::memory_order_relaxed);
+    }
     OH_LOG_INFO(LOG_APP, "Terminal bell");
 }
 
@@ -625,6 +643,11 @@ void Terminal::HandleTitleChanged(ghostty_terminal_t terminal, void* userdata)
         self->m_titleDirty = true;
     }
     self->notifyRenderNeeded();
+}
+
+bool Terminal::drainPendingBell()
+{
+    return m_pendingBellCount.exchange(0, std::memory_order_relaxed) > 0;
 }
 
 std::string Terminal::drainPendingTitle()
@@ -975,6 +998,16 @@ void Terminal::writeInput(const char* data, size_t len) {
     if (len == 0 || !m_running) {
         return;
     }
+    // Keystrokes count as activity so the cursor stays solid the instant a key
+    // is pressed, before the echo round-trips back through feedOutput. The
+    // renderer pointer is only stable under m_stateMutex (setRenderer holds
+    // it while swapping/nulling), so take it for the brief touch.
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (m_renderer) {
+            m_renderer->noteActivity();
+        }
+    }
     emitInput(data, len);
 }
 
@@ -1114,9 +1147,24 @@ std::string Terminal::getLinkAt(int row, int col) const
     return {};
 }
 
+// Selection coordinates are viewport-relative, but a selection is anchored
+// to CONTENT: when the viewport moves N rows toward the bottom, the selected
+// text sits N rows higher on the glass, so the endpoints must shift by -N or
+// the highlight visibly rides along with the scroll (edge auto-scroll long
+// copies made this glaring). Rows may go negative: that just means the
+// selection head lives above the current viewport.
+void Terminal::adjustSelectionForViewportMoveLocked(int64_t movedTowardBottom) {
+    if (!m_selectionActive || movedTowardBottom == 0) {
+        return;
+    }
+    m_selStartRow -= static_cast<int>(movedTowardBottom);
+    m_selEndRow -= static_cast<int>(movedTowardBottom);
+}
+
 void Terminal::scrollView(int delta) {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (!m_vt) return;
+    const int64_t offsetBefore = static_cast<int64_t>(getScrollbarLocked().offset);
     ghostty_terminal_scroll_viewport_t behavior {};
     behavior.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA;
     behavior.value.delta = delta;
@@ -1125,6 +1173,49 @@ void Terminal::scrollView(int delta) {
     using ScrollViewportFn = void (*)(ghostty_terminal_t, const ghostty_terminal_scroll_viewport_t*);
     auto scrollViewport = reinterpret_cast<ScrollViewportFn>(ghostty_terminal_scroll_viewport);
     scrollViewport(m_vt, &behavior);
+    adjustSelectionForViewportMoveLocked(
+        static_cast<int64_t>(getScrollbarLocked().offset) - offsetBefore);
+    notifyRenderNeeded();
+}
+
+void Terminal::scrollToOffset(int offset)
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (!m_vt) {
+        return;
+    }
+
+    const ghostty_terminal_scrollbar_t scrollbar = getScrollbarLocked();
+    const size_t viewportRows = static_cast<size_t>(std::max<uint64_t>(
+        1,
+        scrollbar.len > 0 ? scrollbar.len : static_cast<uint64_t>(m_rows)));
+    const size_t totalRows = static_cast<size_t>(std::max<uint64_t>(
+        viewportRows,
+        scrollbar.total > 0 ? scrollbar.total : static_cast<uint64_t>(m_rows)));
+    const size_t maxOffsetSize = totalRows > viewportRows ? totalRows - viewportRows : 0;
+    const int64_t maxOffset = static_cast<int64_t>(
+        std::min<size_t>(maxOffsetSize, static_cast<size_t>(std::numeric_limits<int>::max())));
+    const int64_t currentOffset = static_cast<int64_t>(std::min<size_t>(
+        static_cast<size_t>(scrollbar.offset),
+        maxOffsetSize));
+    const int64_t desiredOffset = std::max<int64_t>(
+        0,
+        std::min<int64_t>(static_cast<int64_t>(offset), maxOffset));
+
+    if (desiredOffset == currentOffset) {
+        return;
+    }
+
+    const int64_t stepTowardsBottom = determineScrollStepTowardsBottomLocked();
+    if (stepTowardsBottom == 0) {
+        return;
+    }
+
+    scrollViewportLocked(
+        GHOSTTY_SCROLL_VIEWPORT_DELTA,
+        stepTowardsBottom * (desiredOffset - currentOffset));
+    adjustSelectionForViewportMoveLocked(
+        static_cast<int64_t>(getScrollbarLocked().offset) - currentOffset);
     notifyRenderNeeded();
 }
 
@@ -1281,7 +1372,10 @@ bool Terminal::sendMouseEvent(TerminalMouseAction action,
 void Terminal::resetViewScroll() {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (!m_vt) return;
+    const int64_t offsetBefore = static_cast<int64_t>(getScrollbarLocked().offset);
     scrollViewportLocked(GHOSTTY_SCROLL_VIEWPORT_BOTTOM);
+    adjustSelectionForViewportMoveLocked(
+        static_cast<int64_t>(getScrollbarLocked().offset) - offsetBefore);
     notifyRenderNeeded();
 }
 
@@ -1345,10 +1439,13 @@ int64_t Terminal::determineScrollStepTowardsBottomLocked()
         scrollViewportLocked(GHOSTTY_SCROLL_VIEWPORT_TOP);
     }
 
-    if (stepTowardsBottom != 0 && originalOffset > 0) {
-        scrollViewportLocked(
-            GHOSTTY_SCROLL_VIEWPORT_DELTA,
-            stepTowardsBottom * static_cast<int64_t>(originalOffset));
+    if (stepTowardsBottom != 0) {
+        scrollViewportLocked(GHOSTTY_SCROLL_VIEWPORT_TOP);
+        if (originalOffset > 0) {
+            scrollViewportLocked(
+                GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                stepTowardsBottom * static_cast<int64_t>(originalOffset));
+        }
     }
 
     return stepTowardsBottom;
@@ -1580,6 +1677,30 @@ int Terminal::getScrollbackSize() const {
     return static_cast<int>(scrollbar.total - scrollbar.len);
 }
 
+TerminalScrollbarState Terminal::getScrollbarState() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    TerminalScrollbarState state;
+    if (!m_vt) {
+        return state;
+    }
+
+    const ghostty_terminal_scrollbar_t scrollbar = getScrollbarLocked();
+    uint64_t total = scrollbar.total > 0 ? scrollbar.total : static_cast<uint64_t>(m_rows);
+    uint64_t visible = scrollbar.len > 0 ? scrollbar.len : static_cast<uint64_t>(m_rows);
+    if (visible > total) {
+        visible = total;
+    }
+    const uint64_t maxOffset = total > visible ? total - visible : 0;
+    const uint64_t offset = std::min<uint64_t>(scrollbar.offset, maxOffset);
+    const uint64_t maxInt = static_cast<uint64_t>(std::numeric_limits<int>::max());
+
+    state.total = static_cast<int>(std::min<uint64_t>(total, maxInt));
+    state.visible = static_cast<int>(std::min<uint64_t>(visible, maxInt));
+    state.offset = static_cast<int>(std::min<uint64_t>(offset, maxInt));
+    return state;
+}
+
 bool Terminal::hasSelection() const {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     return m_selectionActive;
@@ -1794,16 +1915,9 @@ void Terminal::clearSelection() {
 
 std::string Terminal::getSelectedText() const {
     std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (!m_selectionActive || !m_renderState || !m_vt) {
+    if (!m_selectionActive || !m_vt) {
         return {};
     }
-    if (ghostty_render_state_update(m_renderState, m_vt) != GHOSTTY_SUCCESS) {
-        return {};
-    }
-
-    ghostty_row_iterator_t rowIterator = m_rowIterator;
-    ghostty_row_cells_t rowCells = m_rowCells;
-    ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &rowIterator);
 
     int startRow = 0;
     int startCol = 0;
@@ -1811,38 +1925,76 @@ std::string Terminal::getSelectedText() const {
     int endCol = 0;
     normalizeSelectionBounds(startRow, startCol, endRow, endCol);
 
-    std::string result;
-    for (int row = 0; row < m_rows && ghostty_render_state_row_iterator_next(rowIterator); ++row) {
-        ghostty_render_state_row_get(rowIterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &rowCells);
-        if (row < startRow || row > endRow) {
-            continue;
-        }
+    // Selection rows are viewport-relative and may be negative after the
+    // viewport scrolled with the selection pinned to content (edge
+    // auto-scroll). Convert to absolute screen rows and read cells via
+    // grid_ref so text outside the current viewport is captured too -- the
+    // whole point of a long copy.
+    const ghostty_terminal_scrollbar_t scrollbar = getScrollbarLocked();
+    const size_t viewportRows = static_cast<size_t>(std::max<uint64_t>(
+        1, scrollbar.len > 0 ? scrollbar.len : static_cast<uint64_t>(m_rows)));
+    const size_t totalRows = static_cast<size_t>(std::max<uint64_t>(
+        viewportRows, scrollbar.total > 0 ? scrollbar.total : static_cast<uint64_t>(m_rows)));
+    const size_t maxOffset = totalRows > viewportRows ? totalRows - viewportRows : 0;
+    const int64_t viewportTop = static_cast<int64_t>(
+        std::min(static_cast<size_t>(scrollbar.offset), maxOffset));
 
-        bool rowHasSelection = false;
-        for (int col = 0; col < m_cols && ghostty_render_state_row_cells_next(rowCells); ++col) {
+    int64_t absStart = viewportTop + static_cast<int64_t>(startRow);
+    int64_t absEnd = viewportTop + static_cast<int64_t>(endRow);
+    absStart = std::clamp<int64_t>(absStart, 0, static_cast<int64_t>(totalRows) - 1);
+    absEnd = std::clamp<int64_t>(absEnd, 0, static_cast<int64_t>(totalRows) - 1);
+    if (absEnd < absStart) {
+        return {};
+    }
+    // A runaway selection over a deep scrollback would mean millions of
+    // per-cell FFI reads; cap at a generous ceiling.
+    constexpr int64_t kMaxCopyRows = 20000;
+    if (absEnd - absStart + 1 > kMaxCopyRows) {
+        absEnd = absStart + kMaxCopyRows - 1;
+    }
+
+    std::string result;
+    for (int64_t absRow = absStart; absRow <= absEnd; ++absRow) {
+        const bool isFirst = absRow == absStart;
+        const bool isLast = absRow == absEnd;
+        // Linear selection semantics: first row from startCol to line end,
+        // middle rows whole, last row up to endCol.
+        const int rowStartCol = isFirst ? std::max(0, startCol) : 0;
+        const int rowEndCol = isLast ? std::min(endCol, m_cols - 1) : m_cols - 1;
+        bool rowTouched = false;
+        for (int col = rowStartCol; col <= rowEndCol; ++col) {
+            ghostty_point_t point {
+                .tag = GHOSTTY_POINT_TAG_SCREEN,
+                .value = { .coordinate = {
+                    .x = static_cast<uint16_t>(col),
+                    .y = static_cast<uint32_t>(absRow),
+                } },
+            };
+            ghostty_grid_ref_t ref = GHOSTTY_INIT_SIZED(ghostty_grid_ref_t);
+            if (ghostty_terminal_grid_ref(m_vt, point, &ref) != GHOSTTY_SUCCESS) {
+                continue;
+            }
             ghostty_cell_t raw = 0;
+            if (ghostty_grid_ref_cell(&ref, &raw) != GHOSTTY_SUCCESS) {
+                continue;
+            }
+
             bool hasText = false;
             ghostty_cell_wide_t wide = GHOSTTY_CELL_WIDE_NARROW;
             uint32_t codepoint = 0;
-
-            ghostty_render_state_row_cells_get(rowCells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_HAS_TEXT, &hasText);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &codepoint);
 
-            if (!IsCellSelected(true, startRow, startCol, endRow, endCol, row, col)) {
-                continue;
-            }
-
-            rowHasSelection = true;
-            if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
+            rowTouched = true;
+            if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ||
+                wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
                 result.push_back(' ');
             } else {
                 AppendCodepointUtf8(result, codepoint);
             }
         }
-
-        if (rowHasSelection && row < endRow) {
+        if (rowTouched && !isLast) {
             result.push_back('\n');
         }
     }
@@ -1851,8 +2003,15 @@ std::string Terminal::getSelectedText() const {
 }
 
 void Terminal::setMaxScrollback(int lines) {
-    // ghostty handles scrollback internally
-    (void)lines;
+    // ghostty_vt fixes max_scrollback at ghostty_terminal_new time; there is no
+    // runtime option in ghostty_terminal_option_t to resize a live VT's
+    // scrollback. Record the request so a future terminal (re)creation honors
+    // it; the current session keeps its construction-time depth. The app plumbs
+    // the ETS scrollbackLines value into the constructor (see TryInitialize...)
+    // and never changes it after creation, so that value is what takes effect.
+    if (lines > 0) {
+        m_maxScrollback = lines;
+    }
 }
 
 void Terminal::setTheme(const TerminalTheme& theme) {
@@ -1893,7 +2052,15 @@ void Terminal::drawFrame() {
     int32_t globalDirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
     ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_DIRTY, &globalDirty);
 
-    std::vector<Cell> cells(m_cols * m_rows);
+    // Persistent cell snapshot buffer: reused frame to frame so an idle blink
+    // tick does not allocate and zero the whole grid inside the state lock.
+    // Only dirty rows get reset+refilled below; renderGrid never reads the
+    // non-dirty rows, so their stale contents are harmless.
+    const size_t cellCount = static_cast<size_t>(m_cols) * static_cast<size_t>(m_rows);
+    if (m_frameCells.size() != cellCount) {
+        m_frameCells.assign(cellCount, Cell{});
+    }
+    std::vector<Cell>& cells = m_frameCells;
     ghostty_render_state_colors_t colors {};
     colors.size = sizeof(colors);
     ghostty_render_state_colors_get(m_renderState, &colors);
@@ -1914,6 +2081,10 @@ void Terminal::drawFrame() {
     const std::string searchQuery = m_searchQuery;
     const std::vector<SearchMatch> searchMatches = m_searchMatches;
     const int selectedSearchIndex = m_searchSelectedIndex;
+    // The per-row UTF-8 text / byte-offset tables exist only to test cells
+    // against search matches; skip building them entirely when no search is
+    // active (saves 3 heap allocations + per-cell UTF-8 encoding per row).
+    const bool buildSearchText = searchActive && !searchQuery.empty();
     if (selectionActive) {
         normalizeSelectionBounds(selectionStartRow, selectionStartCol, selectionEndRow, selectionEndCol);
     }
@@ -1940,11 +2111,51 @@ void Terminal::drawFrame() {
     // old/new cursor rows are snapshotted and repainted.
     const bool cursorMoved = cursorRow != m_lastCursorRow || cursorCol != m_lastCursorCol ||
         cursorVisible != m_lastCursorVisible;
-    const bool fullRepaint = m_forceFullFrame ||
+    // A pure vertical viewport shift is invisible to the VT dirty flags. Instead
+    // of re-rasterizing the whole grid, the scroll-damage fast path memmoves the
+    // already rendered offscreen by the shift and repaints only the newly
+    // exposed rows. It only applies when nothing else forces a full frame and
+    // no selection/search overlay is (or was) active, since those overlays are
+    // anchored in viewport space and would smear under a blind pixel shift.
+    const bool overlayActive = selectionActive || m_lastSelectionActive ||
+        searchActive || m_lastSearchActive;
+    const bool otherFullRepaint = m_forceFullFrame ||
         globalDirty == GHOSTTY_RENDER_STATE_DIRTY_FULL ||
-        selectionActive || m_lastSelectionActive ||
-        searchActive || m_lastSearchActive ||
-        viewportTopRow != m_lastViewportTopRow;
+        overlayActive;
+    const bool viewportKnown = m_lastViewportTopRow != static_cast<size_t>(-1);
+    const bool viewportChanged = viewportKnown && viewportTopRow != m_lastViewportTopRow;
+    long viewportDelta = 0;
+    if (viewportChanged) {
+        viewportDelta = static_cast<long>(viewportTopRow) - static_cast<long>(m_lastViewportTopRow);
+    }
+    const long viewportDeltaAbs = viewportDelta < 0 ? -viewportDelta : viewportDelta;
+    const bool canScrollShift = viewportChanged && !otherFullRepaint &&
+        viewportDeltaAbs > 0 && viewportDeltaAbs < static_cast<long>(m_rows);
+    const bool fullRepaint = otherFullRepaint || (viewportChanged && !canScrollShift);
+
+    // Rows the scroll-damage path must repaint over the shifted offscreen: the
+    // newly exposed band plus one guard row for sub-pixel seam, and the pre-shift
+    // cursor row's post-shift location so a stale cursor block is erased.
+    int scrollForceLo = 0;
+    int scrollForceHi = 0;  // half-open range lo .. hi, upper bound exclusive
+    int scrollStaleCursorRow = -1;
+    if (canScrollShift) {
+        const int d = static_cast<int>(viewportDelta);
+        if (d > 0) {
+            scrollForceLo = std::max(0, m_rows - d - 1);
+            scrollForceHi = m_rows;
+        } else {
+            const int a = -d;
+            scrollForceLo = 0;
+            scrollForceHi = std::min(m_rows, a + 1);
+        }
+        if (m_lastCursorRow >= 0) {
+            const int sc = m_lastCursorRow - d;
+            if (sc >= 0 && sc < m_rows) {
+                scrollStaleCursorRow = sc;
+            }
+        }
+    }
     std::vector<uint8_t> dirtyRows(static_cast<size_t>(m_rows), fullRepaint ? 1 : 0);
     bool anyDirtyRow = false;
     const bool falseValue = false;
@@ -1955,18 +2166,32 @@ void Terminal::drawFrame() {
         if (rowDirty) {
             ghostty_render_state_row_set(m_rowIterator, 0 /* ROW_OPTION_DIRTY */, &falseValue);
         }
+        const bool scrollForced = canScrollShift &&
+            ((row >= scrollForceLo && row < scrollForceHi) || row == scrollStaleCursorRow);
         const bool needRow = fullRepaint || rowDirty ||
-            row == cursorRow || row == m_lastCursorRow;
+            row == cursorRow || row == m_lastCursorRow || scrollForced;
         if (!needRow) {
             continue;
         }
         dirtyRows[static_cast<size_t>(row)] = 1;
         anyDirtyRow = anyDirtyRow || rowDirty;
         ghostty_render_state_row_get(m_rowIterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &m_rowCells);
+        // Reset just this row of the persistent buffer before refilling so any
+        // column the cell iterator does not visit falls back to a blank cell
+        // (matches the old per-frame zero-initialized vector) without paying to
+        // clear the whole grid.
+        const size_t rowCellBase = static_cast<size_t>(row) * static_cast<size_t>(m_cols);
+        std::fill(cells.begin() + rowCellBase,
+                  cells.begin() + rowCellBase + static_cast<size_t>(m_cols),
+                  Cell{});
         std::string rowText;
-        std::vector<size_t> rowByteStart(static_cast<size_t>(m_cols), 0);
-        std::vector<size_t> rowByteEnd(static_cast<size_t>(m_cols), 0);
-        rowText.reserve(static_cast<size_t>(m_cols));
+        std::vector<size_t> rowByteStart;
+        std::vector<size_t> rowByteEnd;
+        if (buildSearchText) {
+            rowByteStart.assign(static_cast<size_t>(m_cols), 0);
+            rowByteEnd.assign(static_cast<size_t>(m_cols), 0);
+            rowText.reserve(static_cast<size_t>(m_cols));
+        }
         for (int col = 0; col < m_cols && ghostty_render_state_row_cells_next(m_rowCells); ++col) {
             Cell& dst = cells[row * m_cols + col];
             ghostty_cell_t raw = 0;
@@ -1984,13 +2209,15 @@ void Terminal::drawFrame() {
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &codepoint);
 
-            rowByteStart[static_cast<size_t>(col)] = rowText.size();
-            if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
-                rowText.push_back(' ');
-            } else {
-                AppendCodepointUtf8(rowText, codepoint);
+            if (buildSearchText) {
+                rowByteStart[static_cast<size_t>(col)] = rowText.size();
+                if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
+                    rowText.push_back(' ');
+                } else {
+                    AppendCodepointUtf8(rowText, codepoint);
+                }
+                rowByteEnd[static_cast<size_t>(col)] = rowText.size();
             }
-            rowByteEnd[static_cast<size_t>(col)] = rowText.size();
 
             dst.codepoint = codepoint;
             dst.width = CellWidthFromGhostty(wide);
@@ -2045,7 +2272,7 @@ void Terminal::drawFrame() {
                     static_cast<int>(wide));
             }
 
-            if (searchActive && !searchQuery.empty()) {
+            if (buildSearchText) {
                 const size_t logicalRow = viewportTopRow + static_cast<size_t>(row);
                 const size_t cellStartByte = rowByteStart[static_cast<size_t>(col)];
                 const size_t cellEndByte = rowByteEnd[static_cast<size_t>(col)];
@@ -2093,8 +2320,10 @@ void Terminal::drawFrame() {
     ghostty_render_state_set(m_renderState, 0 /* OPTION_DIRTY */, &dirtyFalse);
 
     // Nothing changed anywhere: skip the frame entirely (unless the cursor
-    // is blinking, which needs its row repainted every tick).
-    if (!fullRepaint && !anyDirtyRow && !cursorMoved && !m_renderer->cursorBlinkEnabled()) {
+    // is blinking, which needs its row repainted every tick, or a viewport
+    // scroll needs the offscreen shifted this frame).
+    if (!fullRepaint && !anyDirtyRow && !cursorMoved && !canScrollShift &&
+        !m_renderer->cursorBlinkEnabled()) {
         return;
     }
 
@@ -2117,6 +2346,11 @@ void Terminal::drawFrame() {
     m_renderer->setColors(themeBackground, themeForeground);
     m_renderer->setCursorColors(themeCursor, themeCursorText);
     m_renderer->beginFrame();
+    // Scroll-damage fast path: shift the offscreen first so renderGrid only has
+    // to repaint the exposed rows on top of the reused pixels.
+    if (canScrollShift) {
+        m_renderer->shiftOffscreen(static_cast<int>(viewportDelta));
+    }
     m_renderer->renderGrid(cells, colsSnapshot, rowsSnapshot, cursorRow, cursorCol, cursorVisible,
                            fullRepaint ? std::vector<uint8_t>() : dirtyRows);
     m_renderer->endFrame();
