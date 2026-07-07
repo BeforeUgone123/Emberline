@@ -29,7 +29,7 @@ export class TerminalSessionHandle {
   attached: boolean = false;
   autoConnectAttempted: boolean = false;
   manualConnectionSelected: boolean = false;
-  // User overrides from the tab editor (double-tap a tab): a custom title
+  // User overrides from the tab editor (right-click a tab): a custom title
   // that beats OSC/cwd auto-naming, and a personal filament color.
   customName: string = '';
   filamentColor: string = '';
@@ -37,6 +37,10 @@ export class TerminalSessionHandle {
   // others override it for nested sessions (e.g. ssh typed inside a local
   // shell) where the app cannot know which machine the prompt lives on.
   pasteMode: string = 'auto';
+  // pasteMode 'relay': the agent scp-relays the staged image to this tailnet
+  // host (host or user@host) so a shell ssh'd into that machine can read it.
+  relayTarget: string = '';
+  relayDir: string = '/tmp/emberline-paste';
   // Rate limit for task-finished system notifications (bell storms).
   lastNotifyMs: number = 0;
   // Filament life-signs epochs (§2): each status edge bumps one counter and the

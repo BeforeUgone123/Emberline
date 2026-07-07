@@ -5,6 +5,7 @@
     "description": "Reusable HarmonyOS terminal library powered by libghostty-vt",
     "deviceTypes": [
       "default",
+      "tablet",
       "2in1"
     ]
   }

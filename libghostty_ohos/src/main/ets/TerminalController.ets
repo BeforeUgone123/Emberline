@@ -28,6 +28,7 @@ interface TerminalNativeBridge {
   feedOutput: (surfaceId: string, data: string) => void;
   requestIme: (surfaceId: string) => void;
   setImeActive: (surfaceId: string, active: boolean) => void;
+  setInputBlocked: (surfaceId: string, blocked: boolean) => void;
   drainPendingInput: (surfaceId: string) => string;
   setInputCallback: (surfaceId: string, callback: ((data: string) => void) | null) => void;
   drainPendingLinkActivation: (surfaceId: string) => string;
@@ -364,6 +365,10 @@ export class TerminalController {
 
   setImeActive(active: boolean): void {
     this.native?.setImeActive(this.nativeSurfaceId, active);
+  }
+
+  setInputBlocked(blocked: boolean): void {
+    this.native?.setInputBlocked(this.nativeSurfaceId, blocked);
   }
 
   feed(data: string): void {

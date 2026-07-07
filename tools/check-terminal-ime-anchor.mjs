@@ -28,7 +28,7 @@ assert.match(surface, /XComponent\(\{\s*id: this\.surfaceId,\s*type: XComponentT
 assert.match(surface, /\.focusable\(true\)/);
 assert.match(surface, /\.focusOnTouch\(true\)/);
 assert.match(surface, /\.defaultFocus\(true\)/);
-assert.match(surface, /\.onTouch\(\(_event\?: TouchEvent\) => \{\s*if \(this\.searchVisible\) \{\s*this\.searchInputController\.stopEditing\(\);\s*\}\s*this\.requestTerminalFocus\(\);\s*\}\)/s);
+assert.match(surface, /\.onTouch\(\(_event\?: TouchEvent\) => \{\s*this\.requestTerminalFocus\(\);\s*\}\)/s);
 
 assert.doesNotMatch(
   surface,
@@ -51,9 +51,10 @@ assert.match(surface, /@Prop @Watch\('onActiveChanged'\) active: boolean = true;
 assert.match(surface, /private foregroundFocusTimer: number = -1;/);
 assert.match(surface, /this\.controller\.setImeActive\(this\.active\);/);
 assert.match(surface, /private onActiveChanged\(\): void \{/);
-// active now owns only IME/focus/search-exit: an open drawer/tab-editor hides
-// the keyboard, but the still-visible terminal keeps polling via `visible`.
-assert.match(surface, /if \(this\.active\) \{\s*this\.controller\.setImeActive\(true\);\s*this\.scheduleForegroundImeRequest\(\);\s*return;\s*\}/s);
+// active now owns IME/focus and the native input gate: an open drawer/tab-editor
+// hides the keyboard and deafens native input (key/axis bypass hit-test
+// occlusion), but the still-visible terminal keeps polling via `visible`.
+assert.match(surface, /if \(this\.active\) \{\s*this\.controller\.setInputBlocked\(false\);\s*this\.controller\.setImeActive\(true\);\s*this\.scheduleForegroundImeRequest\(\);\s*return;\s*\}/s);
 assert.match(
   surface,
   /@Prop @Watch\('onVisibleChanged'\) visible: boolean = true;/,
@@ -74,12 +75,12 @@ const onActiveChangedBlock =
 assert.doesNotMatch(
   onActiveChangedBlock,
   /setPollingSuspended|startScrollbarPolling|stopScrollbarPolling|syncScrollbarState/,
-  'active watch must only touch IME/focus/search; polling and scrollbar belong to the visibility watch'
+  'active watch must only touch IME/focus; polling and scrollbar belong to the visibility watch'
 );
 assert.match(surface, /this\.controller\.setImeActive\(false\);/);
 assert.match(surface, /private onForegroundFocusEpochChanged\(\): void \{/);
 assert.match(surface, /private scheduleForegroundImeRequest\(\): void \{/);
-assert.match(foregroundRequestBlock, /if \(!this\.active \|\| this\.searchVisible\) \{/);
+assert.match(foregroundRequestBlock, /if \(!this\.active\) \{/);
 assert.match(foregroundRequestBlock, /this\.requestTerminalFocus\(\);/);
 
 assert.match(
@@ -334,4 +335,13 @@ assert.match(
   nativeKeyBlock,
   /if \(m_wantsIme && ShouldLetImeHandlePrintableKey\(code, modifiers, m_imePreviewActive\)\) \{\s*return false;\s*\}/s,
   'letters start IME composition, while digits/punctuation stay available to terminal unless IME preview is active'
+);
+
+// Search UI is parked (2026-07-06): buggy overlay removed, native search API
+// retained in TerminalController for a future reintroduction. Keep the surface
+// free of the overlay so a half-revert cannot sneak back without the fixes.
+assert.doesNotMatch(
+  surface,
+  /buildSearchOverlay|searchVisible|searchInputController|openSearch\(/,
+  'search overlay stays removed from TerminalSurface until the feature is reworked'
 );

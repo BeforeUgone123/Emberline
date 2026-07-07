@@ -2,7 +2,6 @@ import { common, Want } from '@kit.AbilityKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { fileIo as fs, fileShare, fileUri, picker } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
-import { unifiedDataChannel, uniformTypeDescriptor } from '@kit.ArkData';
 import { DEFAULT_TERMINAL_CONFIG, TerminalSurface } from 'libghostty-ohos';
 import { buildAnsi256ColorDemo } from '../demo/Ansi256ColorDemo';
 import {
@@ -18,6 +17,7 @@ import { TerminalSessionHandle } from '../model/TerminalSession';
 import { sessionRegistry } from '../model/SessionRegistry';
 import { AppearanceSettings, AppearanceStore, DEFAULT_APPEARANCE } from '../settings/AppearanceStore';
 import { ConnectionSettings, ConnectionStore } from '../settings/ConnectionStore';
+import { OnboardingStore } from '../settings/OnboardingStore';
 import {
   CURVE_ACCEL,
   CURVE_DECEL,
@@ -103,16 +103,12 @@ const FONT_FAMILY_CASCADIA: string = 'FusionTerm Cascadia Mono';
 const FONT_FAMILY_SARASA: string = 'FusionTerm Sarasa Fixed SC';
 const FONT_FAMILY_SYSTEM: string = 'PingFang SC';
 const FONT_FAMILY_CUSTOM: string = 'FusionTerm Custom';
-// Approximate per-chip horizontal advance (chip body ~150vp + 4vp gap) used to
-// turn a drop's window-x into a tab insert index. Chips actually hug their
-// title width, so this is a deliberate approximation; the strip scroll offset
-// is also ignored (few tabs, rarely scrolled). See computeDropInsertIndex.
-const TAB_CHIP_ADVANCE_VP: number = 154;
-const TAB_STRIP_LEFT_INSET_VP: number = 12;
-// The UDMF plain-text record dragged with a tab carries only the hand-off token
-// string; the live controller/driver/agent handle is claimed from the process-
-// global SessionRegistry (same-VM shared heap), never serialized into UDMF.
-const HANDOFF_TOKEN_KEY: string = 'emberHandoffToken';
+// In-track tab reorder geometry. Chips hug their title width (64-210vp), so the
+// page measures each chip via onAreaChange and stores the live width; the gap is
+// the tab strip Row's fixed spacing. The fallback width is only used for the one
+// frame before a freshly added chip has reported its measured width.
+const TAB_STRIP_GAP_VP: number = 4;
+const TAB_CHIP_FALLBACK_WIDTH_VP: number = 120;
 
 interface ThemePreview {
   bg: string;
@@ -132,15 +128,29 @@ struct TerminalTabChip {
   // parent re-render, so the chip diffs the observed epochs itself instead.
   @ObjectLink @Watch('onSessionSignal') session: TerminalSessionHandle;
   @Prop active: boolean;
+  // In-track reorder offset (vp). The page owns the drag state and hands each chip
+  // its current horizontal offset as a plain value @Prop so a parent @State change
+  // always re-syncs it (a nested @Observed field would NOT re-sync a @Prop). For the
+  // chip being dragged this is the raw finger follow (written outside animateTo, so
+  // it is applied instantly with zero delay); for a displaced chip it is the ±(chip
+  // width + gap) let-position, changed inside an animateTo(SPRING_SETTLE) so it glides.
+  @Prop translateX: number;
+  // True only for the chip currently under the finger: lift it above its neighbours
+  // (zIndex) and show the active face so "picked up" reads without a scale transform
+  // (CJK titles must never rasterize -- project filament/chrome rule).
+  @Prop lifted: boolean;
   onSelect: () => void = () => {};
   onClose: () => void = () => {};
   onEdit: () => void = () => {};
-  // Tab drag-out wiring back to the page: split into a new window (context menu),
-  // and the two drag-lifecycle callbacks. onDragStart is handled locally (the chip
-  // owns its title/preview + the shared SessionRegistry), but the drag MOVE (grab
-  // coordinates for the tear-off window position) and END (reorder / merge / tear-
-  // off decision) belong to the page that owns the session list and the context.
-  onHandoffEnd: (token: string, result: number) => void = () => {};
+  // Report the chip's measured width (vp) so the page can turn a drag offset into a
+  // hover slot; chips hug their title width, so the page cannot assume a fixed size.
+  onChipWidth: (width: number) => void = () => {};
+  // In-track drag lifecycle up to the page, which owns the session list + offsets.
+  // The chip only forwards the horizontal PanGesture; the page decides the slot.
+  onReorderStart: () => void = () => {};
+  onReorderUpdate: (offsetX: number) => void = () => {};
+  onReorderEnd: () => void = () => {};
+  onReorderCancel: () => void = () => {};
 
   // Base filament opacity. 1.0 when connected/dead; the breathing loop drives it
   // inside the 0.34-0.6 half-lit band while pending (§2.2). Bound after the
@@ -159,9 +169,6 @@ struct TerminalTabChip {
   private lastSparkFail: number = 0;
   private lastAttention: number = 0;
   private lastPending: boolean = false;
-  // The hand-off token minted in onDragStart; onDragEnd hands it back to the page
-  // so the page can tell reorder / cross-window-merge / tear-off / cancel apart.
-  private handoffToken: string = '';
 
   private filament(): string {
     if (this.session.connected || this.isPending()) {
@@ -429,17 +436,66 @@ struct TerminalTabChip {
       width: 1,
       color: this.active ? COLOR_BAR_BORDER : '#00000000'
     })
+    // Lift the chip while it is dragged: a soft neutral shadow (never ember -- the
+    // accent stays on filament / primary button only) that fades in over DUR_FAST.
+    // Paired with the raised zIndex and the finger-follow translate below, "picked
+    // up" reads without a scale transform (CJK title must never rasterize).
+    .shadow(this.lifted
+      ? { radius: 12, color: '#66000000', offsetX: 0, offsetY: 3 }
+      : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
     // M07/M08 chrome hand-off: fade the active face + border rather than a hard
     // cut. Fast (120) so the face settles a beat before the filament brightens.
     .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
+    // In-track reorder offset. Placed AFTER .animation() so the implicit FAST tween
+    // never captures it: the dragged chip's finger-follow is written directly (zero
+    // delay) while a displaced chip's let-position is driven by an explicit
+    // animateTo(SPRING_SETTLE) on the page -- both bypass the implicit animation.
+    .translate({ x: this.translateX })
+    .zIndex(this.lifted ? 3 : 0)
     .clip(true)
     .focusable(false)
     .onClick(() => {
       this.onSelect();
     })
-    .parallelGesture(TapGesture({ count: 2 }).onAction(() => {
-      this.onEdit();
-    }))
+    // Report the live chip width so the page can turn a drag offset into a hover
+    // slot; chips hug their title width, so no fixed advance can be assumed.
+    .onAreaChange((_oldValue: Area, newValue: Area): void => {
+      const width: number = Number(newValue.width ?? 0);
+      if (Number.isFinite(width) && width > 0) {
+        this.onChipWidth(width);
+      }
+    })
+    // In-track reorder: a 1-finger horizontal PanGesture (grab on 8vp move). On the
+    // chip it naturally pre-empts the tab strip's horizontal Scroll, so dragging a
+    // chip reorders while dragging empty strip still scrolls. offsetX is cumulative
+    // from the gesture start, so it is the finger-follow value directly.
+    .gesture(
+      PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 8 })
+        .onActionStart((_event: GestureEvent): void => {
+          this.onReorderStart();
+        })
+        .onActionUpdate((event: GestureEvent): void => {
+          this.onReorderUpdate(Number(event.offsetX ?? 0));
+        })
+        .onActionEnd((_event: GestureEvent): void => {
+          this.onReorderEnd();
+        })
+        .onActionCancel((_event: GestureEvent): void => {
+          this.onReorderCancel();
+        })
+    )
+    // Touch fallback for rename: a long-press opens the tab editor. The pan above
+    // wins as soon as the finger travels 8vp, so holding still (long-press) and
+    // dragging (reorder) never fire together.
+    .parallelGesture(
+      LongPressGesture({ fingers: 1, repeat: false })
+        .onAction((_event: GestureEvent): void => {
+          this.onEdit();
+        })
+    )
+    // Rename / close via the right-click context menu (2-in-1 primary path; the
+    // long-press above is the touch fallback). Mirrors the terminal surface menu.
+    .bindContextMenu(this.buildTabContextMenu(), ResponseType.RightClick)
     // M15 asymmetric add/remove: a new chip fades + slides in from the right
     // (opacity + translateX, no scale so the CJK title never rasterizes);
     // closing is quicker and plainer so remaining tabs settle without fuss.
@@ -450,63 +506,41 @@ struct TerminalTabChip {
       TransitionEffect.OPACITY
         .animation({ duration: DUR_FAST, curve: CURVE_ACCEL })
     ))
-    // Tab drag-out: one system drag pipeline serves reorder, cross-window merge
-    // and tear-off. On drag start we mint a token, park the LIVE session handle in
-    // the process-global registry (the tab stays visible in place -- the actual
-    // hand-off happens at drop/end), and carry ONLY the token in the UDMF payload.
-    // draggable(true) is required: a Column is not draggable by default.
-    .draggable(true)
-    .onDragStart((event: DragEvent): DragItemInfo => {
-      const token: string = sessionRegistry.generateToken();
-      // Harmless expiry: the tab is still in its origin window's list, so if the
-      // drag somehow never ends within the timeout there is nothing to roll back.
-      sessionRegistry.park(token, this.session, (_handle: TerminalSessionHandle): void => {});
-      this.handoffToken = token;
-      const record: unifiedDataChannel.PlainText = new unifiedDataChannel.PlainText();
-      record.textContent = token;
-      event.setData(new unifiedDataChannel.UnifiedData(record));
-      const preview: DragItemInfo = { builder: (): void => { this.buildDragPreview(); } };
-      return preview;
-    })
-    .onDragEnd((event: DragEvent): void => {
-      this.onHandoffEnd(this.handoffToken, event.getResult());
-    })
   }
 
-  // 160x34 dark rounded pill with the tab title over a 2px filament-color base,
-  // so the dragged tab reads at a glance and matches the chip's own ember chrome.
+  // Right-click / long-press tab menu: rename and close, matching the plain
+  // TerminalSurface menu style (no icons, no accent -- desktop-terminal restraint).
   @Builder
-  private buildDragPreview() {
-    Column() {
-      Row() {
-        Text(this.session.title)
-          .fontSize(12.5)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .constraintSize({ maxWidth: 140 })
-      }
-      .layoutWeight(1)
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      Row()
-        .height(2)
-        .width('100%')
-        .borderRadius(1)
-        .backgroundColor(this.session.filamentColor.length > 0 ? this.session.filamentColor : COLOR_EMBER)
-        .shadow({ radius: 4, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 })
+  private buildTabContextMenu() {
+    Menu() {
+      MenuItem({ content: '标签设置' })
+        .onClick(() => {
+          this.onEdit();
+        })
+      MenuItem({ content: '关闭标签' })
+        .onClick(() => {
+          this.onClose();
+        })
     }
-    .width(160)
-    .height(34)
-    .padding({ left: 12, right: 12, top: 6 })
-    .borderRadius(8)
-    .backgroundColor('#151A22')
-    .border({ width: 1, color: COLOR_BAR_BORDER })
-    .clip(true)
   }
 
 }
+
+// wand-agent deploy walkthrough (first-launch overlay + drawer help pane):
+// the systemd unit shown in step 4, kept as one constant so both render the
+// identical text.
+const AGENT_GUIDE_SERVICE_UNIT: string =
+  '[Unit]\n' +
+  'Description=wand-agent WebSocket PTY for Emberline\n' +
+  'After=network-online.target\n' +
+  '\n' +
+  '[Service]\n' +
+  'ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2 --token 你的token\n' +
+  'Restart=always\n' +
+  'RestartSec=2\n' +
+  '\n' +
+  '[Install]\n' +
+  'WantedBy=multi-user.target';
 
 @Entry
 @Component
@@ -518,17 +552,26 @@ struct Index {
   // view past the right edge.
   private tabScroller: Scroller = new Scroller();
   private context: common.UIAbilityContext | null = null;
-  // Tab drag bookkeeping. handledHandoffTokens records tokens whose drop THIS
-  // window's own tab strip already consumed (a reorder), so the source chip's
-  // onDragEnd knows to leave the handle alone. (Cross-window merge and
-  // tear-off are currently disabled; the handoff plumbing stays for later.)
-  private handledHandoffTokens: Set<string> = new Set<string>();
+  // In-track tab reorder state (application-level drag, no system drag pipeline).
+  // draggingSessionId is the chip under the finger (-1 = idle); dragFromIndex its
+  // original slot; dragTargetIndex the current hover slot (insertion index among the
+  // OTHER chips, 0..n-1); dragDx the raw finger follow (vp). tabWidths is the live
+  // per-chip measured width (vp) reported via onAreaChange -- a plain field, not
+  // @State, so measuring never triggers a re-render; it is read only during a drag.
+  @State private draggingSessionId: number = -1;
+  @State private dragTargetIndex: number = -1;
+  @State private dragDx: number = 0;
+  private dragFromIndex: number = -1;
+  private tabWidths: Map<number, number> = new Map();
   @State private drawerOpen: boolean = false;
   @State private drawerPane: string = 'appearance';
   @State private tabEditOpen: boolean = false;
+  @State private agentGuideOpen: boolean = false;
   @State private tabEditDraft: string = '';
   @State private editingFilament: string = '';
   @State private editingPasteMode: string = 'auto';
+  @State private editingRelayTarget: string = '';
+  @State private editingRelayDir: string = '';
   private editingSession: TerminalSessionHandle | null = null;
   @State private themePreviews: Map<string, ThemePreview> = new Map();
   private themePreviewsLoading: boolean = false;
@@ -568,6 +611,7 @@ struct Index {
   private connectionSettingsLoaded: boolean = false;
   private appearanceStore: AppearanceStore = new AppearanceStore();
   private connectionStore: ConnectionStore = new ConnectionStore();
+  private onboardingStore: OnboardingStore = new OnboardingStore();
   private demoRendered: boolean = false;
   private notifyPermissionRequested: boolean = false;
   private appInBackground: boolean = false;
@@ -590,6 +634,7 @@ struct Index {
       this.addSession();
     }
     void this.loadAppearance();
+    void this.loadOnboarding();
   }
 
   aboutToDisappear(): void {
@@ -791,6 +836,10 @@ struct Index {
   // listeners are unhooked so the parked handle carries no stale closures.
   // Returns the removed handle (or null if the id was unknown) for the caller to
   // park in the SessionRegistry.
+  //
+  // RETAINED (currently no caller): the cross-window tab merge / tear-off entry
+  // points were removed with the system drag pipeline, but this window-release side
+  // of the hand-off stays wired for when cross-window sessions are re-enabled.
   private releaseSessionForHandoff(id: number): TerminalSessionHandle | null {
     const index = this.sessions.findIndex((session: TerminalSessionHandle) => session.id === id);
     if (index < 0) {
@@ -819,17 +868,10 @@ struct Index {
     return session;
   }
 
-  // Approximate the tab insert index from a drop's window-x. Chips hug their
-  // title width and the strip can scroll, so this uses a fixed per-chip advance
-  // and ignores the scroll offset -- a deliberate approximation (see notes).
-  private computeDropInsertIndex(windowX: number): number {
-    const raw: number = Math.round((windowX - TAB_STRIP_LEFT_INSET_VP) / TAB_CHIP_ADVANCE_VP);
-    return Math.max(0, Math.min(raw, this.sessions.length));
-  }
-
-  // Move a tab already in THIS window to a new position (drop-to-reorder). Remove
-  // then insert; a target to the right of the old slot shifts left by one once the
-  // tab is pulled out. No transport churn -- the same controller stays live.
+  // Move a tab already in THIS window to a new position. Remove then insert; a
+  // target to the right of the old slot shifts left by one once the tab is pulled
+  // out. No transport churn -- the same controller stays live. Called by the
+  // in-track drag on drop (endTabDrag), inside the settle animation's finish frame.
   private reorderSession(fromIndex: number, insertIndex: number): void {
     if (fromIndex < 0 || fromIndex >= this.sessions.length) {
       return;
@@ -841,83 +883,195 @@ struct Index {
     this.sessions.splice(dest, 0, moved);
   }
 
-  // Tab strip drop target: claim the parked handle, then either reorder it (it is
-  // already ours) or merge it in from another window. A cross-window merge is
-  // DEFERRED to a setTimeout(0) macrotask so the source window's onDragEnd releases
-  // its copy first: the two windows share one process-global surfaceId per handle,
-  // and mounting the same XComponent id in two windows at once is the crash-family
-  // double-activation this ordering exists to prevent.
-  private handleTabStripDrop(event: DragEvent): void {
-    const token: string = this.readHandoffToken(event);
-    if (token.length === 0) {
-      return;
-    }
-    const handle: TerminalSessionHandle | null = sessionRegistry.claim(token);
-    if (handle === null) {
-      return;
-    }
-    const insertIndex: number = this.computeDropInsertIndex(event.getWindowX());
-    const localIndex: number =
-      this.sessions.findIndex((session: TerminalSessionHandle) => session.id === handle.id);
-    if (localIndex >= 0) {
-      // Reorder within this window. Mark the token so the origin chip's onDragEnd
-      // (which fires right after, still SUCCESSFUL) knows we handled it in place
-      // and must NOT release the handle.
-      this.reorderSession(localIndex, insertIndex);
-      this.activateSession(handle.id);
-      this.handledHandoffTokens.add(token);
-    } else {
-      // Cross-window merge is currently disabled: hand the token straight
-      // back so the source window's onDragEnd finds it parked and keeps the
-      // tab in place (adopt/release plumbing stays for a future re-enable).
-      sessionRegistry.park(token, handle, (): void => {});
-    }
-    event.setResult(DragResult.DRAG_SUCCESSFUL);
+  // ── In-track tab reorder (Chrome / ghostty style: the chip follows the finger
+  // inside the strip, neighbours make room, a spring lands it in the target slot).
+  // No system drag, no floating snapshot -- the chip never leaves the strip. ─────
+
+  // A chip's horizontal advance = its measured width + the strip gap. Falls back to
+  // a nominal width only for the one frame before onAreaChange has reported a chip.
+  private tabAdvance(id: number): number {
+    return (this.tabWidths.get(id) ?? TAB_CHIP_FALLBACK_WIDTH_VP) + TAB_STRIP_GAP_VP;
   }
 
-  // Terminal-body drop target: a no-op that still reports success. This "eats"
-  // any drop that lands inside the app (on the terminal instead of the strip) so
-  // it counts as a cancel; only a drop OUTSIDE every window stays DRAG_FAILED and
-  // becomes a tear-off, keeping the tear-off trigger crisp.
-  private handleTerminalBodyDrop(event: DragEvent): void {
-    event.setResult(DragResult.DRAG_SUCCESSFUL);
-  }
-
-  private readHandoffToken(event: DragEvent): string {
-    try {
-      const records: Array<unifiedDataChannel.UnifiedRecord> = event.getData().getRecords();
-      if (records.length === 0) {
-        return '';
-      }
-      const text: string | undefined = (records[0] as unifiedDataChannel.PlainText).textContent;
-      return text ?? '';
-    } catch (err) {
-      console.error('Failed to read hand-off token from drag data: ' + JSON.stringify(err));
-      return '';
+  // The horizontal offset for the chip at array index `i` during a drag. The dragged
+  // chip follows the finger (dragDx, written directly -> zero delay); a chip the
+  // dragged one has crossed shifts by one advance to open / close the gap; everyone
+  // else sits still. Returns 0 when no drag is in flight. Passed to each chip as the
+  // translateX @Prop, so a parent @State change always re-syncs it.
+  private tabShiftFor(i: number): number {
+    if (this.draggingSessionId < 0 || i < 0 || i >= this.sessions.length) {
+      return 0;
     }
+    if (this.sessions[i].id === this.draggingSessionId) {
+      return this.dragDx;
+    }
+    const from: number = this.dragFromIndex;
+    const insertAt: number = this.dragTargetIndex;
+    const adv: number = this.tabAdvance(this.draggingSessionId);
+    // Others-space index of chip i (the array with the dragged chip removed).
+    const j: number = i > from ? i - 1 : i;
+    // Originally right of the dragged chip, now left of it -> slide left to fill.
+    if (i > from && j < insertAt) {
+      return -adv;
+    }
+    // Originally left of the dragged chip, now right of it -> slide right to open.
+    if (i < from && j >= insertAt) {
+      return adv;
+    }
+    return 0;
   }
 
-  // Source-chip drag end. On SUCCESSFUL: distinguish (a) our own reorder -- flagged
-  // in handledHandoffTokens, nothing to do; (b) another window claimed the handle
-  // -- registry.claim now returns null, so release our copy immediately, before the
-  // adopting window's deferred adopt runs; (c) a cancel drop on some terminal body
-  // -- the token is still parked, so claim() cleans it up and the tab stays put.
-  // FAILED means the drop left every window: tear the tab off into its own window.
-  private handleHandoffEnd(session: TerminalSessionHandle, token: string, result: number): void {
-    if (result === DragResult.DRAG_SUCCESSFUL) {
-      if (this.handledHandoffTokens.has(token)) {
-        this.handledHandoffTokens.delete(token);
-        return;
+  // Which slot the dragged chip currently hovers, as an insertion index among the
+  // OTHER chips (0..n-1). Robust to variable chip widths: count how many other
+  // chips' centres sit left of the dragged chip's live centre.
+  private computeDragTargetIndex(): number {
+    const from: number = this.dragFromIndex;
+    const n: number = this.sessions.length;
+    if (from < 0 || from >= n) {
+      return Math.max(0, from);
+    }
+    let left: number = 0;
+    let draggedLeft: number = 0;
+    const lefts: number[] = [];
+    for (let k = 0; k < n; k++) {
+      lefts.push(left);
+      if (k === from) {
+        draggedLeft = left;
       }
-      const stillParked: TerminalSessionHandle | null = sessionRegistry.claim(token);
-      if (stillParked === null) {
-        this.releaseSessionForHandoff(session.id);
+      left += this.tabAdvance(this.sessions[k].id);
+    }
+    const draggedCentre: number = draggedLeft + this.dragDx + this.tabAdvance(this.draggingSessionId) / 2;
+    let target: number = 0;
+    for (let k = 0; k < n; k++) {
+      if (k === from) {
+        continue;
       }
+      const centreK: number = lefts[k] + this.tabAdvance(this.sessions[k].id) / 2;
+      if (centreK < draggedCentre) {
+        target += 1;
+      }
+    }
+    return target;
+  }
+
+  // Where the dragged chip must spring to on drop, as a translate from its resting
+  // slot: the final left edge (sum of the advances of the chips that end up left of
+  // it) minus its original left edge. Applied via dragDx inside the settle animateTo
+  // so the chip glides into the slot before the splice zeroes every offset.
+  private dragFinalTranslate(): number {
+    const from: number = this.dragFromIndex;
+    const insertAt: number = this.dragTargetIndex;
+    const n: number = this.sessions.length;
+    let originalLeft: number = 0;
+    for (let k = 0; k < from && k < n; k++) {
+      originalLeft += this.tabAdvance(this.sessions[k].id);
+    }
+    let finalLeft: number = 0;
+    let count: number = 0;
+    for (let k = 0; k < n && count < insertAt; k++) {
+      if (k === from) {
+        continue;
+      }
+      finalLeft += this.tabAdvance(this.sessions[k].id);
+      count += 1;
+    }
+    return finalLeft - originalLeft;
+  }
+
+  private resetTabDragState(): void {
+    this.draggingSessionId = -1;
+    this.dragFromIndex = -1;
+    this.dragTargetIndex = -1;
+    this.dragDx = 0;
+  }
+
+  // Drag begin: pick up the chip. Initial target == its own slot so nothing shifts.
+  private beginTabDrag(sessionId: number): void {
+    const from: number = this.sessions.findIndex((s: TerminalSessionHandle) => s.id === sessionId);
+    if (from < 0) {
       return;
     }
-    // FAILED / DRAG_CANCELED / anything else: tear-off is currently disabled,
-    // so just clean up the park and keep the tab in place.
-    sessionRegistry.claim(token);
+    this.dragFromIndex = from;
+    this.draggingSessionId = sessionId;
+    this.dragDx = 0;
+    this.dragTargetIndex = from;
+  }
+
+  // Drag move: the cumulative offset is written straight to dragDx (finger follow,
+  // zero delay). When the hover slot changes, animate the neighbours' let-position
+  // with a spring and give one light tick so the reorder is felt as well as seen.
+  private updateTabDrag(offsetX: number): void {
+    if (this.draggingSessionId < 0) {
+      return;
+    }
+    this.dragDx = offsetX;
+    const nextTarget: number = this.computeDragTargetIndex();
+    if (nextTarget !== this.dragTargetIndex) {
+      hapticBoundary();
+      this.getUIContext().animateTo(
+        { duration: DUR_STANDARD, curve: SPRING_SETTLE },
+        () => {
+          this.dragTargetIndex = nextTarget;
+        });
+    }
+  }
+
+  // Drag end: spring the dragged chip into the target slot, then in the SAME finish
+  // frame splice the array into its new order and zero every offset. The ForEach key
+  // `tab-${id}` is stable, so the splice moves the existing chip components instead
+  // of rebuilding them; because the reorder and the offset reset happen together the
+  // chips are already at their final pixels when the translates drop to 0 -- no
+  // flash. The reset runs OUTSIDE animateTo so it applies instantly, not as a tween.
+  private endTabDrag(): void {
+    if (this.draggingSessionId < 0) {
+      this.resetTabDragState();
+      return;
+    }
+    const sessionId: number = this.draggingSessionId;
+    const from: number = this.sessions.findIndex((s: TerminalSessionHandle) => s.id === sessionId);
+    if (from < 0) {
+      this.resetTabDragState();
+      return;
+    }
+    this.dragFromIndex = from;
+    const insertAt: number = this.dragTargetIndex;
+    const finalTranslate: number = this.dragFinalTranslate();
+    this.getUIContext().animateTo(
+      {
+        duration: DUR_STANDARD,
+        curve: SPRING_SETTLE,
+        onFinish: () => {
+          // Others-space insertAt -> full-array insert index for reorderSession.
+          const fullInsert: number = insertAt <= from ? insertAt : insertAt + 1;
+          this.reorderSession(from, fullInsert);
+          this.resetTabDragState();
+        }
+      },
+      () => {
+        this.dragDx = finalTranslate;
+      });
+    this.activateSession(sessionId);
+  }
+
+  // Drag cancel (gesture interrupted): spring back to the original slot and clear.
+  private cancelTabDrag(): void {
+    if (this.draggingSessionId < 0) {
+      this.resetTabDragState();
+      return;
+    }
+    const from: number = this.dragFromIndex;
+    this.getUIContext().animateTo(
+      {
+        duration: DUR_STANDARD,
+        curve: SPRING_SETTLE,
+        onFinish: () => {
+          this.resetTabDragState();
+        }
+      },
+      () => {
+        this.dragDx = 0;
+        this.dragTargetIndex = from;
+      });
   }
 
   private activateSession(id: number, refocus: boolean = false): void {
@@ -1078,6 +1232,8 @@ struct Index {
     this.tabEditDraft = session.customName.length > 0 ? session.customName : session.title;
     this.editingFilament = session.filamentColor;
     this.editingPasteMode = session.pasteMode;
+    this.editingRelayTarget = session.relayTarget;
+    this.editingRelayDir = session.relayDir;
     this.tabEditOpen = true;
   }
 
@@ -1244,6 +1400,11 @@ struct Index {
         this.buildTabEditScrim();
         this.buildTabEditor();
       }
+
+      if (this.agentGuideOpen) {
+        this.buildAgentGuideScrim();
+        this.buildAgentGuidePanel();
+      }
     }
     .width('100%')
     .height('100%')
@@ -1258,7 +1419,6 @@ struct Index {
           TerminalSurface({
             controller: session.controller,
             surfaceId: `fusionTermSurface-g${session.surfaceSeq}`,
-            searchInputId: `fusionTermSearch-g${session.surfaceSeq}`,
             surfaceColor: this.surfaceBackdropColor(),
             active: session.id === this.activeSessionId &&
               !this.drawerOpen &&
@@ -1280,29 +1440,23 @@ struct Index {
     .width('100%')
     .layoutWeight(1)
     .backgroundColor(this.surfaceBackdropColor())
-    // Swallow any tab drop that lands on the terminal body (own or another
-    // window) as a silent cancel: accept the token type and report success
-    // without acting. This makes "dropped anywhere inside the app" a no-op so
-    // only a drop OUTSIDE every window stays DRAG_FAILED and triggers tear-off.
-    // DND drop events are distinct from touch, so this does not disturb the
-    // terminal's native selection/scroll or the drawer overlay pass-through.
-    .allowDrop([uniformTypeDescriptor.UniformDataType.PLAIN_TEXT])
-    .onDrop((event?: DragEvent): void => {
-      if (event) {
-        this.handleTerminalBodyDrop(event);
-      }
-    })
   }
 
   @Builder
   private buildTabBar() {
     Row({ space: 8 }) {
       Scroll(this.tabScroller) {
-        Row({ space: 4 }) {
-          ForEach(this.sessions, (session: TerminalSessionHandle) => {
+        Row({ space: TAB_STRIP_GAP_VP }) {
+          ForEach(this.sessions, (session: TerminalSessionHandle, index: number) => {
             TerminalTabChip({
               session: session,
               active: session.id === this.activeSessionId,
+              // In-track drag: current horizontal offset for this chip (finger follow
+              // for the dragged chip, let-position for a displaced one) and whether it
+              // is the lifted chip. tabShiftFor re-reads the page drag @State, so both
+              // re-sync as plain-value @Props on every parent re-render.
+              translateX: this.tabShiftFor(index),
+              lifted: this.draggingSessionId === session.id,
               onSelect: (): void => {
                 this.activateSession(session.id, true);
               },
@@ -1312,8 +1466,20 @@ struct Index {
               onEdit: (): void => {
                 this.openTabEditor(session);
               },
-              onHandoffEnd: (token: string, result: number): void => {
-                this.handleHandoffEnd(session, token, result);
+              onChipWidth: (width: number): void => {
+                this.tabWidths.set(session.id, width);
+              },
+              onReorderStart: (): void => {
+                this.beginTabDrag(session.id);
+              },
+              onReorderUpdate: (offsetX: number): void => {
+                this.updateTabDrag(offsetX);
+              },
+              onReorderEnd: (): void => {
+                this.endTabDrag();
+              },
+              onReorderCancel: (): void => {
+                this.cancelTabDrag();
               }
             })
           }, (session: TerminalSessionHandle) => `tab-${session.id}`)
@@ -1338,15 +1504,6 @@ struct Index {
       .scrollBar(BarState.Off)
       .align(Alignment.Start)
       .layoutWeight(1)
-      // Tab strip is the drop target for reorder + cross-window merge. It accepts
-      // the plain-text hand-off token payload; handleTabStripDrop claims the live
-      // handle from the process-global registry and reorders or merges it.
-      .allowDrop([uniformTypeDescriptor.UniformDataType.PLAIN_TEXT])
-      .onDrop((event?: DragEvent): void => {
-        if (event) {
-          this.handleTabStripDrop(event);
-        }
-      })
 
       Button() {
         Image(this.accessoryVisible ? $r('app.media.ic_keyboard_ember') : $r('app.media.ic_keyboard'))
@@ -2182,7 +2339,7 @@ struct Index {
       .margin({ top: 4 })
 
     this.buildGroupTitle('标签页')
-    this.buildHelpRow('双击标签', '重命名标签、选择灯丝颜色;「恢复自动命名」可回到自动标题')
+    this.buildHelpRow('右键标签', '标签设置:重命名、灯丝颜色、图片粘贴视角;触屏长按同效')
     this.buildHelpRow('底部灯丝', '亮 = 已连接;半亮 = 正在连接或重连;灰 = 已断开')
     this.buildHelpRow('关闭标签', '只断开本地连接,不会打断远端 tmux 或正在运行的程序')
 
@@ -2196,11 +2353,175 @@ struct Index {
     this.buildHelpRow('自动连接', '启动或新建标签时自动连上次保存的 Agent;手动选择传输后该标签不再自动连')
     this.buildHelpRow('断线重连', '连接意外断开后按 1s → 30s 退避自动重连;手动断开不会触发')
     this.buildHelpRow('远程复制', '远端程序可通过 OSC 52(如 tmux set-clipboard)直接写入系统剪贴板')
-    this.buildHelpRow('图片粘贴视角', '在会话里手动 ssh 到别的机器后,双击标签把粘贴视角切到「上传」或「共享」,路径才对目标机器有效')
+    this.buildHelpRow('图片粘贴视角', '在会话里手动 ssh 到别的机器后,右键标签把粘贴视角切到「上传」或「中继」,路径才对目标机器有效')
+
+    this.buildGroupTitle('部署 wand-agent(Agent 会话)')
+    this.buildAgentGuideContent()
 
     this.buildGroupTitle('主题与字体')
     this.buildHelpRow('ghostty 键名', '设置项下方的灰色小字是对应的 ghostty 配置键,便于对照 ghostty 文档')
     this.buildHelpRow('自定义字体', '字体页可导入 ttf / otf 文件,导入后自动切换到「自定义」')
+  }
+
+  // Shared by the first-launch overlay and the drawer help pane so the
+  // walkthrough never forks: the full "install + run wand-agent in the Fusion
+  // VM" tutorial (source or prebuilt install, trial run, systemd unit,
+  // app-side connect). Commands are long-press copyable.
+  @Builder
+  private buildAgentGuideContent() {
+    Text('Agent 会话面向融合开发引擎的 Linux 虚拟机:虚拟机里常驻一个 wand-agent,应用经 WebSocket 直连它的伪终端。SSH 与本地 shell 无需以下步骤。长按命令可复制。')
+      .fontSize(11)
+      .fontColor(COLOR_TEXT_SECONDARY)
+      .lineHeight(16)
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+
+    this.buildHelpRow('第 1 步 · 进入虚拟机', '打开融合开发引擎的 Linux 虚拟机终端(或任何能进入虚拟机 shell 的方式),以下命令都在虚拟机里执行')
+
+    this.buildHelpRow('第 2 步 · 安装 wand-agent', '方式一,源码构建(需要 Go 1.21 及以上):')
+    this.buildGuideCommand('git clone https://github.com/beforeugone520/wand-agent.git\ncd wand-agent\ngo build -o wand-agent .\ninstall -m 755 wand-agent /usr/local/bin/')
+    Text('方式二,预构建二进制:把 wand-agent 经共享目录拷进虚拟机,再执行:')
+      .fontSize(11)
+      .fontColor(COLOR_TEXT_SECONDARY)
+      .lineHeight(16)
+      .padding({ top: 2 })
+    this.buildGuideCommand('install -m 755 wand-agent /usr/local/bin/')
+
+    this.buildHelpRow('第 3 步 · 试运行', '--host 填虚拟机桥接网卡地址(融合引擎通常是 172.16.100.2),--token 是鉴权令牌,应用侧需填一致:')
+    this.buildGuideCommand('wand-agent --host 172.16.100.2 --token 你的token')
+    Text('默认监听 8765 端口、路径 /ws。前台跑通即可先做第 5 步连一次。')
+      .fontSize(10.5)
+      .fontColor(COLOR_TEXT_FAINT)
+      .lineHeight(15)
+
+    this.buildHelpRow('第 4 步 · 开机常驻(推荐)', '把 agent 改为 systemd 服务,先写入 /etc/systemd/system/wand-agent.service:')
+    this.buildGuideCommand(AGENT_GUIDE_SERVICE_UNIT)
+    Text('然后启用:')
+      .fontSize(11)
+      .fontColor(COLOR_TEXT_SECONDARY)
+      .padding({ top: 2 })
+    this.buildGuideCommand('systemctl daemon-reload && systemctl enable --now wand-agent')
+
+    this.buildHelpRow('第 5 步 · 回到应用连接', '侧栏「连接」页填入地址与 token(默认 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
+
+    Text('安全提示:token 鉴权面向可信的虚拟机桥接网络;若把 agent 暴露到桥接网络之外,请更换强随机 token 并用防火墙限制来源。')
+      .fontSize(10.5)
+      .fontColor(COLOR_TEXT_FAINT)
+      .lineHeight(15)
+      .width('100%')
+      .padding({ top: 4 })
+  }
+
+  @Builder
+  private buildGuideCommand(cmd: string) {
+    Text(cmd)
+      .fontSize(10.5)
+      .fontColor(COLOR_KEY_TEXT)
+      .lineHeight(16)
+      .copyOption(CopyOptions.LocalDevice)
+      .width('100%')
+      .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+      .backgroundColor(COLOR_PANEL_2)
+      .borderRadius(8)
+      .border({ width: 1, color: COLOR_PANEL_BORDER })
+      .margin({ top: 2, bottom: 4 })
+  }
+
+  @Builder
+  private buildAgentGuideScrim() {
+    Column()
+      .width('100%')
+      .height('100%')
+      .backgroundColor('#80020305')
+      .transition(TransitionEffect.OPACITY.animation({ duration: DUR_STANDARD, curve: CURVE_DECEL }))
+      .onClick(() => {
+        this.dismissAgentGuide();
+      })
+  }
+
+  @Builder
+  private buildAgentGuidePanel() {
+    Column({ space: 12 }) {
+      Text('快速开始:连接融合引擎虚拟机')
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(COLOR_TEXT_PRIMARY)
+        .width('100%')
+
+      Scroll() {
+        Column() {
+          this.buildAgentGuideContent()
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .scrollBar(BarState.Off)
+      .align(Alignment.Top)
+      .layoutWeight(1)
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text('之后可在 侧栏 → 帮助 里随时查看')
+          .fontSize(10.5)
+          .fontColor(COLOR_TEXT_FAINT)
+        Blank()
+        Button('开始使用')
+          .height(34)
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .backgroundColor(COLOR_EMBER)
+          .fontColor('#1A0F05')
+          .borderRadius(8)
+          .stateStyles({
+            pressed: {
+              .opacity(0.82)
+            }
+          })
+          .focusable(false)
+          .onClick(() => {
+            this.dismissAgentGuide();
+          })
+      }
+      .width('100%')
+    }
+    .width(480)
+    .height('78%')
+    .padding(18)
+    .backgroundColor(COLOR_PANEL_BG)
+    .borderRadius(14)
+    .border({ width: 1, color: COLOR_PANEL_BORDER })
+    .shadow({ radius: 28, color: '#B3000000', offsetX: 0, offsetY: 12 })
+    .transition(TransitionEffect.asymmetric(
+      TransitionEffect.OPACITY
+        .combine(TransitionEffect.translate({ y: 12 }))
+        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL }),
+      TransitionEffect.OPACITY
+        .animation({ duration: DUR_EDITOR_EXIT, curve: CURVE_ACCEL })
+    ))
+  }
+
+  // First launch only: pop the deploy guide once. The flag lives in its own
+  // tiny preferences store so clearing connection/appearance settings never
+  // re-triggers onboarding.
+  private async loadOnboarding(): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    try {
+      const seen = await this.onboardingStore.load(this.context);
+      if (!seen) {
+        this.agentGuideOpen = true;
+      }
+    } catch (err) {
+      console.error('Failed to load onboarding state: ' + JSON.stringify(err));
+    }
+  }
+
+  private dismissAgentGuide(): void {
+    this.agentGuideOpen = false;
+    this.onboardingStore.markSeen().catch((err: Object) => {
+      console.error('Failed to persist onboarding state: ' + JSON.stringify(err));
+    });
   }
 
   @Builder
@@ -2234,7 +2555,7 @@ struct Index {
       })
   }
 
-  // Tab editor (double-tap a tab): rename and pick a filament color.
+  // Tab editor (right-click a tab -> 标签设置): rename, filament color, paste mode.
   @Builder
   private buildTabEditor() {
     Column({ space: 14 }) {
@@ -2287,12 +2608,47 @@ struct Index {
           this.buildPasteModeButton('本地', 'local')
           this.buildPasteModeButton('共享', 'share')
           this.buildPasteModeButton('上传', 'sftp')
+          this.buildPasteModeButton('中继', 'relay')
         }
         .width('100%')
         .padding(2)
         .backgroundColor(COLOR_PANEL_2)
         .borderRadius(8)
         .border({ width: 1, color: COLOR_PANEL_BORDER })
+
+        // Relay settings only exist while the relay perspective is selected:
+        // the wand-agent scp-pushes the staged image to this tailnet host, so
+        // a shell ssh'd into that machine can read the pasted path directly.
+        if (this.editingPasteMode === 'relay') {
+          TextInput({ text: this.editingRelayTarget, placeholder: '目标机(host 或 user@host)' })
+            .height(36)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT_PRIMARY)
+            .backgroundColor(COLOR_PANEL_2)
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.editingRelayTarget = value;
+              if (this.editingSession) {
+                this.editingSession.relayTarget = value;
+              }
+            })
+          TextInput({ text: this.editingRelayDir, placeholder: '远端目录(默认 /tmp/emberline-paste)' })
+            .height(36)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT_PRIMARY)
+            .backgroundColor(COLOR_PANEL_2)
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.editingRelayDir = value;
+              if (this.editingSession) {
+                this.editingSession.relayDir = value;
+              }
+            })
+          Text('经 Agent 所在虚拟机 scp 转发;需要虚拟机可免交互 ssh 到目标机(Tailscale ACL 或已装密钥)')
+            .fontSize(10.5)
+            .fontColor(COLOR_TEXT_SECONDARY)
+            .width('100%')
+        }
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
@@ -2587,6 +2943,10 @@ struct Index {
       this.uploadPastedImage(session, localPath);
       return;
     }
+    if (mode === 'relay') {
+      this.relayPastedImage(session, exported, localPath);
+      return;
+    }
     // auto: follow the transport type.
     if (session.statusMode === 'local' || !session.connected) {
       session.controller.paste(exported.length > 0 ? exported : localPath);
@@ -2606,6 +2966,37 @@ struct Index {
     const parts = exported.split('/');
     const fileName = parts[parts.length - 1];
     session.controller.paste(`/mnt/linux_share/${this.linuxShareFolderName()}/${fileName}`);
+  }
+
+  // 'relay' paste mode: the image is staged in the shared folder (VM-visible),
+  // then wand-agent scp-relays it to the configured tailnet host and the
+  // REMOTE path is pasted - for shells that ssh'd from the agent session into
+  // another machine. Needs the agent channel alive; every failure degrades to
+  // pasting a path that at least exists somewhere, plus an explanatory line.
+  private relayPastedImage(session: TerminalSessionHandle, exported: string, localPath: string): void {
+    if (exported.length === 0) {
+      session.controller.paste(localPath);
+      session.controller.feed('\r\n[FusionTerm] 未设置共享文件夹,无法中继;已粘贴本地路径\r\n');
+      return;
+    }
+    const target = session.relayTarget.trim();
+    if (target.length === 0) {
+      this.pasteSharePath(session, exported);
+      session.controller.feed('\r\n[FusionTerm] 未设置中继目标(标签设置 → 图片粘贴视角 → 中继),已粘贴共享路径\r\n');
+      return;
+    }
+    const parts = exported.split('/');
+    const fileName = parts[parts.length - 1];
+    const vmPath = `/mnt/linux_share/${this.linuxShareFolderName()}/${fileName}`;
+    const dir = session.relayDir.trim().length > 0 ? session.relayDir.trim() : '/tmp/emberline-paste';
+    session.agentDriver.uploadRelay(vmPath, target, dir)
+      .then((remotePath: string) => {
+        session.controller.paste(remotePath);
+      })
+      .catch((err: Error) => {
+        this.pasteSharePath(session, exported);
+        session.controller.feed(`\r\n[FusionTerm] 图片中继失败(${err.message}),已粘贴共享路径\r\n`);
+      });
   }
 
   private uploadPastedImage(session: TerminalSessionHandle, localPath: string): void {

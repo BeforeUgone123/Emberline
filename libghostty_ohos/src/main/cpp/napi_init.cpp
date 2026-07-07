@@ -246,6 +246,13 @@ constexpr OH_NativeXComponent_KeyCode LINUX_KEY_INSERT =
     static_cast<OH_NativeXComponent_KeyCode>(110);
 constexpr OH_NativeXComponent_KeyCode LINUX_KEY_DELETE =
     static_cast<OH_NativeXComponent_KeyCode>(111);
+// Linux evdev shift codes, mirrored so the shift-bypass tracking recognises the
+// same dual scheme (raw evdev + HarmonyOS KEY_SHIFT_*) the copy/paste shortcuts
+// already handle for other keys.
+constexpr OH_NativeXComponent_KeyCode LINUX_KEY_LEFT_SHIFT =
+    static_cast<OH_NativeXComponent_KeyCode>(42);
+constexpr OH_NativeXComponent_KeyCode LINUX_KEY_RIGHT_SHIFT =
+    static_cast<OH_NativeXComponent_KeyCode>(54);
 
 std::u16string Utf8ToUtf16(const std::string& text)
 {
@@ -344,6 +351,17 @@ bool IsAltPressed(uint64_t modifiers)
 bool IsShiftPressed(uint64_t modifiers)
 {
     return (modifiers & ARKUI_MODIFIER_KEY_SHIFT) != 0;
+}
+
+// The physical Shift key, whichever code scheme the device reports (HarmonyOS
+// KEY_SHIFT_* enum values or raw Linux evdev codes). Used to maintain a
+// persistent held-shift state for the xterm mouse-tracking bypass, which the
+// per-event modifier bitmask cannot express (it only exists on key events, not
+// on the mouse events the bypass has to gate).
+bool IsShiftKeyCode(OH_NativeXComponent_KeyCode code)
+{
+    return code == KEY_SHIFT_LEFT || code == KEY_SHIFT_RIGHT ||
+        code == LINUX_KEY_LEFT_SHIFT || code == LINUX_KEY_RIGHT_SHIFT;
 }
 
 // Ctrl-Shift-C / Ctrl-Insert copy to the system clipboard; plain Ctrl-C stays
@@ -941,6 +959,12 @@ public:
         if (!m_terminal) {
             return false;
         }
+        // Key events route by focus, not by hit-test: with an overlay open the
+        // XComponent keeps focus, so typing into a drawer field would also
+        // land in the PTY without this gate.
+        if (m_inputBlocked) {
+            return false;
+        }
 
         OH_NativeXComponent_KeyEvent* keyEvent = nullptr;
         if (OH_NativeXComponent_GetKeyEvent(component, &keyEvent) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS || !keyEvent) {
@@ -948,13 +972,32 @@ public:
         }
 
         OH_NativeXComponent_KeyAction action = OH_NATIVEXCOMPONENT_KEY_ACTION_UNKNOWN;
-        if (OH_NativeXComponent_GetKeyEventAction(keyEvent, &action) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS ||
-            action != OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN) {
+        if (OH_NativeXComponent_GetKeyEventAction(keyEvent, &action) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             return false;
         }
 
         OH_NativeXComponent_KeyCode code = KEY_UNKNOWN;
         if (OH_NativeXComponent_GetKeyEventCode(keyEvent, &code) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+            return false;
+        }
+
+        // Maintain the physical Shift state on both DOWN and UP for the xterm
+        // shift-bypass (see TrySendTerminalMouseEvent / TrySendTerminalWheelEvent).
+        // Key events dispatch on the same UI thread as the mouse callbacks that
+        // read this flag, so a plain bool needs no lock. Shift alone produces no
+        // PTY sequence, so it is never consumed here.
+        if (IsShiftKeyCode(code)) {
+            if (action == OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN) {
+                m_physShiftDown = true;
+            } else if (action == OH_NATIVEXCOMPONENT_KEY_ACTION_UP) {
+                m_physShiftDown = false;
+            }
+            return false;
+        }
+
+        // Everything below only reacts to key presses; releases fall through
+        // untouched exactly as before.
+        if (action != OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN) {
             return false;
         }
 
@@ -995,6 +1038,9 @@ public:
     }
 
     void DispatchTouchEvent(OH_NativeXComponent* component, void* window) {
+        if (m_inputBlocked) {
+            return;
+        }
         OH_NativeXComponent_TouchEvent touchEvent {};
         if (OH_NativeXComponent_GetTouchEvent(component, window, &touchEvent) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             return;
@@ -1220,6 +1266,9 @@ public:
     }
 
     void DispatchMouseEvent(OH_NativeXComponent* component, void* window) {
+        if (m_inputBlocked) {
+            return;
+        }
         OH_NativeXComponent_MouseEvent mouseEvent {};
         if (OH_NativeXComponent_GetMouseEvent(component, window, &mouseEvent) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             return;
@@ -1341,6 +1390,11 @@ public:
 
     void DispatchAxisEvent(ArkUI_UIInputEvent* event) {
         if (!event || !m_terminal || !m_renderer) {
+            return;
+        }
+        // UIInput axis events (trackpad scroll) ignore sibling occlusion, so a
+        // two-finger scroll over the open drawer would also scroll the terminal.
+        if (m_inputBlocked) {
             return;
         }
 
@@ -1548,9 +1602,28 @@ public:
         NotifyImeStateLocked();
     }
 
+    // Flipped by the ETS `active` prop (false while the settings drawer or the
+    // tab editor is open). Parks the trackpad accumulator and the held-Shift
+    // bypass so nothing sticks across the blocked window.
+    void SetInputBlocked(bool blocked)
+    {
+        m_inputBlocked = blocked;
+        if (blocked) {
+            m_physShiftDown = false;
+            m_axisScrollRemainderY = 0.0;
+            m_axisVelocityY = 0.0f;
+        }
+    }
+
     void SetImeActive(bool active)
     {
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        if (!active) {
+            // The surface just lost input focus / was hidden (tab switch, drawer
+            // open, disappear). Forget any held Shift so a key-up that lands on
+            // another view can never leave the mouse-tracking bypass stuck on.
+            m_physShiftDown = false;
+        }
         m_imeActive.store(active, std::memory_order_relaxed);
         if (!m_imeActive.load(std::memory_order_relaxed)) {
             m_wantsIme = false;
@@ -2537,6 +2610,15 @@ private:
     bool TrySendTerminalMouseEvent(const OH_NativeXComponent_MouseEvent& mouseEvent,
                                    float cellWidth,
                                    float cellHeight) {
+        // xterm shift-bypass: while Shift is physically held, never forward the
+        // event to a mouse-tracking program. It falls through to the local path
+        // in DispatchMouseEvent (left button = drag-select, right button =
+        // QueueContextMenuRequest -> the app context menu), so a user can select
+        // text and open the app menu even inside fish's kitty click tracking or
+        // tmux mouse mode.
+        if (m_physShiftDown) {
+            return false;
+        }
         if (!m_terminal || !m_terminal->isMouseTrackingEnabled()) {
             return false;
         }
@@ -2603,6 +2685,11 @@ private:
     }
 
     bool TrySendTerminalWheelEvent(double vertical, float cellHeight) {
+        // xterm shift-bypass: Shift+wheel scrolls the local scrollback instead of
+        // being forwarded as wheel events to a mouse-tracking program.
+        if (m_physShiftDown) {
+            return false;
+        }
         if (!m_terminal || !m_renderer || !m_terminal->isMouseTrackingEnabled()) {
             return false;
         }
@@ -3505,6 +3592,16 @@ private:
     bool m_isTouching = false;
     bool m_isSelecting = false;
     bool m_isMousePressed = false;
+    // Physical Shift held state for the xterm shift-bypass. Written from the key
+    // callback and reset on focus loss; read from the mouse/wheel callbacks. All
+    // three run on the UI thread, so no lock is needed.
+    bool m_physShiftDown = false;
+    // Overlay input gate (settings drawer / tab editor open). ArkUI hit-test
+    // only shields touch and mouse: XComponent key events (focus-routed) and
+    // UIInput axis events (trackpad two-finger scroll) bypass sibling
+    // occlusion entirely, so every dispatch entry checks this flag. UI-thread
+    // only, same as m_physShiftDown.
+    bool m_inputBlocked = false;
     TerminalMouseButton m_trackedPressButton = TerminalMouseButton::None;
     bool m_touchMouseDragActive = false;
     float m_touchWheelRemainderY = 0.0f;
@@ -3899,6 +3996,20 @@ static napi_value SetImeActive(napi_env env, napi_callback_info info) {
     bool active = false;
     napi_get_value_bool(env, args[0], &active);
     host->SetImeActive(active);
+    return nullptr;
+}
+
+static napi_value SetInputBlocked(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    TerminalHost* host = GetHostFromCallback(env, info, &argc, args);
+    if (!host || argc < 1) {
+        return nullptr;
+    }
+
+    bool blocked = false;
+    napi_get_value_bool(env, args[0], &blocked);
+    host->SetInputBlocked(blocked);
     return nullptr;
 }
 
@@ -4504,6 +4615,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"pasteText", nullptr, PasteText, nullptr, nullptr, nullptr, napi_default, host},
         {"requestIme", nullptr, RequestIme, nullptr, nullptr, nullptr, napi_default, host},
         {"setImeActive", nullptr, SetImeActive, nullptr, nullptr, nullptr, napi_default, host},
+        {"setInputBlocked", nullptr, SetInputBlocked, nullptr, nullptr, nullptr, napi_default, host},
         {"registerCustomFont", nullptr, RegisterCustomFont, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingTitle", nullptr, DrainPendingTitle, nullptr, nullptr, nullptr, napi_default, host},
         {"drainPendingNotification", nullptr, DrainPendingNotification, nullptr, nullptr, nullptr, napi_default, host},

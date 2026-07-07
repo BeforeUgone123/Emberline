@@ -26,13 +26,13 @@
       {
         "name": "default",
         "material": {
-          "storePassword": "00000020E8EAF92973620CCB0E04F47FF73EE06E7AD3104FD51BD8A5FEA831B930301DDDE6185414FCA70096765DE754",
-          "certpath": "/storage/Users/currentUser/appdata/el2/base/com.huawei.devecostudio/files/ohos/config/default_harmony-advanced-terminalQO-iisL2KWAtlgp6LMw5tQuo0gAm8Ae5-xZ00FEDe3g.cer",
-          "keyAlias": "debugKey",
-          "keyPassword": "00000020E8EAF92973620CCB0E04F47FF73EE06E7AD3104FD51BD8A5FEA831B930301DDDE6185414FCA70096765DE754",
-          "profile": "./docs/粘贴板Debug.p7b",
+          "storePassword": "00000019850362D7F4178344082FCCC4C49E0BA2A615FD5FCFBA543580C3A6F37502C12F121E6F841C",
+          "certpath": "/storage/Users/currentUser/Download/com.haitai.htbrowser/终端发布new.cer",
+          "keyAlias": "2",
+          "keyPassword": "00000019850362D7F4178344082FCCC4C49E0BA2A615FD5FCFBA543580C3A6F37502C12F121E6F841C",
+          "profile": "/storage/Users/currentUser/Download/com.haitai.htbrowser/发布newRelease.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "/storage/Users/currentUser/appdata/el2/base/com.huawei.devecostudio/files/ohos/config/default_harmony-advanced-terminalQO-iisL2KWAtlgp6LMw5tQuo0gAm8Ae5-xZ00FEDe3g.p12"
+          "storeFile": "/storage/Users/currentUser/Desktop/preview/harmony-advanced-terminal/docs/release.p12"
         },
         "type": "HarmonyOS"
       }
