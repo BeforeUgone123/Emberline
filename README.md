@@ -44,8 +44,8 @@ Emberline(原名 FusionTerm)是一款 HarmonyOS 原生终端模拟器,内核移�
   (兼容 `wand-agent` 协议,面向 Fusion Development Engine Linux VM)。
 - 断线指数退避自动重连,断开后敲任意键立即重试;taskKeeping 后台保活,
   切走 app 会话不断线。
-- 标签:动态宽度、拖动重排、双击改名、自定义灯丝颜色;关闭标签不打断
-  远端 tmux 里正在跑的任务。
+- 标签:动态宽度、轨道内拖动重排(按住即拖、邻居实时让位)、右键菜单
+  改名与关闭、自定义灯丝颜色;关闭标签不打断远端 tmux 里正在跑的任务。
 
 **输入与剪贴板**
 
@@ -54,12 +54,17 @@ Emberline(原名 FusionTerm)是一款 HarmonyOS 原生终端模拟器,内核移�
 - 截图直达终端:任意处截图后 Ctrl+V,按会话视角粘出可用路径——本地给
   本地路径、VM 会话走共享目录零上传、SSH 经 SFTP 送达远端,支持逐标签
   覆盖粘贴视角。
+- 图片「中继」视角:在 Agent 会话里 ssh 到 tailnet 上的另一台机器后,
+  粘贴的图片由 wand-agent 从共享目录 `scp` 转发到该机(右键标签 →
+  标签设置 → 图片粘贴视角 → 中继,填目标机与远端目录),终端里直接粘出
+  目标机上的路径。前提:VM 可免交互 ssh 到目标机(Tailscale SSH ACL
+  `accept` 或已装密钥);任何失败会回退为共享路径并在终端说明原因。
 - 中文 IME 完整支持(native 自定义编辑框)。
 
 **自定义**
 
 - 458 套 Ghostty 主题(真色板预览)、五款内置等宽字体 + ttf/otf 自由导入、
-  背景图与亚克力模糊、光标三态、回看搜索。
+  背景图与亚克力模糊、光标三态。
 - 每个设置项下方标注对应的 Ghostty 配置键,熟悉桌面 Ghostty 零学习成本。
 
 ## 项目结构
@@ -136,7 +141,10 @@ wand-agent --host 172.16.100.2 --token <你的token>
 ```
 
 默认监听 `8765` 端口、路径 `/ws`;`--host` 绑定 VM 桥接网卡地址,`--token`
-是 Bearer 鉴权令牌(应用侧需填一致)。前台跑通后建议改为 systemd 常驻:
+是 Bearer 鉴权令牌(应用侧需填一致);`--shell /usr/bin/fish` 可显式指定
+新会话的默认 shell(不指定时跟随启动环境的 `$SHELL`,从 ssh 一行命令或
+systemd 启动时往往不是你交互用的那个,建议显式指定)。前台跑通后建议改为
+systemd 常驻:
 
 ```ini
 # /etc/systemd/system/wand-agent.service
@@ -162,6 +170,9 @@ systemctl daemon-reload && systemctl enable --now wand-agent
 在 Emberline 设置抽屉「连接」页填入地址与 token(默认示例
 `ws://172.16.100.2:8765/ws`),点「连接 Agent」;应用会自动记住并在下次
 启动时重连。
+
+应用内也内置了同一份部署教程:首次启动会弹出引导,之后在侧栏「帮助」页
+常驻,可长按复制命令。
 
 **安全提示**:token 鉴权面向可信的 VM 桥接网络;若把 agent 暴露到桥接网络
 之外,请更换强随机 token 并配合防火墙限制来源。
@@ -198,13 +209,16 @@ for f in tools/check-*.mjs; do node "$f" || echo "FAIL: $f"; done
 - **终端核心包装**:选区视口位移补偿与绝对坐标跨屏文本提取;OSC 52 剪贴板
   捕获;OSC 9 / BEL 通知事件;回看搜索;滚动条状态;标题与通知事件 drain。
 - **ETS 层**:TerminalController / TerminalSurface 重做(输出直连跨 so
-  投递、后台标签轮询门控、滚动条 overlay、安全粘贴、搜索 UI)。
+  投递、后台标签轮询门控、滚动条 overlay、安全粘贴)。
 
 ### 2. VM Agent — fork [beforeugone520/wand-agent](https://github.com/beforeugone520/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
 
 推荐使用加固 fork,相对上游的修改:WebSocket frame routing、Bearer 鉴权、
-Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为。应用同时保持
-对 stock 协议的兼容。
+Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为、PTY 环境净化
+(剔除启动环境泄漏的 `NO_COLOR`)与 `--shell` 显式默认 shell,以及新增的
+`upload-relay` 控制消息(把共享目录里的文件 `scp` 转发到 tailnet 主机,
+供图片「中继」粘贴使用;源文件限定共享目录内 ≤64MB,目标与目录严格校验、
+参数按 argv 传递不经 shell)。应用同时保持对 stock 协议的兼容。
 
 ## 开源协议
 

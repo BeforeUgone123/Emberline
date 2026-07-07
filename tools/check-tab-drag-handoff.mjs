@@ -1,67 +1,86 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-// Tab drag = in-window reorder only (cross-window merge and tear-off are
-// DISABLED by decision 2026-07-05; the handoff plumbing -- registry, adopt/
-// release, softDetach/rebind -- stays in place for a future re-enable).
+// Tab reorder = APPLICATION-LEVEL in-track drag (Chrome / ghostty style: the chip
+// follows the finger inside the strip, neighbours make room, a spring lands it in
+// the target slot). The old ArkUI SYSTEM drag pipeline (draggable + onDragStart +
+// UDMF token + floating preview + allowDrop/onDrop) was ripped out because the
+// floating snapshot felt wrong; rename moved from double-tap to a right-click menu
+// (long-press is the touch fallback). Cross-window merge / tear-off stay DISABLED,
+// but their session plumbing -- SessionRegistry, adopt/release, wireSessionListeners
+// -- is retained for a future re-enable.
 
 const index = readFileSync('entry/src/main/ets/pages/Index.ets', 'utf8');
 
+// AbilityKit import stays (Want/common still used elsewhere).
 assert.match(index, /import \{ common, Want \} from '@kit\.AbilityKit';/,
-  'AbilityKit import stays lean: StartOptions left with the disabled tear-off');
-assert.match(index, /import \{ unifiedDataChannel, uniformTypeDescriptor \} from '@kit\.ArkData';/,
-  'UDMF drag payload imports');
+  'AbilityKit import stays lean');
 
-const chipBuild = index.slice(index.indexOf('struct TerminalTabChip'), index.indexOf('@Entry'));
-assert.match(chipBuild, /\.draggable\(true\)/, 'chip must be draggable');
-assert.match(chipBuild, /\.onDragStart\(\(event: DragEvent\): DragItemInfo => \{/);
-assert.match(chipBuild, /const token: string = sessionRegistry\.generateToken\(\);/,
-  'drag start parks the handle under a fresh token');
-assert.match(chipBuild, /sessionRegistry\.park\(token, this\.session,/,
-  'park keeps the handle recoverable while the drag is in flight');
-assert.match(chipBuild, /event\.setData\(new unifiedDataChannel\.UnifiedData\(record\)\)/,
-  'token travels as UDMF plain text');
-assert.match(chipBuild, /const preview: DragItemInfo = \{ builder: \(\): void => \{ this\.buildDragPreview\(\); \} \};/,
-  'custom drag preview');
-assert.match(chipBuild, /\.onDragEnd\(\(event: DragEvent\): void => \{\s*this\.onHandoffEnd\(this\.handoffToken, event\.getResult\(\)\);/s,
-  'drag end routes through the handoff bookkeeping');
-assert.doesNotMatch(chipBuild, /\.attach\(|\.detach\(|\.rebind\(|\.softDetach\(/,
-  'the chip never touches transport lifecycles directly');
-assert.doesNotMatch(chipBuild, /bindContextMenu|onTearOff|onDragMove/,
-  'tear-off menu and drag-move tracking removed with the disabled tear-off');
+// ── The system drag pipeline must be entirely gone. ──────────────────────────
+assert.doesNotMatch(index, /@kit\.ArkData/,
+  'UDMF ArkData import removed with the system drag payload');
+assert.doesNotMatch(index, /unifiedDataChannel|uniformTypeDescriptor/,
+  'no UDMF drag payload types remain');
+assert.doesNotMatch(index, /\.draggable\(true\)/,
+  'no chip is system-draggable any more');
+assert.doesNotMatch(index, /onDragStart|onDragEnd/,
+  'system drag start/end handlers removed');
+assert.doesNotMatch(index, /allowDrop|onDrop\(/,
+  'no drop targets on the tab strip or terminal body');
+assert.doesNotMatch(index, /handleTabStripDrop|handleTerminalBodyDrop|handleHandoffEnd|readHandoffToken|computeDropInsertIndex/,
+  'system-drag drop/handoff plumbing removed');
+assert.doesNotMatch(index, /handledHandoffTokens|handoffToken|onHandoffEnd|buildDragPreview/,
+  'handoff token bookkeeping + floating preview removed');
 
-const stripDrop = index.slice(index.indexOf('private handleTabStripDrop'), index.indexOf('private handleTerminalBodyDrop'));
-assert.match(stripDrop, /const handle: TerminalSessionHandle \| null = sessionRegistry\.claim\(token\);/,
-  'drop claims the parked handle');
-assert.match(stripDrop, /this\.reorderSession\(localIndex, insertIndex\);/,
-  'same-window drop reorders in place');
-assert.match(stripDrop, /this\.handledHandoffTokens\.add\(token\);/,
-  'reorder marks the token so onDragEnd leaves the handle alone');
-assert.match(stripDrop, /sessionRegistry\.park\(token, handle, \(\): void => \{\}\);/,
-  'foreign handles are parked straight back (cross-window merge disabled)');
-assert.doesNotMatch(stripDrop, /adoptSession|setTimeout/,
-  'no deferred adopt while cross-window merge is disabled');
-assert.match(stripDrop, /event\.setResult\(DragResult\.DRAG_SUCCESSFUL\);/);
+// ── Rename: right-click context menu, NOT double-tap. ────────────────────────
+assert.doesNotMatch(index, /TapGesture\(\{\s*count:\s*2\s*\}\)/,
+  'double-tap-to-rename gesture removed');
+assert.match(index, /@Builder\s*\n\s*private buildTabContextMenu\(\)/,
+  'chip owns a context-menu builder');
+assert.match(index, /MenuItem\(\{ content: '标签设置' \}\)/,
+  'context menu has a tab-settings (rename) item');
+assert.match(index, /MenuItem\(\{ content: '关闭标签' \}\)/,
+  'context menu has a close item');
+assert.match(index, /\.bindContextMenu\(this\.buildTabContextMenu\(\), ResponseType\.RightClick\)/,
+  'menu is bound on right-click');
+assert.match(index, /LongPressGesture\(\{ fingers: 1, repeat: false \}\)/,
+  'long-press is the touch fallback for rename');
 
-const bodyDrop = index.slice(index.indexOf('private handleTerminalBodyDrop'), index.indexOf('private readHandoffToken'));
-assert.match(bodyDrop, /event\.setResult\(DragResult\.DRAG_SUCCESSFUL\);/,
-  'terminal body still eats stray drops so they read as cancel');
-assert.match(index, /\.allowDrop\(\[uniformTypeDescriptor\.UniformDataType\.PLAIN_TEXT\]\)/,
-  'drop targets accept the plain-text token');
+// ── In-track drag: horizontal PanGesture on the chip + page reorder state. ───
+assert.match(index, /PanGesture\(\{ fingers: 1, direction: PanDirection\.Horizontal, distance: 8 \}\)/,
+  'chip drives an as-you-move horizontal pan (distance 8) for reorder');
+assert.match(index, /this\.onReorderUpdate\(Number\(event\.offsetX \?\? 0\)\)/,
+  'pan forwards the cumulative finger offset up to the page');
+assert.match(index, /@Prop translateX: number;/,
+  'chip takes its live drag offset as a plain-value @Prop (parent re-syncs it)');
+assert.match(index, /@Prop lifted: boolean;/,
+  'chip takes a lifted flag (zIndex + active face, never a scale transform)');
+assert.match(index, /onChipWidth: \(width: number\) => void/,
+  'chip reports its measured width so the page can map an offset to a slot');
+assert.match(index, /\.translate\(\{ x: this\.translateX \}\)/,
+  'the offset is applied as a translate (compositor-safe, no relayout)');
 
-const handoffEnd = index.slice(index.indexOf('private handleHandoffEnd'), index.indexOf('private activateSession'));
-assert.match(handoffEnd, /if \(this\.handledHandoffTokens\.has\(token\)\) \{\s*this\.handledHandoffTokens\.delete\(token\);\s*return;/s,
-  'own reorder: nothing further to do');
-assert.match(handoffEnd, /sessionRegistry\.claim\(token\);/,
-  'all other outcomes clean up the park and keep the tab in place');
-assert.doesNotMatch(handoffEnd, /tearOffHandle|startAbility/,
-  'tear-off disabled: FAILED must not launch windows');
-assert.doesNotMatch(index, /tearOffHandle|tearOffFromMenu|TEAR_OFF_/,
-  'tear-off implementation fully removed');
+// Page-side reorder methods.
+assert.match(index, /private tabShiftFor\(i: number\): number \{/,
+  'page computes each chip offset (finger follow for the dragged chip, ±advance for a displaced one)');
+assert.match(index, /private beginTabDrag\(sessionId: number\): void \{/, 'drag begin');
+assert.match(index, /private updateTabDrag\(offsetX: number\): void \{/, 'drag move');
+assert.match(index, /private endTabDrag\(\): void \{/, 'drag end');
+assert.match(index, /private cancelTabDrag\(\): void \{/, 'drag cancel');
+assert.match(index, /translateX: this\.tabShiftFor\(index\)/,
+  'buildTabBar hands each chip its live offset by array index');
+// The neighbours' let-position and the settle both use the shared SPRING_SETTLE
+// spring, and the drop reorders the live session array in place.
+assert.match(index, /curve: SPRING_SETTLE/,
+  'let-position + drop settle ride the shared spring token');
+assert.match(index, /this\.reorderSession\(from, fullInsert\)/,
+  'drop splices the session array into its new order');
 
-// Handoff plumbing must SURVIVE (future re-enable): registry, adopt, release.
+// ── Cross-window handoff plumbing must SURVIVE (future re-enable). ───────────
+assert.match(index, /import \{ sessionRegistry \}/, 'SessionRegistry import retained');
 assert.match(index, /private adoptSession\(/, 'adoptSession plumbing retained');
 assert.match(index, /private releaseSessionForHandoff\(/, 'release plumbing retained');
+assert.match(index, /private wireSessionListeners\(/, 'listener wiring retained');
 assert.match(index, /emberHandoffToken/, 'handoff token key retained for window bootstrap');
 
 console.log('check-tab-drag-handoff: OK');

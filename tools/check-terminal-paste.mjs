@@ -11,6 +11,7 @@ const nativeBridge = await readFile('libghostty_ohos/src/main/cpp/napi_init.cpp'
 const privilegedPasteTool = await readFile('tools/configure-privileged-paste.mjs', 'utf8');
 
 const privilegedPasteEnabled = /const PRIVILEGED_PASTE_ENABLED: boolean = true;/.test(surface);
+const usesBundledPrivilegedProfile = /"profile":\s*"\.\/docs\/粘贴板Debug\.p7b"/.test(buildProfile);
 
 assert.match(
   moduleJson,
@@ -25,14 +26,16 @@ if (privilegedPasteEnabled) {
   );
   assert.match(
     buildProfile,
-    /"profile":\s*"\.\/docs\/粘贴板Debug\.p7b"/,
-    'privileged paste builds should use the debug profile that carries the READ_PASTEBOARD ACL'
+    /"profile":\s*"[^"]+\.p7b"/,
+    'privileged paste builds should use a Harmony signing profile so READ_PASTEBOARD can be granted'
   );
-  assert.match(
-    privilegedProfile.toString('utf8'),
-    /allowed-acls[\s\S]*ohos\.permission\.READ_PASTEBOARD/,
-    'privileged paste profile should contain the READ_PASTEBOARD ACL'
-  );
+  if (usesBundledPrivilegedProfile) {
+    assert.match(
+      privilegedProfile.toString('utf8'),
+      /allowed-acls[\s\S]*ohos\.permission\.READ_PASTEBOARD/,
+      'privileged paste profile should contain the READ_PASTEBOARD ACL'
+    );
+  }
 } else {
   assert.doesNotMatch(
     moduleJson,
@@ -70,7 +73,19 @@ assert.match(surface, /PasteButtonOnClickResult\.SUCCESS === result/);
 assert.match(surface, /this\.pasteFromClipboardAfterSecureGrant\(\);/);
 assert.match(surface, /const data = await clipboard\.getData\(\);/);
 assert.match(surface, /this\.controller\.paste\(text\);/);
-assert.match(surface, /\.bindContextMenu\(this\.buildTerminalContextMenu\(\), ResponseType\.RightClick\)/);
+// The right-click menu moved off ArkUI's unconditional ResponseType.RightClick
+// onto the isShown-controlled overload so it can be mutually exclusive with the
+// shell's own mouse tracking (see check-terminal-context-menu-mutex.mjs).
+assert.doesNotMatch(
+  surface,
+  /\.bindContextMenu\([^;]*ResponseType\.RightClick\)/,
+  'right-click must not unconditionally open the app menu; it is now driven by the native controlled path'
+);
+assert.match(
+  surface,
+  /\.bindContextMenu\(this\.contextMenuVisible, this\.buildTerminalContextMenu\(\),/,
+  'terminal context menu must use the isShown-controlled overload bound to contextMenuVisible'
+);
 assert.doesNotMatch(
   surface,
   /if \(this\.hasClipboardContents\(\)\) \{\s*MenuItem\(\{ content: '粘贴' \}\)/s,

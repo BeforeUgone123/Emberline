@@ -40,6 +40,14 @@ export interface FusionAgentMessage {
   code?: string;
   error?: string;
   message?: string;
+  // upload-relay: push a shared-folder file to a tailnet host via the agent.
+  // relayId is numeric and deliberately distinct from the string-typed id
+  // that the forked reply uses.
+  relayId?: number;
+  src?: string;
+  target?: string;
+  ok?: boolean;
+  path?: string;
 }
 
 function normalizePositiveInteger(value: number, fallback: number): number {
@@ -120,6 +128,21 @@ export function createResizeMessage(cols: number, rows: number): FusionAgentMess
 export function createTerminateMessage(): FusionAgentMessage {
   return {
     type: 'terminate'
+  };
+}
+
+export function createUploadRelayMessage(
+  relayId: number,
+  src: string,
+  target: string,
+  dir: string
+): FusionAgentMessage {
+  return {
+    type: 'upload-relay',
+    relayId,
+    src,
+    target,
+    dir
   };
 }
 

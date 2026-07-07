@@ -1,6 +1,7 @@
 {
   "app": {
     "bundleName": "com.preview.fusionterm",
+    "debug": false,
     "vendor": "preview",
     "versionCode": 1000000,
     "versionName": "1.0.0",

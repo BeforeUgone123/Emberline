@@ -7,6 +7,7 @@ import {
   createPingMessage,
   createResizeMessage,
   createTerminateMessage,
+  createUploadRelayMessage,
   DEFAULT_AGENT_COLS,
   DEFAULT_AGENT_ROWS,
   DEFAULT_FUSION_AGENT_HOST,
@@ -26,6 +27,17 @@ export interface FusionAgentStatus {
 }
 
 type FusionAgentStatusListener = (status: FusionAgentStatus) => void;
+
+// One in-flight upload-relay request awaiting its result frame.
+interface PendingRelay {
+  resolve: (path: string) => void;
+  reject: (err: Error) => void;
+  timer: number;
+}
+
+// Client-side deadline slightly above the agent's own 30s scp timeout so the
+// agent's error message wins the race when the transfer itself is slow.
+const RELAY_REPLY_TIMEOUT_MS = 35000;
 
 export class FusionAgentDriver {
   private controller: TerminalController | null = null;
@@ -50,6 +62,10 @@ export class FusionAgentDriver {
   // UTF-8 sequence can be split across frames; the incomplete tail is kept
   // here until the next frame arrives.
   private pendingUtf8Tail: Array<number> = [];
+  // upload-relay requests keyed by relayId, settled by the matching
+  // upload-relay-result frame, a timeout, or connection teardown.
+  private pendingRelays: Map<number, PendingRelay> = new Map();
+  private nextRelayId: number = 1;
 
   private readonly inputListener: TerminalInputListener = (input: string): void => {
     if (!this.socket || !this.connected || input.length === 0) {
@@ -224,6 +240,7 @@ export class FusionAgentDriver {
     this.connected = false;
     this.supportsTerminateControl = false;
     this.pendingUtf8Tail = [];
+    this.rejectAllPendingRelays('Agent 连接已断开');
     if (!socketToClose) {
       this.socket = null;
       return;
@@ -298,6 +315,63 @@ export class FusionAgentDriver {
       return;
     }
     this.sendSocketPayload(stringifyFusionAgentMessage(createForkMessage(cwd || this.currentCwd)));
+  }
+
+  // Ask the agent to scp a shared-folder file to a tailnet host. Resolves with
+  // the remote path on success; rejects on validation/scp failure, reply
+  // timeout, or connection teardown while the request is in flight.
+  uploadRelay(src: string, target: string, dir: string): Promise<string> {
+    return new Promise<string>((resolve: (path: string) => void, reject: (err: Error) => void) => {
+      if (!this.socket || !this.connected) {
+        reject(new Error('Agent 未连接'));
+        return;
+      }
+      const relayId = this.nextRelayId;
+      this.nextRelayId += 1;
+      const timer = setTimeout(() => {
+        const pending = this.pendingRelays.get(relayId);
+        if (!pending) {
+          return;
+        }
+        this.pendingRelays.delete(relayId);
+        pending.reject(new Error('上传中继超时'));
+      }, RELAY_REPLY_TIMEOUT_MS) as number;
+      this.pendingRelays.set(relayId, { resolve, reject, timer });
+      this.sendSocketPayload(stringifyFusionAgentMessage(createUploadRelayMessage(relayId, src, target, dir)));
+    });
+  }
+
+  private settleRelay(message: FusionAgentMessage): void {
+    const relayId = message.relayId;
+    if (relayId === undefined) {
+      return;
+    }
+    const pending = this.pendingRelays.get(relayId);
+    if (!pending) {
+      return;
+    }
+    this.pendingRelays.delete(relayId);
+    clearTimeout(pending.timer);
+    if (message.ok && message.path && message.path.length > 0) {
+      pending.resolve(message.path);
+    } else {
+      pending.reject(new Error(message.error && message.error.length > 0 ? message.error : '上传中继失败'));
+    }
+  }
+
+  private rejectAllPendingRelays(reason: string): void {
+    if (this.pendingRelays.size === 0) {
+      return;
+    }
+    const pendings: Array<PendingRelay> = [];
+    this.pendingRelays.forEach((pending: PendingRelay) => {
+      pendings.push(pending);
+    });
+    this.pendingRelays.clear();
+    for (const pending of pendings) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+    }
   }
 
   private registerSocketHandlers(): void {
@@ -397,6 +471,9 @@ export class FusionAgentDriver {
         this.emitStatus(this.connected, message.id ? `Forked ${message.id}` : 'Forked session', '');
         break;
       case 'shells':
+        break;
+      case 'upload-relay-result':
+        this.settleRelay(message);
         break;
       case 'ping':
         this.sendSocketPayload(stringifyFusionAgentMessage(createPingMessage(message.ts || Date.now())));
