@@ -1,10 +1,11 @@
 {
   "app": {
-    "bundleName": "com.preview.fusionterm.debug",
+    "bundleName": "com.preview.fusionterm",
+    "debug": false,
     "vendor": "preview",
     "versionCode": 1000000,
     "versionName": "1.0.0",
     "icon": "$media:fusionterm_icon",
-    "label": "$string:app_name_dev"
+    "label": "$string:app_name"
   }
 }
