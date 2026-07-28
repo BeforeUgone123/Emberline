@@ -145,11 +145,10 @@ ohpm install --all                # 安装 HarmonyOS 依赖(含本地 HAR 引用
 hvigorw assembleHap --mode module -p product=default -p module=entry@default --no-daemon
 ```
 
-开发 worktree 的 `compatibleSdkVersion` 与 `targetSdkVersion` 已固定为
+工程的 `compatibleSdkVersion` 与 `targetSdkVersion` 固定为
 `6.1.0(23)`(API 23);`compileSdkVersion` 不显式配置,跟随 DevEco Studio
-配套 SDK。正式版 `main` 仍保留 `5.0.0(12)`,待 API 23 的发布构建、签名安装
-与真机回归完成后再单独升级。DevEco Sync 若提示 SDK version 无效,先确认当前
-打开的是哪个 worktree,并确认本机已安装该分支所需的 HarmonyOS SDK。
+配套 SDK。DevEco Sync 若提示 SDK version 无效,先确认本机已安装 HarmonyOS
+6.1.0(API 23)SDK。该配置不再支持安装到 API 23 以下的设备。
 
 改动 `libghostty_ohos/` 下的 C++ 后需要完整重编(HAR 会随 entry 一起构建)。
 

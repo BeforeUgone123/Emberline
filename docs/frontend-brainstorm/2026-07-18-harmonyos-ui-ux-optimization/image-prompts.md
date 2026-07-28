@@ -48,3 +48,4 @@ dashboard; no KPI cards, charts, gradients, or persistent animation.
 - Glassmorphism across the terminal, background blobs, gradients, scanlines, or cyberpunk neon.
 - Rounded rectangles with text where a familiar symbol or native control is clearer.
 - CJK text scaling, animated terminal reflow, crossfading terminal canvases, or ambient loops.
+

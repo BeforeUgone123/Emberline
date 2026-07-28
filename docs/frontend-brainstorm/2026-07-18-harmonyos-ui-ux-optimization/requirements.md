@@ -42,3 +42,4 @@ mobile app or a decorative terminal mockup.
 - No full-screen glass/blur treatment, gradients, glow fields, bokeh, or cyberpunk decoration.
 - No page-level spectacle, terminal crossfades, animated reflow, or persistent ambient loops.
 - No renderer migration or transport redesign in the UI phase.
+
