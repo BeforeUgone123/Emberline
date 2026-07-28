@@ -5,10 +5,6 @@
       "value": "Emberline"
     },
     {
-      "name": "app_name_dev",
-      "value": "Emberline Dev"
-    },
-    {
       "name": "module_desc",
       "value": "Advanced terminal emulator"
     },
@@ -26,3 +22,4 @@
     }
   ]
 }
+

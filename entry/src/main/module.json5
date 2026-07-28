@@ -42,6 +42,7 @@
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:EntryAbility_desc",
         "icon": "$media:fusionterm_icon",
+        "label": "$string:EntryAbility_label",
         "startWindowIcon": "$media:fusionterm_start_icon",
         "startWindowBackground": "$color:start_window_background",
         "launchType": "multiton",

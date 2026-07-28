@@ -82,8 +82,10 @@ encoder. Do not add soft key rows back without an explicit user request.
   (`check-adaptive-chrome.mjs`). The tab strip is ghostty-macOS shaped:
   equal-split tabs, a floating pill capsule as the active face, and a
   solo tab collapses to a centered title.
-- The source-level quality gate currently contains 35 `tools/check-*.mjs`
-  scripts. These are structural checks, not a substitute for HAP compilation,
+- The release branch source-level quality gate currently contains 34
+  `tools/check-*.mjs` scripts. The dev worktree carries one additional
+  channel-identity check that is intentionally not promoted to `main`.
+  These are structural checks, not a substitute for HAP compilation,
   profiler evidence, or device QA.
 
 ## Key Files
