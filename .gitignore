@@ -19,8 +19,18 @@ local.properties
 entry/.preview/
 jscrash-*.log
 docs/cppcrash-*.log
+# Signing material. The patterns below are anchored at docs/ and do NOT reach
+# subdirectories, so docs/key/ (p12 private keys, CSRs and the keystore
+# material tree) needs its own rule -- without it a `git add -A` would publish
+# the app signing keys to a public repository.
+docs/key/
 docs/*.csr
 docs/*.p12
 docs/*.p7b
+# Belt and braces: never commit key material from anywhere in the tree.
+**/*.p12
+**/*.csr
+**/*.p7b
+**/*.keystore
 third_party/libssh2/
 third_party/mbedtls/

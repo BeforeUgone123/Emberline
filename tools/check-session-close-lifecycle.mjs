@@ -14,10 +14,10 @@ assert.doesNotMatch(closeSessionBody, /session\.agentDriver\.terminate\(\);/,
 assert.match(closeSessionBody, /session\.driver\.detach\(\);/,
   'closing a terminal tab should still stop and destroy native local\/SSH sessions');
 
-// Anchor on the ability-teardown body specifically: the chip now also defines
-// an aboutToDisappear (filament breathing cleanup), so target the one that
-// starts by unregistering the foreground event hub — that is the ability's.
-const disappearBody = index.match(/  aboutToDisappear\(\): void \{\s*this\.context\?\.eventHub\.off\([\s\S]*?\n  \}/)?.[0] ?? '';
+// Anchor on the ability-teardown body specifically: the chip also defines an
+// aboutToDisappear (dot breathing cleanup), so target the one that starts by
+// unregistering the window registry entry then the event hub — the page's.
+const disappearBody = index.match(/  aboutToDisappear\(\): void \{\s*sessionRegistry\.unregisterWindow\(this\.windowStamp\);\s*this\.context\?\.eventHub\.off\([\s\S]*?\n  \}/)?.[0] ?? '';
 assert.match(disappearBody, /session\.agentDriver\.detach\(\);/,
   'ability teardown should passively detach agent sockets without injecting terminal input');
 assert.doesNotMatch(disappearBody, /session\.agentDriver\.terminate\(\);/,

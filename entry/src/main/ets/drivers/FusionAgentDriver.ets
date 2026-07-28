@@ -55,6 +55,12 @@ export class FusionAgentDriver {
   // every deliberate teardown (closeConnection), so manual disconnect, tab
   // close, and a clean shell exit never trigger retries.
   private autoReconnect: boolean = false;
+  // Last state pushed through emitStatus, replayed verbatim when a new
+  // listener attaches (tab moved across windows must not repaint a live
+  // connection as idle -- that fake edge made adopting windows treat a live
+  // socket as dead).
+  private lastEmittedConnected: boolean = false;
+  private lastEmittedLabel: string = 'Agent 待机';
   private lastEndpoint: FusionAgentEndpoint | null = null;
   private reconnectAttempt: number = 0;
   private reconnectTimer: number = -1;
@@ -161,7 +167,8 @@ export class FusionAgentDriver {
 
   setStatusListener(listener: FusionAgentStatusListener | null): void {
     this.statusListener = listener;
-    this.emitStatus(false, 'Agent 待机', '');
+    // Replay the CURRENT truth to the new listener instead of hardcoded idle.
+    this.emitStatus(this.lastEmittedConnected, this.lastEmittedLabel, '');
   }
 
   connect(endpoint: FusionAgentEndpoint): void {
@@ -486,6 +493,8 @@ export class FusionAgentDriver {
   }
 
   private emitStatus(connected: boolean, label: string, error: string): void {
+    this.lastEmittedConnected = connected;
+    this.lastEmittedLabel = label || '';
     if (!this.statusListener) {
       return;
     }

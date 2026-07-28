@@ -1,5 +1,13 @@
 # Emberline 动效规范 v1
 
+> 2026-07-18:本文保留为第一版动效研究与编号来源,不是待办清单。当前实现
+> 以根 `AGENTS.md` 的动效不做清单、Direction A
+> `docs/frontend-brainstorm/2026-07-18-harmonyos-ui-ux-optimization/design-brief.md`
+> 和源码为准。
+> M13(屏幕快捷键条)、全屏 dim scrim、抽屉推挤终端、主题暗幕、布局尺寸补间
+> 已被明确否决;看到下文旧方案不得重新实现。所有现有动效仍待真机长 tmux
+> 输出与后台功耗验证。
+
 > 适用:HarmonyOS 原生终端模拟器 Emberline / MatePad Edge(2in1,120Hz,键盘+触控板+触屏)
 > 气质基线:近黑三层(#07090C/#0D1117/#1C232E)、唯一强调色「余烬铜」#D08F53、签名隐喻=灯丝(亮/半亮/灰烬)。
 > **裁决五原则**:①每个动效必须传达一个状态(连接/断开/连接中/失败/完成/选中/切换),答不出即砍;②高频路径宁快勿花;③终端渲染层(XComponent/reflow)动效从严,默认瞬切;④含 CJK 文字组件禁 `transform scale`,一律 `opacity + translateY`;⑤强调色动效只出现在灯丝与主按钮。
@@ -152,7 +160,7 @@ this.getUIContext().animateTo({ duration: DUR_STANDARD, curve: CURVE_DECEL },
 
 **性能论证**:必须走 ArkUI 声明式属性动画(RenderService 合成线程),**绝不用 `setInterval`/`requestAnimationFrame` 逐帧驱动**(会占 UI/JS 线程抢终端输入)。2px 节点 opacity 循环在 GPU 上≈免费,`FRAME_60` 进一步省电。与 XComponent 分属两层,不碰终端渲染。
 
-> 熄灭(2.1 表第三态)与失败(第四态)复用同一 epoch/keyframe 基建,详设见第 3 节方案表 M03/M04——非对称编排是关键:熄灭首段 120ms 先 hold 住余温、再 700ms 慢慢冷透(色相 ember→过渡橙 #C56B3A→ash),读作「刚刚还活着、现在慢慢凉了」;失败做 2–3 下**无辉光**的顿挫闪烁后落灰,与呼吸的「平滑+有辉光+循环」刻意拉开,不看文字也能分「在连」与「连不上」。
+> 熄灭(2.1 表第三态)与失败(第四态)复用同一 epoch/keyframe 基建,详设见第 3 节方案表 M03/M04——非对称编排是关键:熄灭首段 120ms 先 hold 住余温、再 700ms 慢慢冷透(色相 ember→过渡橙 #C56B3A→ash),读作「此前还活着、现在慢慢凉了」;失败做 2–3 下**无辉光**的顿挫闪烁后落灰,与呼吸的「平滑+有辉光+循环」刻意拉开,不看文字也能分「在连」与「连不上」。
 
 ---
 

@@ -40,17 +40,17 @@ assert.match(
 );
 assert.match(
   captureOsc52,
-  /if \(!m_pendingOsc52Sequence\.empty\(\)\) \{[\s\S]*?scanData = std::move\(m_pendingOsc52Sequence\);[\s\S]*?scanData \+= data;/,
+  /if \(!m_pendingOsc52Sequence\.empty\(\)\) \{[\s\S]*?joinedData = std::move\(m_pendingOsc52Sequence\);[\s\S]*?joinedData \+= data;[\s\S]*?scanData = &joinedData;/,
   'OSC 52 parser must prepend a saved partial sequence to the next output chunk'
 );
 assert.match(
   captureOsc52,
-  /if \(end == std::string::npos\) \{[\s\S]*?m_pendingOsc52Sequence = scanData\.substr\(start\);[\s\S]*?return;/,
+  /if \(end == std::string::npos\) \{[\s\S]*?m_pendingOsc52Sequence = scanData->substr\(start\);[\s\S]*?return;/,
   'OSC 52 parser must save an unterminated sequence instead of dropping long tmux copies'
 );
 assert.match(
   captureOsc52,
-  /RememberOsc52PrefixTail\(scanData\);/,
+  /RememberOsc52PrefixTail\(\*scanData\);/,
   'OSC 52 parser must remember a split ESC ] 52 ; prefix at a chunk boundary'
 );
 assert.match(

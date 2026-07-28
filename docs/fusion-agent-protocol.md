@@ -1,77 +1,70 @@
 # Fusion Agent Protocol
 
-> **2026-07-03**: the project now targets the hardened fork
-> `beforeugone520/wand-agent` (commit `2974ee3`) as the default VM backend.
-> Fork behavior differences from stock `ystyle/wand-agent`:
-> binary frames always route to the PTY and only text frames are parsed as
-> control JSON; `Authorization: Bearer <token>` is the preferred auth (query
-> `?token=` still accepted); JSON `ping` is answered with `pong`; the agent
-> emits `{"type":"exit"}` when the shell exits and never injects
-> bracketed-paste markers; `fork` returns an `unsupported` error — open one
-> WebSocket per terminal; `--host/--port/--max-sessions` are enforced.
-> FusionTerm sends both the Bearer header and the query token, so it works
-> against either backend.
-
-
 ## Purpose
 
-Fusion Agent is the preferred transport for FusionTerm's Fusion VM path. The
-HarmonyOS app connects to a small agent running inside the Fusion Development
-Engine Linux VM. The agent owns Linux PTY creation and process lifecycle; the
-HarmonyOS app owns UI state, terminal rendering, profiles, and reconnection.
+Fusion Agent is Emberline's primary transport into the Fusion Development
+Engine Linux VM. The VM-side agent owns the Linux PTY and process lifecycle;
+the HarmonyOS app owns tabs, UI state, rendering, reconnection, profiles, and
+fallback transports.
 
-This is intentionally narrower than a general SSH client. SSH remains available
-as a fallback and later advanced mode, but the first product path should make the
-known Fusion VM feel native and low-friction.
+The default backend is the hardened `beforeugone520/wand-agent` fork (based on
+`ystyle/wand-agent` v0.2.3). Emberline keeps enough compatibility for the stock
+wire format, but new product behavior must target the hardened fork.
 
-## Relationship To wand-agent
+Keep the transport in `entry`:
 
-`ystyle/wand-agent` is the compatibility target for the current milestone:
+```text
+entry/src/main/ets/drivers/FusionAgentProtocol.ts
+entry/src/main/ets/drivers/FusionAgentDriver.ets
+```
 
-- WebSocket endpoint creates one PTY session per terminal connection.
-- Binary frames carry terminal input and output bytes.
-- Text frames carry JSON control messages such as resize, cwd, fork, terminate
-  (when advertised by a hardened agent), ping, and errors.
-- The PTY environment advertises `TERM=xterm-256color` and
-  `COLORTERM=truecolor`.
+Do not move VM assumptions or WebSocket orchestration into `libghostty_ohos`.
 
-FusionTerm should speak that wire format directly, then harden the VM-side agent
-later as a project-owned fork if needed.
+## Development Endpoint
 
-## Default Endpoint
-
-Development default:
+The current development default is:
 
 ```text
 ws://172.16.100.2:8765/ws?token=harmonyterm&cols=80&rows=24
 ```
 
-The default matches `ystyle/wand-agent`'s openEuler container address, port, and
-prototype token. If a device build exposes the VM through another gateway
-address, change the single app constant rather than reintroducing a DNS-only
-host name.
+Constants live in `FusionAgentProtocol.ts`:
 
-Connection query parameters:
+- host `172.16.100.2`;
+- port `8765`;
+- path `/ws`;
+- token `harmonyterm`;
+- initial grid `80x24` until the renderer reports its real size.
 
-```text
-token=<bearer token>
-cols=<terminal columns>
-rows=<terminal rows>
-cwd=<optional initial directory>
-shell=<optional shell path>
-```
+Supported query parameters are `token`, `cols`, `rows`, optional `cwd`, and
+optional `shell`. `secure: true` changes the scheme to `wss`.
 
-Production should prefer `wss://` or an SSH tunnel when traffic leaves the
-trusted VM bridge network.
+The published default token and plain `ws://` endpoint are for a trusted local
+VM bridge only. Production exposure requires per-install pairing, secure
+credential storage, Authorization-only authentication, and `wss://` or a
+protected tunnel. See `code-review-2026-07-10.md` (CR-003).
+
+## Authentication Compatibility
+
+When a token is configured, Emberline currently sends it twice:
+
+1. `Authorization: Bearer <token>` for the hardened fork;
+2. `?token=<token>` for stock wand-agent compatibility.
+
+Do not log the URL, token, Authorization header, or terminal input. Removing the
+query token is part of the production pairing/transport work; doing it before
+stock compatibility is intentionally dropped would be a protocol change.
 
 ## Frame Model
 
-Binary frames are raw terminal bytes:
+Binary frames contain raw terminal bytes:
 
-- app to agent: keyboard input, paste data, quick-key escape sequences;
-- agent to app: PTY output, including ANSI/VT sequences.
+- app to agent: native keyboard and paste input encoded as UTF-8;
+- agent to app: PTY output, including ANSI/VT control sequences.
 
-Text frames are UTF-8 JSON control messages:
+The client preserves an incomplete UTF-8 tail across WebSocket frames before
+feeding text to `TerminalController`. Text frames are UTF-8 JSON controls with a
+required `type` field:
 
 ```json
 {
@@ -79,33 +72,33 @@ Text frames are UTF-8 JSON control messages:
 }
 ```
 
-The app must pass binary server frames directly to `TerminalController.feed()`.
-The app must send terminal input bytes from `TerminalController.write()` as
-binary client frames.
+The hardened fork routes binary frames only to the PTY and text frames only to
+the control parser. Stock wand-agent may forward unknown text controls into the
+PTY, so the app must not invent controls without capability/compatibility review.
 
-## Session Start
+## Connection Start
 
-There is no app-side `hello` frame. Opening `/ws` creates the PTY session. After
-the WebSocket opens, FusionTerm sends a current-directory query:
+Opening the WebSocket creates one PTY session. Emberline does not send an app
+`hello` frame. On `open`, the client:
+
+1. marks the socket connected;
+2. resets the reconnect attempt counter;
+3. reports the connected endpoint to the tab;
+4. sends `{"type":"cwd"}`.
+
+The hardened fork may send an optional `ready` frame:
 
 ```json
 {
-  "type": "cwd"
+  "type": "ready",
+  "sessionId": "session-id",
+  "cwd": "/home/user",
+  "capabilities": ["terminate"]
 }
 ```
 
-The agent replies with the current directory when available:
-
-```json
-{
-  "type": "cwd",
-  "dir": "/home/user"
-}
-```
-
-FusionTerm still accepts a future `ready` frame from a hardened fork, but it must
-not send unknown JSON controls to stock `wand-agent`, because unknown text frames
-are forwarded to the PTY as terminal input by that prototype.
+Emberline uses `ready.capabilities` only for guarded controls such as remote
+termination. It does not require `ready` before accepting PTY output.
 
 ## Control Messages
 
@@ -121,11 +114,12 @@ App to agent:
 }
 ```
 
-The agent resizes the PTY. No response is required unless resize fails.
+The app sends resize only after the grid actually changes and clamps both values
+to positive integers.
 
 ### Working Directory
 
-App to agent:
+App query:
 
 ```json
 {
@@ -133,7 +127,7 @@ App to agent:
 }
 ```
 
-Agent to app:
+Agent response/push:
 
 ```json
 {
@@ -142,35 +136,12 @@ Agent to app:
 }
 ```
 
-The agent may also push `cwd` changes when it detects a new process working
-directory.
-
-### Fork
-
-App to agent:
-
-```json
-{
-  "type": "fork",
-  "cwd": "/home/user/project"
-}
-```
-
-Agent to app:
-
-```json
-{
-  "type": "forked",
-  "id": "new-session-id"
-}
-```
-
-The current app exposes the helper method but does not yet add session tabs in
-the UI.
+The app also accepts `cwd` instead of `dir`. The current directory can become
+the tab title and the base for image-paste path decisions.
 
 ### Heartbeat
 
-Either side may send:
+Incoming stock-compatible ping:
 
 ```json
 {
@@ -179,17 +150,30 @@ Either side may send:
 }
 ```
 
-Stock `wand-agent` uses `ping` as the reply shape as well, so FusionTerm replies
-with the same `type` and timestamp. A future project fork may also introduce
-`pong`; the app treats `pong` as a no-op for compatibility.
+Emberline replies with the same `type` and timestamp. Incoming `pong` is
+accepted as a no-op. The current client does **not** originate heartbeat probes,
+track last activity, or close a half-open socket after missed deadlines. That is
+an unresolved release finding (CR-007), not an implemented guarantee.
 
-The app should consider the connection stale after two missed heartbeat
-intervals.
+### Fork Compatibility Helper
+
+The protocol helper can send:
+
+```json
+{
+  "type": "fork",
+  "cwd": "/home/user/project"
+}
+```
+
+and parse a `forked` reply. The hardened project fork intentionally reports
+`unsupported`; Emberline's visible tabs use independent WebSocket connections,
+not the fork control. Do not build tab lifecycle on this helper.
 
 ### Terminate
 
-App to hardened agent, only when the agent advertises a terminate capability in
-its `ready.capabilities` list:
+Only when `ready.capabilities` contains `terminate`, `session.terminate`, or
+`control.terminate`, an explicit remote-session termination may send:
 
 ```json
 {
@@ -197,13 +181,8 @@ its `ready.capabilities` list:
 }
 ```
 
-The agent should terminate the PTY process group, flush remaining output, emit
-`exit` when possible, and close the WebSocket. FusionTerm does not send this
-JSON control to stock `wand-agent` because unknown text frames may be forwarded
-to the PTY. It also must not synthesize terminal bytes such as Ctrl-C or `exit`
-when closing a tab: if the user is attached to tmux, those bytes can interrupt
-the foreground task running inside tmux. Stock compatibility is passive socket
-close only; the agent owns whatever socket-close cleanup policy it implements.
+Closing/detaching a normal tab is passive. The app never falls back to injecting
+Ctrl-C or `exit`, because that could interrupt a foreground task inside tmux.
 
 ### Exit
 
@@ -218,8 +197,8 @@ Agent to app:
 }
 ```
 
-After `exit`, the agent closes the WebSocket once buffered PTY output has been
-sent.
+On `exit`, the app closes the socket before reporting the final label so stale
+input cannot be written into a dead shell.
 
 ### Error
 
@@ -228,75 +207,90 @@ Agent to app:
 ```json
 {
   "type": "error",
+  "code": "start-failed",
   "error": "failed to start /bin/bash"
 }
 ```
 
-The app also tolerates `message` and `code` fields from a hardened fork. The
-status bar should show a short safe string and keep detailed logs for
-diagnostics.
+The client accepts `error`, `message`, and `code`. Current control-error state
+and socket teardown still need one atomic transition (see the additional risks
+in the dated code review).
 
-## Authentication
+### Upload Relay (Hardened Fork)
 
-Prototype mode may use a bearer token because the agent is expected to run on a
-trusted VM bridge network. Do not ship a long-lived URL query token as the final
-design.
+App to agent:
 
-Preferred progression:
+```json
+{
+  "type": "upload-relay",
+  "relayId": 1,
+  "src": "/shared/path/image.png",
+  "target": "user@tailnet-host",
+  "dir": "/tmp/emberline-paste"
+}
+```
 
-1. Prototype: token in query string for fast local testing.
-2. Milestone: token in `Authorization: Bearer <token>` or WebSocket subprotocol.
-3. Hardened: short-lived pairing token minted from the VM management channel.
-4. Networked: `wss://` or SSH tunnel when traffic is not isolated to the VM
-   bridge.
+Agent reply:
 
-The agent should bind to the narrowest practical address. Avoid exposing it on a
-public interface unless TLS and authentication are configured.
+```json
+{
+  "type": "upload-relay-result",
+  "relayId": 1,
+  "ok": true,
+  "path": "/tmp/emberline-paste/image.png"
+}
+```
+
+On failure the reply sets `ok: false` and provides `error`. The app allows one
+or more requests keyed by numeric `relayId`, uses a 35-second client deadline,
+and rejects known requests during deliberate connection teardown. Per-session
+credential isolation and reconnect-generation cleanup remain open review items.
+
+The hardened agent constrains the source to its shared directory, limits file
+size, validates target/directory arguments, and invokes `scp` without a shell.
+
+## Reconnection And Teardown
+
+- `connect()` arms automatic recovery and stores the last endpoint.
+- After a previously connected socket drops, retry delay is exponential:
+  1, 2, 4, 8, 16, then at most 30 seconds.
+- Typing while a retry timer is waiting cancels the delay and retries now; the
+  triggering input is not queued.
+- Explicit disconnect, passive detach, and clean `exit` disarm retries.
+- Every event handler is tied to its own socket instance so late callbacks from
+  an old socket cannot update a replacement session.
+
+Initial connect failures and half-open connections are not yet handled by the
+same recovery path. Do not describe the current client as fully self-healing
+until CR-007 and the related generation races are fixed and device-tested.
 
 ## Agent Runtime Requirements
 
-The agent must:
+The VM-side agent must:
 
-- start one PTY per WebSocket connection;
+- create one PTY per WebSocket connection;
 - set `TERM=xterm-256color` and `COLORTERM=truecolor`;
-- resize the PTY when receiving `resize`;
-- clean up the process group when the socket closes;
-- avoid logging terminal input or bearer tokens.
+- apply `resize` to the PTY;
+- serialize WebSocket writes;
+- clean up the process group when the socket/session is terminated;
+- avoid logging input or credentials;
+- bound concurrent sessions and enforce authentication.
 
-A hardened project fork should additionally bound max sessions, report shell
-exit state, and expose version/build info in startup logs.
+Recommended development launch:
 
-## HarmonyOS App Integration
-
-Add a new ArkTS transport next to the current native driver:
-
-```text
-entry/src/main/ets/drivers/FusionAgentDriver.ets
+```sh
+wand-agent --host 172.16.100.2 --token harmonyterm
 ```
 
-`FusionAgentDriver` should:
+## Verification Gate
 
-- use HarmonyOS WebSocket APIs from NetworkKit;
-- map terminal input to binary WebSocket frames;
-- map binary output frames to `TerminalController.feed()`;
-- send `cwd` after the socket opens;
-- send `resize` on terminal size changes;
-- update app status from `cwd`, `forked`, `ready`, `exit`, and `error`;
-- reconnect only after an explicit user action for the first milestone.
+Source checks cover protocol URL construction, controls, driver wiring, default
+target, auto-connect structure, and Agent setup documentation. A release still
+requires a DevEco/device pass for:
 
-Keep `libghostty_ohos` transport-neutral. Do not move Fusion Agent assumptions
-into the renderer HAR.
-
-## First Implementation Milestone
-
-1. Run stock `ystyle/wand-agent` or a hardened fork inside the Fusion
-   Development Engine Linux VM.
-2. Add `FusionAgentDriver.ets` and a profile mode for the Fusion Development
-   Engine VM bridge at `ws://172.16.100.2:8765/ws`.
-3. Remove the app-side custom `hello` handshake and use only wand-agent controls:
-   `resize`, `cwd`, `fork`, and `ping`.
-4. Send terminal input and quick-key sequences as binary WebSocket frames.
-5. Make the `VM` button use Fusion Agent by default.
-6. Keep SSH as a fallback action in the connection panel.
-7. Verify with 256-color, truecolor, resize, Ctrl-C, Ctrl-D, Tab, and paste
-   smoke tests.
+- authentication success/failure;
+- 256-color and truecolor output;
+- resize, Ctrl-C, Ctrl-D, Tab, IME, and paste;
+- first-connect failure, backoff, half-open timeout, and foreground recovery;
+- multi-tab isolation and upload-relay generation handling;
+- background `taskKeeping` plus foreground screen-on behavior.

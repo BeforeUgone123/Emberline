@@ -6,6 +6,8 @@ const index = await readFile('entry/src/main/ets/pages/Index.ets', 'utf8');
 const ability = await readFile('entry/src/main/ets/entryability/EntryAbility.ets', 'utf8');
 const controller = await readFile('libghostty_ohos/src/main/ets/TerminalController.ets', 'utf8');
 const nativeBridge = await readFile('libghostty_ohos/src/main/cpp/napi_init.cpp', 'utf8');
+const terminalHeader = await readFile('libghostty_ohos/src/main/cpp/terminal/terminal.h', 'utf8');
+const terminalSource = await readFile('libghostty_ohos/src/main/cpp/terminal/terminal.cpp', 'utf8');
 
 const requestTerminalFocusBlock =
   surface.match(/private requestTerminalFocus\(\): void \{([\s\S]*?)\n  \}/)?.[1] ?? '';
@@ -21,8 +23,21 @@ const nativeSurfaceShowBlock = nativeBridge.match(/void OnSurfaceShow\(OH_Native
 const nativeSurfaceHideBlock = nativeBridge.match(/void OnSurfaceHide\(\)[\s\S]*?\n    void OnSurfaceDestroyed/)?.[0] ?? '';
 const nativeFocusBlock = nativeBridge.match(/void OnFocusEvent\(\)[\s\S]*?\n    void OnBlurEvent/)?.[0] ?? '';
 const nativeBlurBlock = nativeBridge.match(/void OnBlurEvent\(\)[\s\S]*?\n    bool DispatchKeyEvent/)?.[0] ?? '';
+const nativeCanAcceptImeBlock =
+  nativeBridge.match(/bool CanAcceptImeCallbacks\(\) const[\s\S]*?\n    }/)?.[0] ?? '';
+const nativeGetTextConfigBlock =
+  nativeBridge.match(/static void HandleImeGetTextConfig[\s\S]*?\n    static void HandleImeInsertText/)?.[0] ?? '';
+const nativeShowImeBlock =
+  nativeBridge.match(/void ShowImeLocked\(InputMethod_RequestKeyboardReason reason\)[\s\S]*?\n    void HideImeLocked/)?.[0] ?? '';
+const nativeNotifyImeBlock =
+  nativeBridge.match(/void NotifyImeStateLocked\(bool force = false\)[\s\S]*?\n    \/\/ Force the next NotifyImeStateLocked/)?.[0] ?? '';
+const nativeCaptureImeBlock =
+  nativeBridge.match(/void CaptureImeSurroundingText[\s\S]*?\n    void RefreshImeSurroundingText/)?.[0] ?? '';
+const nativeRefreshImeBlock =
+  nativeBridge.match(/void RefreshImeSurroundingText[\s\S]*?\n    void NotifyImeStateLocked/)?.[0] ?? '';
+const terminalImeSnapshotBlock =
+  terminalSource.match(/void Terminal::getImeSnapshot[\s\S]*?\n}\n\nstd::string Terminal::getLinkAt/)?.[0] ?? '';
 const indexTabBarBlock = index.match(/private buildTabBar\(\)[\s\S]*?\n  @Builder\n  private buildDrawerScrim/)?.[0] ?? '';
-const indexAccessoryBlock = index.match(/private buildAccessoryBar\(\)[\s\S]*?\n  private filteredThemes/)?.[0] ?? '';
 
 assert.match(surface, /XComponent\(\{\s*id: this\.surfaceId,\s*type: XComponentType\.SURFACE,\s*libraryname: 'libghostty_ohos'/s);
 assert.match(surface, /\.focusable\(true\)/);
@@ -60,10 +75,23 @@ assert.match(
   /@Prop @Watch\('onVisibleChanged'\) visible: boolean = true;/,
   'tab visibility must be a prop distinct from active so a translucent drawer does not throttle the visible terminal'
 );
+assert.match(surface, /const INACTIVE_TAB_TITLE_POLL_INTERVAL_MS: number = 120;/);
+assert.match(surface, /const APP_BACKGROUND_TITLE_POLL_INTERVAL_MS: number = 500;/);
+assert.match(surface, /@Prop @Watch\('onAppBackgroundedChanged'\) appBackgrounded: boolean = false;/);
 assert.match(
   surface,
-  /private onVisibleChanged\(\): void \{\s*this\.controller\.setPollingSuspended\(!this\.visible\);/s,
+  /private onVisibleChanged\(\): void \{\s*this\.syncPollingBudget\(\);/s,
   'tab visibility (not active) must gate the controller input polling for background tabs'
+);
+assert.match(
+  surface,
+  /private onAppBackgroundedChanged\(\): void \{\s*this\.syncPollingBudget\(\);\s*\}/s,
+  'the app lifecycle must switch hidden-title polling back to the low-power cadence'
+);
+assert.match(
+  surface,
+  /private syncPollingBudget\(\): void \{[\s\S]*?this\.appBackgrounded\s*\? APP_BACKGROUND_TITLE_POLL_INTERVAL_MS\s*: INACTIVE_TAB_TITLE_POLL_INTERVAL_MS;[\s\S]*?this\.controller\.setPollingSuspended\(!this\.visible, titlePollIntervalMs\);/s,
+  'inactive tabs stay responsive while the app is foregrounded but throttle when the whole app is backgrounded'
 );
 assert.match(
   surface,
@@ -107,6 +135,7 @@ assert.match(
   /visible: session\.id === this\.activeSessionId/,
   'polling/scrollbar gating must follow raw tab visibility, independent of drawer/tab-edit overlays'
 );
+assert.match(index, /appBackgrounded: this\.appInBackground/);
 assert.match(index, /foregroundFocusEpoch: this\.foregroundFocusEpoch/);
 assert.match(index, /private focusActiveTerminalSoon\(\): void \{/);
 assert.match(
@@ -125,57 +154,53 @@ assert.match(
   /ic_plus[\s\S]*?\.focusable\(false\)[\s\S]*?this\.addSession\(true\);/s,
   'new-tab button must not keep keyboard focus from the terminal'
 );
-for (const label of ['ic_keyboard', 'ic_link', 'ic_gear']) {
+for (const label of ['ic_link', 'ic_gear', 'ic_more']) {
   assert.match(
     indexTabBarBlock,
-    new RegExp(`${label}[\\s\\S]*?\\.focusable\\(false\\)`),
-    `${label} chrome button must not participate in arrow-key focus traversal`
+    new RegExp(`${label}[\\s\\S]*?\\.focusable\\(this\\.workbenchFocusZone > 0\\)`),
+    `${label} chrome button must join focus traversal only after the explicit focus shortcut leaves the terminal`
   );
 }
+assert.doesNotMatch(indexTabBarBlock, /ic_keyboard|ic_help/, 'quick-key and standalone help actions must stay out of persistent chrome');
+assert.match(index, /\.keyboardShortcut\(FunctionKey\.F6, \[\], \(\) => \{\s*this\.cycleWorkbenchFocus\(\);/s);
 assert.match(
   index,
-  /\.backgroundColor\(this\.active \? '#151A22' : '#00000000'\)[\s\S]*?\.focusable\(false\)\s*\.onClick/s,
+  /\.keyboardShortcut\('\.', \[ModifierKey\.CTRL, ModifierKey\.ALT\], \(\) => \{\s*this\.cycleWorkbenchFocus\(\);/s,
+  'compact keyboards without a function row must retain the explicit workbench focus route'
+);
+assert.match(index, /private cycleWorkbenchFocus\(\): void \{/);
+assert.match(index, /focusControl\.requestFocus\(componentId\);/);
+assert.match(index, /\.id\(`workbenchInspector-\$\{pane\}`\)[\s\S]*?\.focusable\(this\.workbenchFocusZone === 2\)/s);
+assert.match(index, /\.keyboardShortcut\(FunctionKey\.ESC, \[\], \(\) => \{/);
+assert.doesNotMatch(index, /accessoryVisible|buildAccessoryBar|sendAccessoryKey/);
+assert.match(
+  index,
+  /\.backgroundColor\(this\.active\s*\? this\.chrome\.capBg[\s\S]*?\.focusable\(false\)\s*\.onClick/s,
   'tab chips must be mouse/touch clickable without stealing arrow-key focus'
-);
-for (const label of ['Esc', 'Tab', '\\^C', '复制', '粘贴']) {
-  assert.match(
-    indexAccessoryBlock,
-    new RegExp(`Button\\('${label}'\\)[\\s\\S]*?\\.focusable\\(false\\)`),
-    `${label} accessory button must not take hardware arrow-key focus`
-  );
-}
-assert.match(
-  indexAccessoryBlock,
-  /Button\('复制'\)[\s\S]*?controller\.requestCopy\(\);/s,
-  'copy accessory button must reuse the surface copy listener'
-);
-assert.match(
-  indexAccessoryBlock,
-  /Button\('粘贴'\)[\s\S]*?controller\.requestPaste\(\);/s,
-  'paste accessory button must reuse the surface paste listener'
-);
-assert.match(
-  indexAccessoryBlock,
-  /Button\(key\)[\s\S]*?\.focusable\(false\)[\s\S]*?this\.sendAccessoryKey\(key\);/s,
-  'accessory arrow buttons must not capture the physical arrow keys after click'
 );
 
 assert.match(ability, /const FOREGROUND_FOCUS_EVENT: string = 'fusionTermForeground';/);
 assert.match(ability, /private wasBackgrounded: boolean = false;/);
 assert.match(
   ability,
-  /onBackground\(\): void \{\s*this\.wasBackgrounded = true;[\s\S]*?eventHub\.emit\(BACKGROUND_EVENT\);\s*\}/s,
+  /onBackground\(\): void \{[\s\S]*?this\.wasBackgrounded = true;[\s\S]*?eventHub\.emit\(BACKGROUND_EVENT\);\s*\}/s,
   'onBackground must record the flag AND broadcast so the page can notify for the active tab'
 );
 assert.match(
   ability,
-  /onForeground\(\): void \{\s*if \(!this\.wasBackgrounded\) \{\s*return;\s*\}\s*this\.wasBackgrounded = false;\s*this\.context\.eventHub\.emit\(FOREGROUND_FOCUS_EVENT\);\s*\}/s,
+  /onForeground\(\): void \{[\s\S]*?if \(!this\.wasBackgrounded\) \{\s*return;\s*\}\s*this\.wasBackgrounded = false;\s*this\.context\.eventHub\.emit\(FOREGROUND_FOCUS_EVENT\);\s*\}/s,
   'initial launch foreground must be ignored; only a real background->foreground transition should refocus IME'
 );
 
 assert.match(controller, /requestIme: \(surfaceId: string\) => void;/);
 assert.match(controller, /setImeActive: \(surfaceId: string, active: boolean\) => void;/);
 assert.match(controller, /requestIme\(\): void \{/);
+assert.match(controller, /private titlePollIntervalMs: number = 500;/);
+assert.match(
+  controller,
+  /setPollingSuspended\(suspended: boolean, titlePollIntervalMs: number = 500\): void/
+);
+assert.match(controller, /\}, this\.titlePollIntervalMs\) as number;/);
 assert.match(
   controller,
   /private nativeSurfaceId: string = '';/,
@@ -226,15 +251,34 @@ assert.match(nativeBridge, /static napi_value SetImeActive/);
 assert.match(nativeBridge, /\{"requestIme"/);
 assert.match(nativeBridge, /\{"setImeActive"/);
 assert.match(nativeBridge, /std::atomic<bool> m_imeActive \{ true \};/);
+assert.match(nativeBridge, /std::atomic<bool> m_xComponentFocused \{ false \};/);
+assert.match(nativeBridge, /constexpr auto IME_RENDER_REPORT_INTERVAL = std::chrono::milliseconds\(50\);/);
+assert.doesNotMatch(
+  nativeBridge,
+  /NATIVE_IME_API_ENABLED|Focused-stutter A\/B/,
+  'the temporary no-IME diagnostic switch must not ship after the InputMethod API is restored'
+);
 assert.match(nativeBridge, /static TerminalHost\* FindActiveImeHost\(InputMethod_TextEditorProxy\* proxy\)/);
 assert.ok(
   (nativeBridge.match(/FindActiveImeHost\(proxy\)/g) ?? []).length >= 13,
-  'IME text editor callbacks must be dropped while their terminal surface is inactive'
+  'IME input and query callbacks must be dropped while their terminal surface is inactive or unfocused'
+);
+assert.match(nativeBridge, /static TerminalHost\* FindConfigurableImeHost\(InputMethod_TextEditorProxy\* proxy\)/);
+assert.match(nativeGetTextConfigBlock, /FindConfigurableImeHost\(proxy\)/);
+assert.doesNotMatch(
+  nativeGetTextConfigBlock,
+  /FindActiveImeHost\(proxy\)/,
+  'attach-time text configuration must remain available before the restored XComponent receives focus'
 );
 assert.match(
   nativeSurfaceShowBlock,
   /shouldRestoreIme = m_wantsIme && m_imeActive\.load\(std::memory_order_relaxed\);/s,
   'foreground surface restore must still ignore hidden sessions when deciding whether to reclaim IME'
+);
+assert.match(
+  nativeSurfaceHideBlock,
+  /m_xComponentFocused\.store\(false, std::memory_order_relaxed\);/,
+  'a hidden XComponent must stop render-driven IME reporting even when its proxy stays attached'
 );
 assert.match(
   nativeSetImeActiveBlock,
@@ -252,7 +296,7 @@ assert.match(
   'hidden sessions may remember intent but must not show the keyboard'
 );
 assert.match(nativeBridge, /std::recursive_mutex m_surfaceMutex;/);
-assert.match(nativeBridge, /void RequestIme\(\)\s*\{\s*std::lock_guard<std::recursive_mutex> surfaceLock\(m_surfaceMutex\);\s*ShowImeLocked\(IME_REQUEST_REASON_OTHER\);\s*NotifyImeStateLocked\(\);/s);
+assert.match(nativeBridge, /void RequestIme\(\)\s*\{\s*std::lock_guard<std::recursive_mutex> surfaceLock\(m_surfaceMutex\);\s*ShowImeLocked\(IME_REQUEST_REASON_OTHER\);\s*NotifyImeStateLocked\(true\);/s);
 assert.match(nativeBridge, /ResetImeSessionLocked\(\);/);
 assert.match(nativeBridge, /OH_InputMethodController_Detach\(m_imeInputMethodProxy\);/);
 assert.doesNotMatch(
@@ -306,18 +350,86 @@ assert.doesNotMatch(
 );
 assert.match(
   nativeFocusBlock,
-  /ShowImeLocked\(IME_REQUEST_REASON_OTHER\);\s*NotifyImeStateLocked\(\);/s,
+  /m_xComponentFocused\.store\(true, std::memory_order_relaxed\);\s*ShowImeLocked\(IME_REQUEST_REASON_OTHER\);\s*NotifyImeStateLocked\(true\);/s,
   'native focus remains the single keyboard restore path after ArkUI focusControl.requestFocus'
 );
 assert.match(
+  nativeBlurBlock,
+  /m_xComponentFocused\.store\(false, std::memory_order_relaxed\);/,
+  'native blur must stop render-driven IME reporting before the next terminal frame'
+);
+assert.match(
   nativeTouchBlock,
-  /ShowImeLocked\(IME_REQUEST_REASON_TOUCH\);\s*NotifyImeStateLocked\(\);/s,
+  /ShowImeLocked\(IME_REQUEST_REASON_TOUCH\);\s*NotifyImeStateLocked\(true\);/s,
   'native touch is the reliable event path for libraryname XComponent taps'
 );
 assert.match(
   nativeMouseBlock,
-  /ShowImeLocked\(IME_REQUEST_REASON_MOUSE\);\s*NotifyImeStateLocked\(\);/s,
+  /ShowImeLocked\(IME_REQUEST_REASON_MOUSE\);\s*NotifyImeStateLocked\(true\);/s,
   'mouse clicks must restore native IME for trackpad and pointer users'
+);
+assert.match(
+  nativeNotifyImeBlock,
+  /if \(!m_imeActive\.load\(std::memory_order_relaxed\) \|\|\s*!m_xComponentFocused\.load\(std::memory_order_relaxed\) \|\|\s*m_terminal == nullptr \|\| !m_surfaceReady\) \{\s*return;\s*\}/s,
+  'render-driven IME snapshots must stop before touching terminal state when the surface is inactive or unfocused'
+);
+assert.match(
+  nativeNotifyImeBlock,
+  /if \(!force && m_lastImeReportAt\.time_since_epoch\(\)\.count\(\) != 0 &&\s*now - m_lastImeReportAt < IME_RENDER_REPORT_INTERVAL\) \{\s*return;\s*\}/s,
+  'render-driven IME reports must be rate-limited before capturing terminal text'
+);
+assert.match(
+  nativeCanAcceptImeBlock,
+  /CanConfigureIme\(\) &&\s*m_xComponentFocused\.load\(std::memory_order_relaxed\)/s,
+  'IME callbacks must be rejected after either ArkTS deactivation or real XComponent blur'
+);
+assert.match(
+  nativeBridge,
+  /bool CanConfigureIme\(\) const\s*\{\s*return m_imeActive\.load\(std::memory_order_relaxed\);\s*\}/s,
+  'attach-time configuration may run before focus but must still reject inactive terminal surfaces'
+);
+assert.match(
+  nativeBridge,
+  /m_terminal->drawFrame\(\);\s*NotifyImeStateLocked\(\);/s,
+  'the render loop must use the rate-limited IME report path rather than forcing Binder work every frame'
+);
+assert.match(
+  nativeBridge,
+  /void InvalidateImeReportCacheLocked\(\)\s*\{\s*m_lastImeReportAt = \{\};/s,
+  'focus/show/session hand-off must make the next IME report immediately eligible'
+);
+assert.match(nativeNotifyImeBlock, /RefreshImeSurroundingText\(surrounding, cursorIndex\);/);
+assert.match(
+  nativeCaptureImeBlock,
+  /std::lock_guard<std::mutex> lock\(m_imeSnapshotMutex\);[\s\S]*?text = m_cachedImeSurrounding;[\s\S]*?cursorIndex = m_cachedImeCursor;/s,
+  'IME Binder queries must copy the last renderer-owned snapshot under their own short lock'
+);
+assert.doesNotMatch(
+  nativeCaptureImeBlock,
+  /m_terminal|getImeSnapshot|ghostty_render_state_update|getScreenContent|getCursorPosition|std::vector<std::string>/,
+  'IME Binder queries must never enter terminal state or update Ghostty render state'
+);
+assert.match(nativeRefreshImeBlock, /m_terminal->getImeSnapshot\(line, cursorColumn\);/);
+assert.match(
+  nativeRefreshImeBlock,
+  /std::lock_guard<std::mutex> lock\(m_imeSnapshotMutex\);[\s\S]*?m_cachedImeSurrounding = text;[\s\S]*?m_cachedImeCursor = cursorIndex;/s,
+  'the render/report path must publish each cursor-row snapshot atomically for IME callbacks'
+);
+assert.doesNotMatch(
+  nativeRefreshImeBlock,
+  /OH_InputMethodProxy_NotifySelectionChange|OH_InputMethodProxy_NotifyCursorUpdate/,
+  'the snapshot lock must be released before outgoing Binder notifications can re-enter callbacks'
+);
+assert.match(nativeBridge, /mutable std::mutex m_imeSnapshotMutex;/);
+assert.match(nativeBridge, /std::u16string m_cachedImeSurrounding;/);
+assert.match(nativeBridge, /int32_t m_cachedImeCursor = 0;/);
+assert.match(terminalHeader, /void getImeSnapshot\(std::string& line, int& cursorCol\) const;/);
+assert.match(terminalImeSnapshotBlock, /ghostty_render_state_update\(m_renderState, m_vt\)/);
+assert.match(terminalImeSnapshotBlock, /row != cursorRow/);
+assert.doesNotMatch(
+  terminalImeSnapshotBlock,
+  /std::vector<std::string>|getScreenContent|getCursorPosition/,
+  'the terminal IME snapshot must capture only the cursor row under one state lock'
 );
 assert.match(nativeBridge, /bool ShouldLetImeHandlePrintableKey\(/);
 assert.match(nativeBridge, /bool IsTerminalLetterKey\(/);

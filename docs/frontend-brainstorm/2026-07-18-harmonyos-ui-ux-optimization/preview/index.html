@@ -1,0 +1,1609 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emberline - Harmony Native Workbench Preview</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --app: #050507;
+      --chrome: #080b10;
+      --terminal: #07090c;
+      --panel: #10141b;
+      --panel-2: #151a22;
+      --field: #0b0f14;
+      --border: #252d39;
+      --border-soft: #171d26;
+      --text: #d7ddea;
+      --muted: #8d97a8;
+      --faint: #667181;
+      --ember: #d08f53;
+      --ember-soft: #3d2a1d;
+      --success: #89b990;
+      --error: #d47c76;
+      --radius-sm: 4px;
+      --radius-md: 6px;
+      --radius-lg: 8px;
+      --titlebar-height: 48px;
+      --inspector-width: 400px;
+      --ease-out: cubic-bezier(.16, 1, .3, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+      letter-spacing: 0;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--app);
+      color: var(--text);
+      font-family: "HarmonyOS Sans SC", "HarmonyOS Sans", "Segoe UI", sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    [tabindex]:focus-visible {
+      outline: 2px solid var(--ember);
+      outline-offset: 2px;
+    }
+
+    .app-shell {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: var(--app);
+    }
+
+    .titlebar {
+      position: relative;
+      z-index: 20;
+      display: flex;
+      align-items: stretch;
+      width: 100%;
+      height: var(--titlebar-height);
+      background: var(--chrome);
+      border-bottom: 1px solid #121821;
+      user-select: none;
+    }
+
+    .tab-zone {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      padding-left: 8px;
+    }
+
+    .tabs {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    .tab {
+      position: relative;
+      display: flex;
+      width: 172px;
+      min-width: 108px;
+      max-width: 210px;
+      height: 34px;
+      flex: 0 1 172px;
+      align-items: center;
+      padding: 0;
+      overflow: hidden;
+      border: 1px solid transparent;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      cursor: default;
+      transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+    }
+
+    .tab-main {
+      display: flex;
+      min-width: 0;
+      height: 100%;
+      flex: 1;
+      align-items: center;
+      gap: 8px;
+      padding: 0 4px 2px 10px;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      cursor: default;
+    }
+
+    .tab:hover,
+    .tab:focus-visible {
+      background: #10151c;
+      color: var(--text);
+    }
+
+    .tab.active {
+      border-color: #202834;
+      background: var(--panel-2);
+      color: var(--text);
+    }
+
+    .tab-label {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      font-size: 12px;
+      line-height: 1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab-state {
+      width: 5px;
+      height: 5px;
+      flex: 0 0 5px;
+      border-radius: 50%;
+      background: var(--faint);
+    }
+
+    .tab[data-state="connected"] .tab-state {
+      background: var(--success);
+    }
+
+    .tab[data-state="pending"] .tab-state {
+      background: var(--ember);
+    }
+
+    .tab[data-state="failed"] .tab-state {
+      background: var(--error);
+    }
+
+    .tab-filament {
+      position: absolute;
+      right: 8px;
+      bottom: 0;
+      left: 8px;
+      height: 2px;
+      border-radius: 1px;
+      background: #343c47;
+      opacity: 0;
+      transition: background-color 180ms ease, opacity 180ms ease;
+    }
+
+    .tab.active .tab-filament,
+    .tab.unread .tab-filament {
+      opacity: 1;
+    }
+
+    .tab[data-state="connected"] .tab-filament,
+    .tab[data-state="pending"] .tab-filament {
+      background: var(--ember);
+    }
+
+    .tab[data-state="failed"] .tab-filament {
+      background: var(--error);
+    }
+
+    .tab-close {
+      display: grid;
+      width: 20px;
+      height: 20px;
+      flex: 0 0 20px;
+      place-items: center;
+      margin-right: 6px;
+      padding: 0;
+      border: 0;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+    }
+
+    .tab:hover .tab-close,
+    .tab:focus-within .tab-close,
+    .tab.active .tab-close {
+      opacity: 1;
+    }
+
+    .tab-close:hover {
+      background: #242b35;
+      color: var(--text);
+    }
+
+    .icon-button {
+      position: relative;
+      display: grid;
+      width: 34px;
+      height: 34px;
+      flex: 0 0 34px;
+      place-items: center;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .icon-button:hover {
+      background: #111720;
+      color: var(--text);
+    }
+
+    .icon-button.selected {
+      border-color: #28303b;
+      background: var(--panel-2);
+      color: var(--ember);
+    }
+
+    .icon-button svg,
+    .tab-close svg,
+    .menu-item svg,
+    .status-icon svg {
+      width: 16px;
+      height: 16px;
+      stroke-width: 1.7;
+    }
+
+    .new-tab {
+      margin: 0 4px;
+    }
+
+    [data-tooltip]::after {
+      position: absolute;
+      top: calc(100% + 8px);
+      left: 50%;
+      z-index: 60;
+      max-width: 180px;
+      padding: 5px 8px;
+      border: 1px solid #303846;
+      border-radius: var(--radius-sm);
+      background: #171c24;
+      color: var(--text);
+      box-shadow: 0 8px 20px rgb(0 0 0 / 28%);
+      content: attr(data-tooltip);
+      font-size: 11px;
+      line-height: 1.3;
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, -3px);
+      transition: opacity 100ms ease, transform 100ms ease;
+      white-space: nowrap;
+    }
+
+    [data-tooltip]:hover::after,
+    [data-tooltip]:focus-visible::after {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+
+    .app-actions,
+    .window-controls {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+    }
+
+    .app-actions {
+      gap: 4px;
+      padding: 0 8px;
+      border-left: 1px solid #151b24;
+    }
+
+    .window-controls {
+      width: 132px;
+      justify-content: stretch;
+      border-left: 1px solid #151b24;
+    }
+
+    .window-control {
+      display: grid;
+      height: 100%;
+      flex: 1;
+      place-items: center;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #9ba4b2;
+      cursor: default;
+      transition: background-color 120ms ease, color 120ms ease;
+    }
+
+    .window-control:hover {
+      background: #151a22;
+      color: var(--text);
+    }
+
+    .window-control.close:hover {
+      background: #a4433e;
+      color: #fff;
+    }
+
+    .window-control svg {
+      width: 14px;
+      height: 14px;
+      stroke-width: 1.5;
+    }
+
+    .workspace {
+      position: relative;
+      width: 100%;
+      height: calc(100% - var(--titlebar-height));
+      overflow: hidden;
+      background: var(--terminal);
+    }
+
+    .terminal {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      padding: 16px 20px 24px;
+      background: var(--terminal);
+      color: #cdd6f4;
+      font-family: "Maple Mono NF CN", "JetBrains Mono", "Cascadia Mono", monospace;
+      font-size: 13px;
+      line-height: 1.58;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .terminal-line {
+      min-height: 20px;
+    }
+
+    .term-muted { color: #6c7086; }
+    .term-cyan { color: #89dceb; }
+    .term-blue { color: #89b4fa; }
+    .term-green { color: #a6e3a1; }
+    .term-yellow { color: #f9e2af; }
+    .term-red { color: #f38ba8; }
+    .term-mauve { color: #cba6f7; }
+    .term-strong { color: #f2f4f8; font-weight: 600; }
+
+    .cursor-block {
+      display: inline-block;
+      width: 7px;
+      height: 15px;
+      margin-bottom: -2px;
+      background: #f5e0c3;
+    }
+
+    .inspector {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 15;
+      display: flex;
+      width: var(--inspector-width);
+      flex-direction: column;
+      border-left: 1px solid var(--border);
+      background: var(--panel);
+      box-shadow: -16px 0 30px rgb(0 0 0 / 18%);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(100%);
+      transition: transform 180ms var(--ease-out), opacity 140ms ease;
+    }
+
+    .app-shell.inspector-open .inspector {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+
+    .inspector-header {
+      display: flex;
+      height: 52px;
+      flex: 0 0 52px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px 0 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .inspector-title {
+      min-width: 0;
+    }
+
+    .inspector-title strong {
+      display: block;
+      overflow: hidden;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .inspector-title span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .inspector-tabs {
+      display: grid;
+      height: 44px;
+      flex: 0 0 44px;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2px;
+      padding: 5px 12px;
+      border-bottom: 1px solid var(--border);
+      background: #0d1117;
+    }
+
+    .inspector-tab {
+      position: relative;
+      border: 0;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      transition: background-color 120ms ease, color 120ms ease;
+    }
+
+    .inspector-tab:hover {
+      color: var(--text);
+    }
+
+    .inspector-tab.active {
+      background: var(--panel-2);
+      color: var(--text);
+    }
+
+    .inspector-tab.active::after {
+      position: absolute;
+      right: 12px;
+      bottom: 1px;
+      left: 12px;
+      height: 2px;
+      border-radius: 1px;
+      background: var(--ember);
+      content: "";
+    }
+
+    .inspector-content {
+      min-height: 0;
+      flex: 1;
+      overflow-y: auto;
+      scrollbar-color: #3b4452 transparent;
+      scrollbar-width: thin;
+    }
+
+    .pane {
+      display: none;
+      padding: 0 16px 24px;
+    }
+
+    .pane.active {
+      display: block;
+    }
+
+    .status-band {
+      margin: 0 -16px;
+      padding: 15px 16px 14px;
+      border-bottom: 1px solid var(--border);
+      background: #0d1117;
+    }
+
+    .status-heading {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-icon {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      flex: 0 0 28px;
+      place-items: center;
+      border: 1px solid #314035;
+      border-radius: var(--radius-md);
+      background: #142019;
+      color: var(--success);
+    }
+
+    .status-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .status-name {
+      overflow: hidden;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-detail {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .status-filament {
+      width: 22px;
+      height: 2px;
+      border-radius: 1px;
+      background: var(--ember);
+    }
+
+    .status-band.pending .status-icon {
+      border-color: #5b3c26;
+      background: #261a12;
+      color: var(--ember);
+    }
+
+    .status-band.pending .status-filament {
+      animation: breathe 900ms ease-in-out infinite alternate;
+    }
+
+    @keyframes breathe {
+      from { opacity: .35; }
+      to { opacity: .8; }
+    }
+
+    .section {
+      padding-top: 20px;
+    }
+
+    .section-title {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+
+    .setting-row {
+      display: flex;
+      min-height: 52px;
+      align-items: center;
+      gap: 14px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .setting-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .setting-label {
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .setting-meta {
+      margin-top: 3px;
+      overflow: hidden;
+      color: var(--faint);
+      font-size: 11px;
+      line-height: 1.35;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .field,
+    .select {
+      width: 176px;
+      height: 32px;
+      padding: 0 9px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--field);
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .field::placeholder {
+      color: var(--faint);
+    }
+
+    .segmented {
+      display: flex;
+      height: 32px;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--field);
+    }
+
+    .segment {
+      height: 26px;
+      padding: 0 9px;
+      border: 0;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .segment:hover {
+      color: var(--text);
+    }
+
+    .segment.active {
+      background: #222a35;
+      color: var(--text);
+    }
+
+    .stepper {
+      display: grid;
+      width: 108px;
+      height: 32px;
+      grid-template-columns: 32px 44px 32px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--field);
+    }
+
+    .stepper button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .stepper button:hover {
+      background: #1a202a;
+      color: var(--text);
+    }
+
+    .stepper output {
+      display: grid;
+      place-items: center;
+      border-right: 1px solid var(--border);
+      border-left: 1px solid var(--border);
+      color: var(--text);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-flex;
+      width: 38px;
+      height: 22px;
+      flex: 0 0 38px;
+      align-items: center;
+      padding: 2px;
+      border: 1px solid #38414d;
+      border-radius: 11px;
+      background: #1b222c;
+      cursor: pointer;
+      transition: background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .switch input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+    }
+
+    .switch-knob {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #9ba4b2;
+      transform: translateX(0);
+      transition: transform 140ms var(--ease-out), background-color 120ms ease;
+    }
+
+    .switch:has(input:checked) {
+      border-color: #855b38;
+      background: var(--ember-soft);
+    }
+
+    .switch input:checked + .switch-knob {
+      background: var(--ember);
+      transform: translateX(16px);
+    }
+
+    .switch:has(input:focus-visible) {
+      outline: 2px solid var(--ember);
+      outline-offset: 2px;
+    }
+
+    .disclosure {
+      width: 100%;
+      margin-top: 8px;
+      padding: 10px 0;
+      border: 0;
+      border-bottom: 1px solid var(--border-soft);
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .disclosure:hover {
+      color: var(--text);
+    }
+
+    .theme-list {
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .theme-row {
+      display: flex;
+      width: 100%;
+      min-height: 46px;
+      align-items: center;
+      gap: 10px;
+      padding: 0;
+      border: 0;
+      border-bottom: 1px solid var(--border-soft);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .theme-row:hover,
+    .theme-row.active {
+      color: var(--text);
+    }
+
+    .theme-row.active {
+      box-shadow: inset 2px 0 var(--ember);
+    }
+
+    .theme-name {
+      min-width: 0;
+      flex: 1;
+      padding-left: 8px;
+      overflow: hidden;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .swatches {
+      display: flex;
+      gap: 3px;
+      padding-right: 4px;
+    }
+
+    .swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+    }
+
+    .swatch.mocha-bg { background: #1e1e2e; }
+    .swatch.mocha-fg { background: #cdd6f4; }
+    .swatch.mocha-blue { background: #89b4fa; }
+    .swatch.mocha-green { background: #a6e3a1; }
+    .swatch.carbon-bg { background: #161616; }
+    .swatch.carbon-fg { background: #f2f4f8; }
+    .swatch.carbon-blue { background: #78a9ff; }
+    .swatch.carbon-green { background: #42be65; }
+    .swatch.rose-bg { background: #191724; }
+    .swatch.rose-fg { background: #e0def4; }
+    .swatch.rose-blue { background: #9ccfd8; }
+    .swatch.rose-yellow { background: #f6c177; }
+
+    .terminal-capability {
+      color: var(--success);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+    }
+
+    .range-wrap {
+      display: flex;
+      width: 176px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    input[type="range"] {
+      min-width: 0;
+      flex: 1;
+      accent-color: var(--ember);
+    }
+
+    .range-value {
+      width: 34px;
+      color: var(--muted);
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .inspector-footer {
+      display: flex;
+      min-height: 56px;
+      flex: 0 0 auto;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 10px 16px;
+      border-top: 1px solid var(--border);
+      background: #0d1117;
+    }
+
+    .button {
+      height: 34px;
+      padding: 0 13px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 120ms ease, background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .button:hover {
+      border-color: #3a4553;
+      background: #1a2029;
+    }
+
+    .button.primary {
+      border-color: #c1844d;
+      background: var(--ember);
+      color: #17100a;
+      font-weight: 600;
+    }
+
+    .button.primary:hover {
+      background: #dda061;
+    }
+
+    .button:active {
+      opacity: .82;
+    }
+
+    .button:disabled {
+      cursor: not-allowed;
+      opacity: .48;
+    }
+
+    .more-menu {
+      position: absolute;
+      top: 42px;
+      right: 136px;
+      z-index: 50;
+      width: 190px;
+      padding: 5px;
+      border: 1px solid #303846;
+      border-radius: var(--radius-lg);
+      background: #151a22;
+      box-shadow: 0 14px 34px rgb(0 0 0 / 38%);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-5px);
+      transition: opacity 120ms ease, transform 140ms var(--ease-out);
+    }
+
+    .more-menu.open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+    }
+
+    .menu-item {
+      display: flex;
+      width: 100%;
+      height: 34px;
+      align-items: center;
+      gap: 10px;
+      padding: 0 9px;
+      border: 0;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--text);
+      font-size: 12px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .menu-item:hover {
+      background: #222933;
+    }
+
+    .menu-separator {
+      height: 1px;
+      margin: 5px 4px;
+      background: var(--border);
+    }
+
+    .toast {
+      position: absolute;
+      bottom: 18px;
+      left: 18px;
+      z-index: 70;
+      max-width: min(360px, calc(100% - 36px));
+      padding: 9px 12px;
+      border: 1px solid #34404d;
+      border-radius: var(--radius-md);
+      background: #171c24;
+      color: var(--text);
+      box-shadow: 0 10px 26px rgb(0 0 0 / 34%);
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(6px);
+      transition: opacity 120ms ease, transform 160ms var(--ease-out);
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 899px) {
+      :root {
+        --inspector-width: 352px;
+      }
+
+      .tab {
+        width: 142px;
+        flex-basis: 142px;
+      }
+
+      .app-actions {
+        gap: 1px;
+        padding: 0 5px;
+      }
+
+      .window-controls {
+        width: 120px;
+      }
+
+      .field,
+      .select,
+      .range-wrap {
+        width: 156px;
+      }
+    }
+
+    @media (max-width: 640px) {
+      :root {
+        --inspector-width: 100%;
+      }
+
+      .window-controls {
+        display: none;
+      }
+
+      .more-menu {
+        right: 8px;
+      }
+
+      .setting-row {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 8px;
+        padding: 11px 0;
+      }
+
+      .field,
+      .select,
+      .range-wrap {
+        width: 100%;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell" id="appShell">
+    <header class="titlebar">
+      <div class="tab-zone">
+        <div class="tabs" id="tabs" role="tablist" aria-label="终端会话">
+          <div class="tab active" data-session="vm" data-state="connected">
+            <button class="tab-main" type="button" role="tab" aria-selected="true">
+              <span class="tab-state" aria-hidden="true"></span>
+              <span class="tab-label">vm · ~/emberline</span>
+            </button>
+            <span class="tab-filament" aria-hidden="true"></span>
+            <button class="tab-close" type="button" aria-label="关闭 vm 会话">
+              <i data-lucide="x" aria-hidden="true"></i>
+            </button>
+          </div>
+          <div class="tab" data-session="build" data-state="pending">
+            <button class="tab-main" type="button" role="tab" aria-selected="false">
+              <span class="tab-state" aria-hidden="true"></span>
+              <span class="tab-label">build · hvigor</span>
+            </button>
+            <span class="tab-filament" aria-hidden="true"></span>
+            <button class="tab-close" type="button" aria-label="关闭 build 会话">
+              <i data-lucide="x" aria-hidden="true"></i>
+            </button>
+          </div>
+          <div class="tab unread" data-session="logs" data-state="connected">
+            <button class="tab-main" type="button" role="tab" aria-selected="false">
+              <span class="tab-state" aria-hidden="true"></span>
+              <span class="tab-label">agent logs · 完成</span>
+            </button>
+            <span class="tab-filament" aria-hidden="true"></span>
+            <button class="tab-close" type="button" aria-label="关闭日志会话">
+              <i data-lucide="x" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+        <button class="icon-button new-tab" id="newTabButton" type="button"
+                aria-label="新建终端会话" data-tooltip="新建会话">
+          <i data-lucide="plus" aria-hidden="true"></i>
+        </button>
+      </div>
+
+      <nav class="app-actions" aria-label="工作区操作">
+        <button class="icon-button selected" id="connectionButton" type="button"
+                aria-label="连接" data-tooltip="连接">
+          <i data-lucide="link-2" aria-hidden="true"></i>
+        </button>
+        <button class="icon-button" id="settingsButton" type="button"
+                aria-label="设置" data-tooltip="设置">
+          <i data-lucide="settings" aria-hidden="true"></i>
+        </button>
+        <button class="icon-button" id="moreButton" type="button"
+                aria-label="更多" data-tooltip="更多" aria-haspopup="menu" aria-expanded="false">
+          <i data-lucide="ellipsis" aria-hidden="true"></i>
+        </button>
+      </nav>
+
+      <div class="window-controls" role="group" aria-label="窗口控制">
+        <button class="window-control" type="button" aria-label="最小化">
+          <i data-lucide="minus" aria-hidden="true"></i>
+        </button>
+        <button class="window-control" type="button" aria-label="最大化">
+          <i data-lucide="square" aria-hidden="true"></i>
+        </button>
+        <button class="window-control close" type="button" aria-label="关闭窗口">
+          <i data-lucide="x" aria-hidden="true"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <div class="terminal" id="terminal" tabindex="0" role="application"
+           aria-label="Fusion Development Engine 终端">
+        <div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~/emberline</span>$ git status --short --branch</div>
+        <div class="terminal-line"><span class="term-muted">## dev</span></div>
+        <div class="terminal-line"><span class="term-yellow"> M</span> entry/src/main/ets/entryability/EntryAbility.ets</div>
+        <div class="terminal-line"><span class="term-yellow"> M</span> build-profile.json5</div>
+        <div class="terminal-line"></div>
+        <div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~/emberline</span>$ tmux attach -t long-build</div>
+        <div class="terminal-line"><span class="term-cyan">[emberline]</span> compiling entry@default · debug</div>
+        <div class="terminal-line"><span class="term-muted">[1/4]</span> ArkTS sources <span class="term-green">done</span></div>
+        <div class="terminal-line"><span class="term-muted">[2/4]</span> native terminal driver <span class="term-green">done</span></div>
+        <div class="terminal-line"><span class="term-muted">[3/4]</span> packaging HAP <span class="term-green">done</span></div>
+        <div class="terminal-line"><span class="term-muted">[4/4]</span> signing <span class="term-green">done</span></div>
+        <div class="terminal-line"></div>
+        <div class="terminal-line"><span class="term-strong">BUILD SUCCESSFUL</span> <span class="term-muted">in 3.8s</span></div>
+        <div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~/emberline</span>$ <span class="cursor-block" aria-hidden="true"></span></div>
+      </div>
+
+      <aside class="inspector" id="inspector" aria-label="工作区检查器">
+        <div class="inspector-header">
+          <div class="inspector-title">
+            <strong id="inspectorTitle">连接</strong>
+            <span id="inspectorSubtitle">当前会话 · Fusion Agent</span>
+          </div>
+          <button class="icon-button" id="closeInspector" type="button"
+                  aria-label="关闭检查器" data-tooltip="关闭">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+
+        <div class="inspector-tabs" role="tablist" aria-label="设置分类">
+          <button class="inspector-tab" type="button" role="tab" data-pane="terminal-pane">终端</button>
+          <button class="inspector-tab" type="button" role="tab" data-pane="appearance-pane">外观</button>
+          <button class="inspector-tab active" type="button" role="tab" data-pane="connection-pane">连接</button>
+        </div>
+
+        <div class="inspector-content">
+          <section class="pane" id="terminal-pane" aria-label="终端设置">
+            <div class="section">
+              <h2 class="section-title">文字</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">终端字号</div>
+                  <div class="setting-meta">font-size</div>
+                </div>
+                <div class="stepper" role="group" aria-label="终端字号">
+                  <button type="button" id="fontMinus" aria-label="减小字号">−</button>
+                  <output id="fontSizeValue">13</output>
+                  <button type="button" id="fontPlus" aria-label="增大字号">+</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">字体家族</div>
+                  <div class="setting-meta">font-family</div>
+                </div>
+                <select class="select" aria-label="字体家族">
+                  <option>Maple Mono</option>
+                  <option>JetBrains Mono</option>
+                  <option>Cascadia Mono</option>
+                  <option>更纱黑体</option>
+                  <option>系统字体</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="section">
+              <h2 class="section-title">光标</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">光标样式</div>
+                  <div class="setting-meta">cursor-style</div>
+                </div>
+                <div class="segmented" role="group" aria-label="光标样式">
+                  <button class="segment active" type="button">竖线</button>
+                  <button class="segment" type="button">方块</button>
+                  <button class="segment" type="button">下划线</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">光标闪烁</div>
+                  <div class="setting-meta">cursor-style-blink</div>
+                </div>
+                <label class="switch" aria-label="光标闪烁">
+                  <input type="checkbox" checked>
+                  <span class="switch-knob"></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="pane" id="appearance-pane" aria-label="外观设置">
+            <div class="section">
+              <h2 class="section-title">主题</h2>
+              <input class="field" id="themeSearch" type="search" placeholder="搜索主题" aria-label="搜索主题">
+              <div class="theme-list" id="themeList">
+                <button class="theme-row active" type="button" data-theme="mocha">
+                  <span class="theme-name">Catppuccin Mocha</span>
+                  <span class="swatches" aria-hidden="true">
+                    <span class="swatch mocha-bg"></span>
+                    <span class="swatch mocha-fg"></span>
+                    <span class="swatch mocha-blue"></span>
+                    <span class="swatch mocha-green"></span>
+                  </span>
+                </button>
+                <button class="theme-row" type="button" data-theme="carbonfox">
+                  <span class="theme-name">Carbonfox</span>
+                  <span class="swatches" aria-hidden="true">
+                    <span class="swatch carbon-bg"></span>
+                    <span class="swatch carbon-fg"></span>
+                    <span class="swatch carbon-blue"></span>
+                    <span class="swatch carbon-green"></span>
+                  </span>
+                </button>
+                <button class="theme-row" type="button" data-theme="rosepine">
+                  <span class="theme-name">Rosé Pine</span>
+                  <span class="swatches" aria-hidden="true">
+                    <span class="swatch rose-bg"></span>
+                    <span class="swatch rose-fg"></span>
+                    <span class="swatch rose-blue"></span>
+                    <span class="swatch rose-yellow"></span>
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div class="section">
+              <h2 class="section-title">背景</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">终端遮罩</div>
+                  <div class="setting-meta">background-opacity</div>
+                </div>
+                <div class="range-wrap">
+                  <input id="opacityRange" type="range" min="40" max="100" value="100" aria-label="终端遮罩">
+                  <output class="range-value" id="opacityValue">100%</output>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">背景图片</div>
+                  <div class="setting-meta">background-image</div>
+                </div>
+                <button class="button" type="button" data-action="preview-only">选择文件</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="pane active" id="connection-pane" aria-label="连接设置">
+            <div class="status-band" id="statusBand">
+              <div class="status-heading">
+                <div class="status-icon" aria-hidden="true">
+                  <i data-lucide="square-terminal"></i>
+                </div>
+                <div class="status-copy">
+                  <div class="status-name">Fusion Development Engine</div>
+                  <div class="status-detail">
+                    <span class="status-filament" aria-hidden="true"></span>
+                    <span id="connectionStatus">已连接 · 18 ms</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h2 class="section-title">Fusion Agent</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">主机</div>
+                  <div class="setting-meta">WebSocket PTY bridge</div>
+                </div>
+                <input class="field" type="text" value="172.16.100.2" aria-label="Fusion Agent 主机">
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">端口</div>
+                  <div class="setting-meta">/ws</div>
+                </div>
+                <input class="field" type="text" value="8765" inputmode="numeric" aria-label="Fusion Agent 端口">
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">令牌</div>
+                  <div class="setting-meta">仅保存在当前配置</div>
+                </div>
+                <input class="field" type="password" value="harmonyterm" aria-label="Fusion Agent 令牌">
+              </div>
+            </div>
+
+            <div class="section">
+              <h2 class="section-title">终端环境</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">TERM</div>
+                  <div class="setting-meta">xterm-256color</div>
+                </div>
+                <span class="terminal-capability">truecolor</span>
+              </div>
+              <button class="disclosure" type="button" id="advancedDisclosure">SSH 与本地备用 ›</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="inspector-footer">
+          <button class="button" type="button" id="disconnectButton">断开</button>
+          <button class="button primary" type="button" id="reconnectButton">重新连接</button>
+        </div>
+      </aside>
+    </main>
+
+    <div class="more-menu" id="moreMenu" role="menu" aria-label="更多操作">
+      <button class="menu-item" type="button" role="menuitem" data-action="new-window">
+        <i data-lucide="panels-top-left" aria-hidden="true"></i>
+        <span>新建窗口</span>
+      </button>
+      <button class="menu-item" type="button" role="menuitem" data-action="diagnostics">
+        <i data-lucide="activity" aria-hidden="true"></i>
+        <span>帮助与诊断</span>
+      </button>
+      <div class="menu-separator"></div>
+      <button class="menu-item" type="button" role="menuitem" data-action="about">
+        <i data-lucide="info" aria-hidden="true"></i>
+        <span>关于 Emberline</span>
+      </button>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.js"></script>
+  <script>
+    const appShell = document.getElementById('appShell');
+    const terminal = document.getElementById('terminal');
+    const tabs = document.getElementById('tabs');
+    const connectionButton = document.getElementById('connectionButton');
+    const settingsButton = document.getElementById('settingsButton');
+    const moreButton = document.getElementById('moreButton');
+    const moreMenu = document.getElementById('moreMenu');
+    const toast = document.getElementById('toast');
+    const inspectorTitle = document.getElementById('inspectorTitle');
+    const inspectorSubtitle = document.getElementById('inspectorSubtitle');
+    const statusBand = document.getElementById('statusBand');
+    const connectionStatus = document.getElementById('connectionStatus');
+    const reconnectButton = document.getElementById('reconnectButton');
+    let toastTimer = 0;
+    let reconnectTimer = 0;
+    let nextSession = 1;
+
+    const sessionBodies = {
+      vm: terminal.innerHTML,
+      build: [
+        '<div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~/emberline</span>$ ./hvigorw assembleHap</div>',
+        '<div class="terminal-line"><span class="term-cyan">hvigor</span> resolving ArkTS modules…</div>',
+        '<div class="terminal-line"><span class="term-muted">entry@default</span> CompileArkTS <span class="term-yellow">running</span></div>',
+        '<div class="terminal-line"><span class="term-muted">libghostty_ohos</span> CmakeBuild <span class="term-green">cached</span></div>',
+        '<div class="terminal-line"></div>',
+        '<div class="terminal-line"><span class="term-muted">tmux: long-build · pane 1/2</span></div>',
+        '<div class="terminal-line"><span class="cursor-block" aria-hidden="true"></span></div>'
+      ].join(''),
+      logs: [
+        '<div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~</span>$ journalctl -u wand-agent -n 8</div>',
+        '<div class="terminal-line"><span class="term-muted">14:26:02</span> client connected <span class="term-cyan">172.16.100.1</span></div>',
+        '<div class="terminal-line"><span class="term-muted">14:26:02</span> PTY created <span class="term-yellow">xterm-256color</span></div>',
+        '<div class="terminal-line"><span class="term-muted">14:31:48</span> resize rows=44 cols=158</div>',
+        '<div class="terminal-line"><span class="term-muted">14:34:10</span> task complete exit=0</div>',
+        '<div class="terminal-line"></div>',
+        '<div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~</span>$ <span class="cursor-block" aria-hidden="true"></span></div>'
+      ].join('')
+    };
+
+    function refreshIcons() {
+      if (window.lucide) {
+        window.lucide.createIcons({ attrs: { 'aria-hidden': 'true' } });
+      }
+    }
+
+    function showToast(message) {
+      window.clearTimeout(toastTimer);
+      toast.textContent = message;
+      toast.classList.add('show');
+      toastTimer = window.setTimeout(() => toast.classList.remove('show'), 1800);
+    }
+
+    function closeMoreMenu() {
+      moreMenu.classList.remove('open');
+      moreButton.setAttribute('aria-expanded', 'false');
+    }
+
+    function selectPane(paneId) {
+      document.querySelectorAll('.inspector-tab').forEach((button) => {
+        const active = button.dataset.pane === paneId;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+      });
+      document.querySelectorAll('.pane').forEach((pane) => {
+        pane.classList.toggle('active', pane.id === paneId);
+      });
+      const labels = {
+        'terminal-pane': ['终端', '当前会话 · 字体与输入'],
+        'appearance-pane': ['外观', '全局 · 主题与背景'],
+        'connection-pane': ['连接', '当前会话 · Fusion Agent']
+      };
+      inspectorTitle.textContent = labels[paneId][0];
+      inspectorSubtitle.textContent = labels[paneId][1];
+      connectionButton.classList.toggle('selected', paneId === 'connection-pane');
+      settingsButton.classList.toggle('selected', paneId !== 'connection-pane');
+      appShell.classList.add('inspector-open');
+      closeMoreMenu();
+    }
+
+    function activateTab(tab) {
+      document.querySelectorAll('.tab').forEach((candidate) => {
+        const active = candidate === tab;
+        candidate.classList.toggle('active', active);
+        candidate.querySelector('.tab-main').setAttribute('aria-selected', String(active));
+      });
+      tab.classList.remove('unread');
+      terminal.innerHTML = sessionBodies[tab.dataset.session] || sessionBodies.vm;
+      terminal.focus({ preventScroll: true });
+    }
+
+    function closeTab(tab) {
+      const wasActive = tab.classList.contains('active');
+      tab.remove();
+      if (wasActive) {
+        const next = tabs.querySelector('.tab');
+        if (next) {
+          activateTab(next);
+        }
+      }
+    }
+
+    tabs.addEventListener('click', (event) => {
+      const close = event.target.closest('.tab-close');
+      const tab = event.target.closest('.tab');
+      if (!tab) return;
+      if (close) {
+        event.stopPropagation();
+        closeTab(tab);
+        return;
+      }
+      activateTab(tab);
+    });
+
+    document.getElementById('newTabButton').addEventListener('click', () => {
+      const id = `new-${nextSession++}`;
+      sessionBodies[id] = [
+        '<div class="terminal-line"><span class="term-green">ember@fusion-vm</span>:<span class="term-blue">~</span>$ <span class="cursor-block" aria-hidden="true"></span></div>'
+      ].join('');
+      const tab = document.createElement('div');
+      tab.className = 'tab';
+      tab.dataset.session = id;
+      tab.dataset.state = 'connected';
+      tab.innerHTML = '<button class="tab-main" type="button" role="tab" aria-selected="false">' +
+        '<span class="tab-state" aria-hidden="true"></span>' +
+        `<span class="tab-label">session ${nextSession}</span></button>` +
+        '<span class="tab-filament" aria-hidden="true"></span>' +
+        '<button class="tab-close" type="button" aria-label="关闭会话"><i data-lucide="x"></i></button>';
+      tabs.appendChild(tab);
+      refreshIcons();
+      activateTab(tab);
+      tab.scrollIntoView({ block: 'nearest', inline: 'end' });
+    });
+
+    connectionButton.addEventListener('click', () => selectPane('connection-pane'));
+    settingsButton.addEventListener('click', () => selectPane('terminal-pane'));
+    document.getElementById('closeInspector').addEventListener('click', () => {
+      appShell.classList.remove('inspector-open');
+      connectionButton.classList.remove('selected');
+      settingsButton.classList.remove('selected');
+      terminal.focus({ preventScroll: true });
+    });
+
+    document.querySelectorAll('.inspector-tab').forEach((button) => {
+      button.addEventListener('click', () => selectPane(button.dataset.pane));
+    });
+
+    moreButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const open = !moreMenu.classList.contains('open');
+      closeMoreMenu();
+      moreMenu.classList.toggle('open', open);
+      moreButton.setAttribute('aria-expanded', String(open));
+    });
+
+    document.addEventListener('click', (event) => {
+      if (!event.target.closest('#moreMenu') && !event.target.closest('#moreButton')) {
+        closeMoreMenu();
+      }
+    });
+
+    document.querySelectorAll('[data-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const messages = {
+          'new-window': '已请求新建 Emberline 窗口',
+          diagnostics: '帮助与诊断将在独立页面中打开',
+          about: 'Emberline Dev · Harmony Native Workbench',
+          'preview-only': '视觉预览：生产版将调用系统文件选择器'
+        };
+        showToast(messages[button.dataset.action]);
+        closeMoreMenu();
+      });
+    });
+
+    document.querySelectorAll('.segmented').forEach((group) => {
+      group.addEventListener('click', (event) => {
+        const segment = event.target.closest('.segment');
+        if (!segment) return;
+        group.querySelectorAll('.segment').forEach((item) => item.classList.toggle('active', item === segment));
+      });
+    });
+
+    let fontSize = 13;
+    function setFontSize(next) {
+      fontSize = Math.max(10, Math.min(26, next));
+      document.getElementById('fontSizeValue').textContent = String(fontSize);
+      terminal.style.fontSize = `${fontSize}px`;
+    }
+    document.getElementById('fontMinus').addEventListener('click', () => setFontSize(fontSize - 1));
+    document.getElementById('fontPlus').addEventListener('click', () => setFontSize(fontSize + 1));
+
+    document.getElementById('opacityRange').addEventListener('input', (event) => {
+      const value = Number(event.target.value);
+      document.getElementById('opacityValue').textContent = `${value}%`;
+      terminal.style.opacity = String(Math.max(.82, value / 100));
+    });
+
+    document.getElementById('themeSearch').addEventListener('input', (event) => {
+      const query = event.target.value.trim().toLowerCase();
+      document.querySelectorAll('.theme-row').forEach((row) => {
+        row.hidden = !row.textContent.toLowerCase().includes(query);
+      });
+    });
+
+    document.querySelectorAll('.theme-row').forEach((row) => {
+      row.addEventListener('click', () => {
+        document.querySelectorAll('.theme-row').forEach((item) => item.classList.toggle('active', item === row));
+        const palettes = {
+          mocha: ['#07090c', '#cdd6f4'],
+          carbonfox: ['#090909', '#f2f4f8'],
+          rosepine: ['#0d0b12', '#e0def4']
+        };
+        const palette = palettes[row.dataset.theme];
+        terminal.style.backgroundColor = palette[0];
+        terminal.style.color = palette[1];
+      });
+    });
+
+    reconnectButton.addEventListener('click', () => {
+      window.clearTimeout(reconnectTimer);
+      statusBand.classList.add('pending');
+      connectionStatus.textContent = '正在连接 · ws://172.16.100.2:8765/ws';
+      reconnectButton.disabled = true;
+      reconnectButton.textContent = '连接中';
+      reconnectTimer = window.setTimeout(() => {
+        statusBand.classList.remove('pending');
+        connectionStatus.textContent = '已连接 · 17 ms';
+        reconnectButton.disabled = false;
+        reconnectButton.textContent = '重新连接';
+        showToast('Fusion Agent 已连接');
+      }, 1200);
+    });
+
+    document.getElementById('disconnectButton').addEventListener('click', () => {
+      statusBand.classList.remove('pending');
+      connectionStatus.textContent = '已断开 · 会话保留';
+      showToast('连接已断开');
+    });
+
+    document.getElementById('advancedDisclosure').addEventListener('click', () => {
+      showToast('SSH 与本地备用将在此处展开');
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      if (moreMenu.classList.contains('open')) {
+        closeMoreMenu();
+        moreButton.focus();
+      } else if (appShell.classList.contains('inspector-open')) {
+        appShell.classList.remove('inspector-open');
+        connectionButton.classList.remove('selected');
+        settingsButton.classList.remove('selected');
+        terminal.focus({ preventScroll: true });
+      }
+    });
+
+    const previewPane = new URLSearchParams(window.location.search).get('inspector');
+    if (previewPane === 'terminal' || previewPane === 'appearance' || previewPane === 'connection') {
+      selectPane(`${previewPane}-pane`);
+    }
+    refreshIcons();
+  </script>
+</body>
+</html>

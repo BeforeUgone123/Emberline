@@ -1,5 +1,11 @@
 # Harmony Advanced Terminal Design
 
+> **Historical baseline (2026-07-02).** The architecture boundary remains
+> useful, but the SSH-first actions, quick-key bar, single-controller UI, and
+> milestone scope below no longer describe the current app. Use root
+> `AGENTS.md`, `docs/handoff.md`, `docs/fusion-agent-protocol.md`, and the
+> 2026-07-18 Direction A documents for current decisions.
+
 ## Goal
 
 Build a HarmonyOS Stage application that turns the existing `libghostty-ohos`

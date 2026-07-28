@@ -65,6 +65,9 @@ public:
 
     std::string getScreenContent() const;
     void getCursorPosition(int& row, int& col) const;
+    // IME surrounding text needs only the caret row, captured with the cursor
+    // position under one terminal-state lock.
+    void getImeSnapshot(std::string& line, int& cursorCol) const;
     std::string getLinkAt(int row, int col) const;
 
     // Returns and clears the most recent OSC 0/2 window title (empty when

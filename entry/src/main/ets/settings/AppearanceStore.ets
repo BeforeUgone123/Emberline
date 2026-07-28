@@ -6,7 +6,13 @@ import { common } from '@kit.AbilityKit';
 export interface AppearanceSettings {
   fontSize: number;
   fontFamily: string;
-  themeName: string;
+  // Ghostty-style light/dark pairing: one theme per system color mode. The
+  // legacy single 'themeName' key migrates into the dark slot on first load.
+  darkThemeName: string;
+  lightThemeName: string;
+  // 'system' follows the OS color mode; 'dark' / 'light' pin the app to one
+  // slot regardless of the OS setting.
+  colorModeOverride: string;
   customFontPath: string;
   backgroundImagePath: string;
   backgroundOpacity: number;
@@ -21,7 +27,9 @@ export interface AppearanceSettings {
 export const DEFAULT_APPEARANCE: AppearanceSettings = {
   fontSize: 13,
   fontFamily: 'FusionTerm Maple Mono',
-  themeName: 'Catppuccin_Mocha',
+  darkThemeName: 'Catppuccin_Mocha',
+  lightThemeName: 'Catppuccin_Latte',
+  colorModeOverride: 'system',
   customFontPath: '',
   backgroundImagePath: '',
   backgroundOpacity: 0.91,
@@ -41,7 +49,12 @@ export class AppearanceStore {
     const loaded: AppearanceSettings = {
       fontSize: await this.readNumber('fontSize', DEFAULT_APPEARANCE.fontSize),
       fontFamily: await this.readString('fontFamily', DEFAULT_APPEARANCE.fontFamily),
-      themeName: await this.readString('themeName', DEFAULT_APPEARANCE.themeName),
+      // Migration: an existing single-theme install keeps its theme as the
+      // dark-mode choice; the light slot starts at the default pairing.
+      darkThemeName: await this.readString('darkThemeName',
+        await this.readString('themeName', DEFAULT_APPEARANCE.darkThemeName)),
+      lightThemeName: await this.readString('lightThemeName', DEFAULT_APPEARANCE.lightThemeName),
+      colorModeOverride: await this.readString('colorModeOverride', DEFAULT_APPEARANCE.colorModeOverride),
       customFontPath: await this.readString('customFontPath', DEFAULT_APPEARANCE.customFontPath),
       backgroundImagePath: await this.readString('backgroundImagePath', DEFAULT_APPEARANCE.backgroundImagePath),
       backgroundOpacity: await this.readNumber('backgroundOpacity', DEFAULT_APPEARANCE.backgroundOpacity),
@@ -59,7 +72,9 @@ export class AppearanceStore {
     }
     await this.prefs.put('fontSize', settings.fontSize);
     await this.prefs.put('fontFamily', settings.fontFamily);
-    await this.prefs.put('themeName', settings.themeName);
+    await this.prefs.put('darkThemeName', settings.darkThemeName);
+    await this.prefs.put('lightThemeName', settings.lightThemeName);
+    await this.prefs.put('colorModeOverride', settings.colorModeOverride);
     await this.prefs.put('customFontPath', settings.customFontPath);
     await this.prefs.put('backgroundImagePath', settings.backgroundImagePath);
     await this.prefs.put('backgroundOpacity', settings.backgroundOpacity);

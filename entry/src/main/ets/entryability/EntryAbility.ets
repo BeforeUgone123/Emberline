@@ -1,7 +1,8 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { SYS_DARK_KEY } from '../theme/ChromeTheme';
 
 const DOMAIN = 0x0001;
 const TAG = 'FusionTermAbility';
@@ -12,6 +13,9 @@ const WINDOW_CHROME_HEIGHT: number = 48;
 // re-fronted) with this Want parameter; the page reads the matching AppStorage
 // key in aboutToAppear to claim the parked session instead of adding a blank tab.
 const HANDOFF_TOKEN_KEY: string = 'emberHandoffToken';
+// Page -> ability: the adaptive chrome turned light/dark, restyle the system
+// window decor buttons to match (they are not part of the ArkTS tree).
+const CHROME_MODE_EVENT: string = 'fusionTermChromeMode';
 
 interface WindowChromeController {
   setWindowDecorVisible(visible: boolean): void;
@@ -25,6 +29,8 @@ interface WindowDecorButtonStyle {
 
 export default class EntryAbility extends UIAbility {
   private wasBackgrounded: boolean = false;
+  private windowForeground: boolean = false;
+  private mainWindow: window.Window | null = null;
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     this.captureHandoffToken(want);
@@ -32,6 +38,38 @@ export default class EntryAbility extends UIAbility {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'Failed to set color mode: %{public}s', JSON.stringify(err));
+    }
+    this.publishSystemColorMode(this.context.config.colorMode);
+    this.context.eventHub.on(CHROME_MODE_EVENT, (isLight: boolean): void => {
+      this.applyDecorButtonMode(isLight);
+    });
+  }
+
+  // System light/dark switched while running: publish it for the page, which
+  // re-resolves the effective theme (ghostty theme = light:...,dark:... model).
+  onConfigurationUpdate(newConfig: Configuration): void {
+    this.publishSystemColorMode(newConfig.colorMode);
+  }
+
+  private publishSystemColorMode(mode: ConfigurationConstant.ColorMode | undefined): void {
+    const sysDark: boolean = mode !== ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT;
+    AppStorage.setOrCreate(SYS_DARK_KEY, sysDark);
+  }
+
+  private applyDecorButtonMode(isLight: boolean): void {
+    const mainWindow: window.Window | null = this.mainWindow;
+    if (!mainWindow) {
+      return;
+    }
+    try {
+      const chromeWindow = mainWindow as WindowChromeController;
+      chromeWindow.setDecorButtonStyle({
+        colorMode: isLight
+          ? ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
+          : ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'Failed to restyle decor buttons: %{public}s', JSON.stringify(err));
     }
   }
 
@@ -68,6 +106,8 @@ export default class EntryAbility extends UIAbility {
         hilog.error(DOMAIN, TAG, 'Failed to get main window: %{public}s', JSON.stringify(err));
         return;
       }
+      this.mainWindow = mainWindow;
+      this.applyForegroundScreenPolicy();
       try {
         const chromeWindow = mainWindow as WindowChromeController;
         chromeWindow.setWindowDecorVisible(false);
@@ -81,7 +121,21 @@ export default class EntryAbility extends UIAbility {
     });
   }
 
+  private applyForegroundScreenPolicy(): void {
+    const mainWindow: window.Window | null = this.mainWindow;
+    if (!mainWindow) {
+      return;
+    }
+    const enabled: boolean = this.windowForeground;
+    void mainWindow.setWindowKeepScreenOn(enabled).catch((err: Object) => {
+      hilog.warn(DOMAIN, TAG, 'Failed to set foreground screen policy (%{public}s): %{public}s',
+        enabled ? 'awake' : 'system-default', JSON.stringify(err));
+    });
+  }
+
   onForeground(): void {
+    this.windowForeground = true;
+    this.applyForegroundScreenPolicy();
     if (!this.wasBackgrounded) {
       return;
     }
@@ -90,10 +144,18 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    this.windowForeground = false;
+    this.applyForegroundScreenPolicy();
     this.wasBackgrounded = true;
     // Task-finished notifications only fire for tabs the user cannot see;
     // the page needs to know "the whole app is hidden" so the ACTIVE tab
     // notifies too when its agent finishes while we are backgrounded.
     this.context.eventHub.emit(BACKGROUND_EVENT);
+  }
+
+  onWindowStageDestroy(): void {
+    this.windowForeground = false;
+    this.applyForegroundScreenPolicy();
+    this.mainWindow = null;
   }
 }

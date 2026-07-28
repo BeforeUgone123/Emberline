@@ -13,6 +13,11 @@ import {
 } from './TerminalTypes';
 
 const SCROLLBAR_POLL_INTERVAL_MS: number = 100;
+// Hidden tabs only need prompt title/notification delivery. Polling them every
+// frame multiplied N-API traffic by the tab count and competed with live tmux
+// rendering, while 120 ms remains effectively immediate for chrome updates.
+const INACTIVE_TAB_TITLE_POLL_INTERVAL_MS: number = 120;
+const APP_BACKGROUND_TITLE_POLL_INTERVAL_MS: number = 500;
 const SCROLLBAR_TRACK_WIDTH: number = 12;
 const SCROLLBAR_TOUCH_WIDTH: number = 18;
 const SCROLLBAR_THUMB_WIDTH: number = 4;
@@ -41,6 +46,7 @@ export struct TerminalSurface {
   // polling and the scrollbar loop follow tab visibility rather than `active`
   // (which additionally drops while an overlay owns the keyboard).
   @Prop @Watch('onVisibleChanged') visible: boolean = true;
+  @Prop @Watch('onAppBackgroundedChanged') appBackgrounded: boolean = false;
   @Prop @Watch('onForegroundFocusEpochChanged') foregroundFocusEpoch: number = 0;
   onLinkActivated: TerminalLinkListener | null = null;
   // Clipboard images are packed to PNG in the app sandbox and handed to the
@@ -87,7 +93,7 @@ export struct TerminalSurface {
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    this.controller.setPollingSuspended(!this.visible);
+    this.syncPollingBudget();
     this.controller.setConfigListener((config: TerminalConfig) => {
       this.appliedFontSize = config.fontSize;
     });
@@ -429,18 +435,28 @@ export struct TerminalSurface {
     this.stopForegroundImeRequest();
   }
 
-  // Tab visibility owns the controller polling budget and the scrollbar
-  // refresh loop, so a background tab throttles to the 500ms cadence and stops
-  // scrollbar polling, but a foreground tab under a translucent drawer keeps
-  // running its task output and title at full speed.
+  // Hidden tabs suspend the full input drain, but keep title updates responsive
+  // while the app is foregrounded. Only the app lifecycle selects the slower
+  // title cadence; scrollbar polling still follows tab visibility.
   private onVisibleChanged(): void {
-    this.controller.setPollingSuspended(!this.visible);
+    this.syncPollingBudget();
     if (this.visible) {
       this.syncScrollbarState();
       this.startScrollbarPolling();
     } else {
       this.stopScrollbarPolling();
     }
+  }
+
+  private onAppBackgroundedChanged(): void {
+    this.syncPollingBudget();
+  }
+
+  private syncPollingBudget(): void {
+    const titlePollIntervalMs: number = this.appBackgrounded
+      ? APP_BACKGROUND_TITLE_POLL_INTERVAL_MS
+      : INACTIVE_TAB_TITLE_POLL_INTERVAL_MS;
+    this.controller.setPollingSuspended(!this.visible, titlePollIntervalMs);
   }
 
   private scheduleForegroundImeRequest(): void {

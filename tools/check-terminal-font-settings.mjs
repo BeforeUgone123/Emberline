@@ -29,6 +29,26 @@ assert.match(index, /const FONT_FAMILY_CASCADIA: string = 'FusionTerm Cascadia M
 assert.match(index, /const FONT_FAMILY_SARASA: string = 'FusionTerm Sarasa Fixed SC';/);
 assert.match(index, /const FONT_FAMILY_SYSTEM: string = 'PingFang SC';/);
 assert.match(index, /const FONT_FAMILY_CUSTOM: string = 'FusionTerm Custom';/);
+for (const [family, rawFile] of [
+  ['FONT_FAMILY_MAPLE', 'MapleMonoNormal-NF-CN-Regular.ttf'],
+  ['FONT_FAMILY_JETBRAINS', 'JetBrainsMono-Regular.ttf'],
+  ['FONT_FAMILY_CASCADIA', 'CascadiaMono.ttf'],
+  ['FONT_FAMILY_SARASA', 'SarasaFixedSC-Regular.ttf'],
+]) {
+  assert.match(
+    index,
+    new RegExp(`familyName: ${family},\\s*familySrc: \\$rawfile\\('fonts/${rawFile}'\\)`),
+    `${family} must be registered with the ArkUI font manager for a real picker preview`
+  );
+}
+assert.match(index, /private registerBundledFontPreviews\(\): void/);
+assert.ok((index.match(/this\.registerBundledFontPreviews\(\);/g) ?? []).length >= 2,
+  'bundled previews must be prepared when the terminal settings pane opens or becomes active');
+assert.match(
+  index,
+  /private registerCustomFontPreview\(\): void \{[\s\S]*?familyName: FONT_FAMILY_CUSTOM,[\s\S]*?familySrc: this\.customFontPath/,
+  'an imported custom font must also be registered with ArkUI for its picker preview'
+);
 assert.match(index, /@State private fontFamily: string = DEFAULT_APPEARANCE\.fontFamily;/);
 assert.match(index, /fontFamily: this\.fontFamily/);
 assert.match(index, /private buildFontChoiceButton\(label: string, family: string\)/);

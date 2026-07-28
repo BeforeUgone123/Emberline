@@ -18,6 +18,7 @@ find_library(native-buffer-lib native_buffer)
 find_library(native-fence-lib native_fence)
 find_library(native-drawing-lib native_drawing)
 find_library(inputmethod-lib ohinputmethod)
+find_library(hitrace-lib hitrace_ndk.z)
 
 # Source files
 set(SOURCES
@@ -70,4 +71,5 @@ target_link_libraries(libghostty_ohos PUBLIC
     ${native-fence-lib}
     ${native-window-lib}
     ${inputmethod-lib}
+    ${hitrace-lib}
 )

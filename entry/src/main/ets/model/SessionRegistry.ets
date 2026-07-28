@@ -19,9 +19,59 @@ const HANDOFF_EXPIRY_MS: number = 15000;
 // the window that receives the drop -- without serializing or re-creating the
 // live controller/driver/agent. `__probe` is a cross-window shared-heap identity
 // canary read into logs while wiring up the drag-out / merge feature.
+// One live Emberline window, registered by its Index page while mounted. All
+// windows share this module (multiton same-process shared heap), so "move to
+// window" can hand a live session handle straight to the target window's
+// receive() on the same JS thread -- no parking, no token, no timing window.
+export interface WindowRegistration {
+  stamp: number;
+  label: string;
+  receive: (handle: TerminalSessionHandle) => void;
+  tabCount: () => number;
+}
+
 class SessionRegistry {
   private parked: Map<string, ParkedSession> = new Map();
+  private windows: Map<number, WindowRegistration> = new Map();
+  private nextWindowStamp: number = 0;
   __probe: number = 42;
+
+  // Register a mounted window. Returns its stamp; the page unregisters it in
+  // aboutToDisappear so the "move to window" list never shows dead windows.
+  registerWindow(label: string,
+                 receive: (handle: TerminalSessionHandle) => void,
+                 tabCount: () => number): number {
+    const stamp = ++this.nextWindowStamp;
+    const reg: WindowRegistration = { stamp, label: label.length > 0 ? label : `窗口 ${stamp}`, receive, tabCount };
+    this.windows.set(stamp, reg);
+    return stamp;
+  }
+
+  unregisterWindow(stamp: number): void {
+    this.windows.delete(stamp);
+  }
+
+  // Other windows a tab could move to (everyone but the asking window).
+  listWindows(excludeStamp: number): WindowRegistration[] {
+    const result: WindowRegistration[] = [];
+    for (const reg of this.windows.values()) {
+      if (reg.stamp !== excludeStamp) {
+        result.push(reg);
+      }
+    }
+    return result;
+  }
+
+  // Same-thread direct delivery for the context-menu "move to window" path.
+  // The caller must have already released the session from its own window.
+  deliverTo(stamp: number, handle: TerminalSessionHandle): boolean {
+    const reg = this.windows.get(stamp);
+    if (!reg) {
+      return false;
+    }
+    reg.receive(handle);
+    return true;
+  }
 
   park(token: string, handle: TerminalSessionHandle,
        onExpire: (handle: TerminalSessionHandle) => void): void {

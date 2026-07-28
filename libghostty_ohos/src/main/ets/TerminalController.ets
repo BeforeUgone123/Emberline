@@ -21,6 +21,11 @@ import {
   TerminalTitleListener
 } from './TerminalTypes';
 
+// These are chrome/control events, not keystroke transport (native input is
+// pushed through setInputCallback). A 20 Hz drain keeps gestures and titles
+// responsive without pinning the ArkTS thread to six N-API calls every frame.
+const UI_EVENT_POLL_INTERVAL_MS: number = 50;
+
 interface TerminalNativeBridge {
   writeInput: (surfaceId: string, data: string) => void;
   pasteText: (surfaceId: string, data: string) => void;
@@ -78,6 +83,10 @@ export class TerminalController {
   private nativeSurfaceId: string = '';
   private config: TerminalConfig = cloneTerminalConfig(DEFAULT_TERMINAL_CONFIG);
   private themeName: string = DEFAULT_THEME_NAME;
+  // Tracks only successful native applications. A failed load remains
+  // retryable, while repeated startup/config notifications cannot re-read and
+  // reparse the same raw theme for an already configured surface.
+  private appliedThemeName: string = '';
   private configListener: TerminalConfigListener | null = null;
   private inputListener: TerminalInputListener | null = null;
   private linkListener: TerminalLinkListener | null = null;
@@ -89,12 +98,12 @@ export class TerminalController {
   private attachmentListener: TerminalAttachmentListener | null = null;
   private sizeListener: TerminalSizeListener | null = null;
   private inputPollTimer: number = -1;
-  // Hidden tabs suspend the 60Hz input drain; the surface toggles this with
-  // its `active` prop so background sessions stop burning CPU on idle polls.
-  // Titles keep flowing on a slow poll so a background tab still shows live
-  // progress (spinners in OSC titles) while it works.
+  // Hidden tabs suspend the full input drain. Their title-only cadence is
+  // supplied by the surface so inactive tabs can stay responsive in the
+  // foreground without keeping the same cadence after the app is backgrounded.
   private pollingSuspended: boolean = false;
   private titlePollTimer: number = -1;
+  private titlePollIntervalMs: number = 500;
   private trackedWindow: window.Window | null = null;
   private windowRectListener: ((options: window.RectChangeOptions) => void) | null = null;
   private lastReportedSize: TerminalSize = { cols: 0, rows: 0 };
@@ -106,6 +115,7 @@ export class TerminalController {
     this.native.setFilesDir(this.nativeSurfaceId, context.filesDir);
     this.native.setResourceManager(this.nativeSurfaceId, context.resourceManager);
     this.native.setInputCallback(this.nativeSurfaceId, this.inputListener);
+    this.appliedThemeName = '';
     this.applyTheme();
     if (this.titleListener) {
       this.startInputPolling();
@@ -128,6 +138,7 @@ export class TerminalController {
     this.stopBackgroundTitlePolling();
     this.native = null;
     this.nativeSurfaceId = '';
+    this.appliedThemeName = '';
     this.notifyAttachmentChanged(false);
   }
 
@@ -182,9 +193,12 @@ export class TerminalController {
   }
 
   setTheme(themeName: string): boolean {
+    const changed: boolean = this.themeName !== themeName;
     this.themeName = themeName;
     const loaded = this.applyTheme();
-    this.notifyConfigChanged();
+    if (changed) {
+      this.notifyConfigChanged();
+    }
     return loaded;
   }
 
@@ -256,13 +270,20 @@ export class TerminalController {
     }
   }
 
-  setPollingSuspended(suspended: boolean): void {
-    if (this.pollingSuspended === suspended) {
+  setPollingSuspended(suspended: boolean, titlePollIntervalMs: number = 500): void {
+    const intervalChanged: boolean = this.titlePollIntervalMs !== titlePollIntervalMs;
+    if (this.pollingSuspended === suspended && !intervalChanged) {
       return;
     }
     this.pollingSuspended = suspended;
+    this.titlePollIntervalMs = titlePollIntervalMs;
     if (suspended) {
       this.stopInputPolling();
+      if (intervalChanged) {
+        this.stopBackgroundTitlePolling();
+      }
+      this.drainPendingTitleOnce();
+      this.drainPendingNotificationOnce();
       this.startBackgroundTitlePolling();
     } else {
       this.stopBackgroundTitlePolling();
@@ -297,7 +318,7 @@ export class TerminalController {
     this.titlePollTimer = setInterval(() => {
       this.drainPendingTitleOnce();
       this.drainPendingNotificationOnce();
-    }, 500) as number;
+    }, this.titlePollIntervalMs) as number;
   }
 
   private stopBackgroundTitlePolling(): void {
@@ -567,7 +588,14 @@ export class TerminalController {
     if (!this.native) {
       return false;
     }
-    return this.native.loadTheme(this.nativeSurfaceId, this.themeName);
+    if (this.appliedThemeName === this.themeName) {
+      return true;
+    }
+    const loaded: boolean = this.native.loadTheme(this.nativeSurfaceId, this.themeName);
+    if (loaded) {
+      this.appliedThemeName = this.themeName;
+    }
+    return loaded;
   }
 
   private notifyConfigChanged(): void {
@@ -637,7 +665,7 @@ export class TerminalController {
       if (this.pasteRequestListener && pendingPaste.length > 0) {
         this.pasteRequestListener();
       }
-    }, 16) as number;
+    }, UI_EVENT_POLL_INTERVAL_MS) as number;
   }
 
   private stopInputPolling(): void {

@@ -14,11 +14,11 @@ terminal environment values suitable for modern CLIs:
 
 The product should feel like a desktop-grade terminal in the spirit of Ghostty,
 not a demo screen or marketing page. The first screen is the terminal surface.
-App chrome should stay minimal: connection state, VM action, local fallback,
-theme/settings, and later session tabs. Decision 2026-07-03: no on-screen
-quick-key bar — the target device is a 2-in-1 with a physical keyboard, and
-all key handling goes through the native key encoder. Do not add soft key
-rows back without an explicit user request.
+App chrome stays limited to session tabs plus connection, settings, and overflow;
+local PTY and SSH remain secondary choices inside the connection inspector.
+Decision 2026-07-03: no on-screen quick-key bar — the target device is a 2-in-1
+with a physical keyboard, and all key handling goes through the native key
+encoder. Do not add soft key rows back without an explicit user request.
 
 ## Architecture Boundary
 
@@ -36,13 +36,71 @@ rows back without an explicit user request.
 - Do not persist passwords. Host-key trust and safer credential handling are
   follow-up requirements before broad SSH-client positioning.
 
+## Current Implementation — 2026-07-21
+
+- Direction A, **Harmony Native Workbench**, is implemented in the `dev`
+  worktree. Launch remains terminal-first; the 48 vp rail has exactly three
+  persistent app actions after the tabs: connection, settings, and overflow.
+- The right inspector is an overlay, not a terminal resize. It exposes exactly
+  `终端`, `外观`, and `连接`, uses 352/400 vp responsive widths, blocks native
+  terminal input while open, and returns focus on close.
+- Help and Agent setup are explicit overflow actions. Automatic onboarding and
+  all quick-key UI/state/resources have been removed.
+- `F6` or `Ctrl+Alt+.` cycles terminal -> chrome -> inspector without stealing
+  `Tab` or `Shift+Tab` from terminal programs; `Esc` closes the topmost app
+  overlay.
+- Theme previews load progressively. Connection errors expose inline retry and
+  details. UI loops and terminal polling stop when hidden/backgrounded where the
+  current architecture allows it.
+- Decision 2026-07-21: the unverified native output-consumer, hidden-surface
+  render-loop, direct-byte WebSocket, and NativeWindow fence experiments were
+  rolled back together. The renderer/output path is back on the last known
+  stable implementation pending a device profiler trace; theme caching and
+  non-rendering UI improvements remain.
+- Live sessions request a `taskKeeping` continuous task through
+  `KeepAliveManager.ets`; `EntryAbility.ets` requests screen-on only while the
+  window is foregrounded. Both policies still require DevEco/device verification.
+- Codex turn-complete reminders now use the official TUI OSC 9 notification
+  channel. The native parser survives split transport chunks, Help covers tmux
+  passthrough plus foreground permission/end-to-end tests, and a visible active
+  tab shows a completion toast instead of discarding the event. System publication
+  uses the visible `SERVICE_INFORMATION` slot, and the direct test reports whether
+  HarmonyOS accepted the notification or rejected app/slot authorization. Help
+  tells users to restart/resume Codex after changing its TUI config because a tmux
+  reload cannot update an already-running Codex process. Watch forwarding still
+  depends on system/device settings and requires device verification.
+- 2026-07-27: full window & tab management is enabled -- vertical tab lift
+  starts a programmatic system drag (merge on any strip / tear-off into a new
+  window), and the tab menu offers split / move-to-window through the
+  process-global window registry. Stability contract: "lift = unload" (the
+  source window releases before the drag starts); no deferred/timed adoption
+  is permitted (`check-tab-drag-handoff.mjs` pins this).
+- 2026-07-27: chrome colors are fully theme-derived (`ChromeTheme.ets`
+  tokens; ghostty light:/dark: dual-theme slots; system color-mode follow).
+  The ember filament accent system is retired -- connection state is a
+  neutral dot, and no fixed chrome hex values are permitted
+  (`check-adaptive-chrome.mjs`). The tab strip is ghostty-macOS shaped:
+  equal-split tabs, a floating pill capsule as the active face, and a
+  solo tab collapses to a centered title.
+- The source-level quality gate currently contains 35 `tools/check-*.mjs`
+  scripts. These are structural checks, not a substitute for HAP compilation,
+  profiler evidence, or device QA.
+
 ## Key Files
 
 - `README.md`: project overview and build notes.
 - `docs/product-positioning.md`: product goals, target users, and non-goals.
 - `docs/handoff.md`: current implementation state and source conversation.
+- `docs/code-review-2026-07-10.md`: release blockers and the 2026-07-18 status
+  reconciliation for the security/correctness review.
 - `docs/fusion-agent-protocol.md`: wand-agent-compatible WebSocket PTY
   contract.
+- `docs/frontend-brainstorm/2026-07-18-harmonyos-ui-ux-optimization/`:
+  approved Direction A design source, preview, implementation contract, and
+  current UI status.
+- `docs/frontend-brainstorm/2026-07-21-emberline-redesign/`: archived
+  full-redesign exploration (three rejected directions, closed 2026-07-21;
+  Direction A remains the current UI).
 - `docs/superpowers/specs/2026-07-02-harmony-advanced-terminal-design.md`:
   original approved design.
 - `docs/superpowers/plans/2026-07-02-harmony-advanced-terminal.md`: full
@@ -52,6 +110,9 @@ rows back without an explicit user request.
 - `entry/src/main/cpp/terminal_driver.cpp`: N-API bridge.
 - `entry/src/main/cpp/ssh/ssh_session.cpp`: libssh2 remote PTY path.
 - `entry/src/main/cpp/pty/pty_handler.cpp`: local PTY path.
+- `entry/src/main/ets/common/KeepAliveManager.ets`: process-wide continuous-task
+  accounting for connected sessions.
+- `tools/check-harmony-native-workbench.mjs`: Direction A structural gate.
 - `libghostty_ohos`: vendored renderer HAR module.
 
 ## Current Build Assumptions
@@ -60,29 +121,50 @@ This Codex workspace does not provide the full HarmonyOS runtime toolchain. Full
 HAP builds must run on a DevEco/Harmony SDK machine with `ohpm`, `hvigorw`,
 `hdc`, signing material, CMake, and Ninja available.
 
+Development and release are intentionally separate worktrees:
+
+- `/mnt/linux_share/preview/harmony-advanced-terminal` is branch `dev`, bundle
+  `com.preview.fusionterm.debug`, label `Emberline Dev`, SDK `6.1.0(23)`, and a
+  local debug signing profile.
+- `/mnt/linux_share/preview/harmony-advanced-terminal-release` is branch `main`
+  and retains the release identity `com.preview.fusionterm` plus release signing.
+- Do not test release by merely swapping signing in the dev tree. Stabilize on
+  `dev`, promote reviewed changes deliberately, and build/sign in the release
+  worktree. Bundle identity and signing profile must match an installed app;
+  otherwise uninstall the conflicting package before reinstalling.
+
 The repository vendors `libghostty_ohos/prebuilt/arm64-v8a/libghostty_vt.a` so
 the renderer HAR can configure in DevEco without rebuilding Ghostty VT first.
-Third-party SSH fallback sources are intentionally not vendored; fetch them
-with:
+Third-party SSH fallback sources are intentionally not vendored; the current
+development fetch command is:
 
 ```sh
 bash tools/fetch-third-party.sh
 ```
 
+That script still pins `libssh2-1.11.1`. Use it only to reproduce the current
+build against isolated disposable test endpoints; do not enter valuable SSH
+credentials and do not ship it. Release must compile SSH/SFTP out or use a
+verified patched revision and shared SSH/SFTP host-key verification.
+
 ## Next Best Work
 
-1. Run `ohpm install --all` and a full `hvigorw` build on the DevEco machine.
-2. Run `wand-agent` or a hardened project fork inside the Fusion Development
-   Engine Linux VM with token `harmonyterm`.
-3. Verify the app can reach the agent at `172.16.100.2:8765/ws`, or update
-   `DEFAULT_FUSION_AGENT_HOST` to the actual VM bridge address.
-4. If the native SSH fallback build fails, fetch `third_party/libssh2` and
-   `third_party/mbedtls`, then inspect `entry/src/main/cpp/CMakeLists.txt`.
-5. Implement the first safety milestone: Fusion Agent authentication hardening,
-   SSH host-key fingerprint reporting for fallback, and trust UI.
-6. Split the ArkUI workspace into components only after the current end-to-end
-   VM connection path compiles.
-7. Keep docs updated whenever product scope changes; do not let the project
+1. Read `docs/code-review-2026-07-10.md`; unresolved Critical and High findings
+   remain the engineering queue.
+2. Do not ship `libssh2-1.11.1`. Compile SSH/SFTP out or pin an audited patched
+   revision, then implement shared SSH/SFTP host-key verification.
+3. Harden Fusion Agent pairing, credential storage, and transport; repair
+   initial retry, heartbeat timeout, and connection-generation handling.
+4. Fix cross-tab image-upload credentials, lossless native writes, native EOF
+   propagation, final renderer-host disposal, and process-level native cleanup.
+5. Repair the clean-clone gate and make signing inputs reproducible without
+   committing machine-specific material.
+6. On the DevEco machine, run all 34 structural checks, `ohpm install --all`, a
+   full `hvigorw` build, codelinter, and the Direction A device/profiler matrix,
+   including long tmux output, background keep-alive, and foreground screen-on.
+7. Split `Index.ets` only after the primary VM path and release blockers are
+   verified end to end.
+8. Keep docs updated whenever product scope changes; do not let the project
    drift back into a vague "terminal emulator" label.
 
 ## Source Conversation
@@ -129,4 +211,4 @@ and other product ideas, but they are not the current Emberline product source:
 - **geometryTransition 共享元素(标签↔分屏一镜到底)→ 延后,非默认**。仅「标签拖出成独立窗」等空间连续明确场景才评审采用,时长 ≤300ms 走 CURVE_DECEL。
 - **逐帧 relayout 属性补间:`width/height/margin/padding/fontSize/borderWidth/constraintSize/flex` → 禁补间**。每帧触发 measure/layout,与终端 XComponent 抢主线程。合成层安全属性只有 `opacity / translate / rotate / 颜色`(含文字禁 scale)。必须动 width 的非终端面板配 `renderFit` 且压低 expected 帧率。
 - **`setInterval` / 自建 `rAF` 常驻循环驱动动画 → 禁**。占 UI/JS 线程抢终端渲染;能用声明式 `.animation` / `keyframeAnimateTo`(合成线程)表达就别碰 `animator`,只有「进度→自绘参数」才上 `animator`。
-- **强调色(余烬铜)动效只出现在灯丝与主按钮**,不外扩。
+- **固定强调色已整体退役(2026-07-27 自适应 chrome 裁决)**:chrome 唯一的非中性色是主题自带的 ANSI red(连接失败圆点)。不得再引入任何固定强调色或固定 chrome 色值。

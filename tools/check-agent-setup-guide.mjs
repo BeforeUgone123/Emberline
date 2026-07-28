@@ -1,45 +1,33 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-// The wand-agent deploy walkthrough must exist in BOTH surfaces from one
-// shared builder: a one-shot first-launch overlay (persisted OnboardingStore
-// flag) and the always-reachable drawer help pane. Guarded so the tutorial
-// never silently drops out of either place or forks into two copies.
+// The wand-agent deploy walkthrough must stay complete and explicitly
+// reachable from the overflow menu, without blocking the terminal-first launch.
 
 const index = await readFile('entry/src/main/ets/pages/Index.ets', 'utf8');
-const store = await readFile('entry/src/main/ets/settings/OnboardingStore.ets', 'utf8');
 
-// (1) Persisted one-shot flag with its own store (clearing other settings must
-// never re-trigger onboarding).
-assert.match(store, /const STORE_NAME: string = 'fusionterm_onboarding';/, 'onboarding needs its own preferences store');
-assert.match(store, /get\('agentGuideSeen', false\)/, 'store must read the agentGuideSeen flag');
-assert.match(store, /put\('agentGuideSeen', true\);\s*await this\.prefs\.flush\(\);/s, 'markSeen must persist and flush');
-
-// (2) Index wiring: load on launch, open once, dismiss persists.
+// (1) No automatic onboarding: the terminal is the first useful viewport.
 assert.match(index, /@State private agentGuideOpen: boolean = false;/, 'guide overlay needs a visibility @State');
-assert.match(index, /private onboardingStore: OnboardingStore = new OnboardingStore\(\);/, 'Index must own an OnboardingStore');
-assert.match(index, /void this\.loadOnboarding\(\);/, 'aboutToAppear must check the first-launch flag');
+assert.doesNotMatch(index, /OnboardingStore|onboardingStore|loadOnboarding/, 'launch must not auto-open onboarding');
+
+// (2) The top-bar overflow is the permanent entry point.
 assert.match(
   index,
-  /const seen = await this\.onboardingStore\.load\(this\.context\);\s*if \(!seen\) \{\s*this\.agentGuideOpen = true;\s*\}/s,
-  'the guide must auto-open only while the flag is unset'
-);
-assert.match(
-  index,
-  /private dismissAgentGuide\(\): void \{\s*this\.agentGuideOpen = false;\s*this\.onboardingStore\.markSeen\(\)/s,
-  'dismissing the guide must persist the seen flag'
+  /MenuItem\(\{ content: '帮助与诊断' \}\)[\s\S]*?this\.agentGuideOpen = true;/,
+  'the overflow menu must open help and diagnostics'
 );
 assert.match(
   index,
   /if \(this\.agentGuideOpen\) \{\s*this\.buildAgentGuideScrim\(\);\s*this\.buildAgentGuidePanel\(\);\s*\}/s,
   'the guide overlay must be mounted in the root stack'
 );
+assert.match(index, /private dismissAgentGuide\(\): void \{\s*this\.agentGuideOpen = false;\s*this\.focusActiveTerminalSoon\(\);/s);
 
-// (3) One shared walkthrough builder, embedded in BOTH the overlay and the
-// help pane.
+// (3) One walkthrough builder, embedded in the explicit help surface.
 const panelUses = index.match(/this\.buildAgentGuideContent\(\)/g) ?? [];
-assert.ok(panelUses.length >= 2, 'the walkthrough builder must be embedded in both the overlay and the help pane');
-assert.match(index, /this\.buildGroupTitle\('部署 wand-agent\(Agent 会话\)'\)/u, 'help pane needs the deploy group');
+assert.equal(panelUses.length, 1, 'the walkthrough must have one source of truth');
+assert.match(index, /this\.buildGroupTitle\('部署 wand-agent\(Agent 会话\)'\)/u, 'help surface needs the deploy group');
+assert.match(index, /private buildAgentGuidePanel\(\)[\s\S]*?this\.buildHelpPane\(\)/, 'the explicit panel must host the full help surface');
 
 // (4) The walkthrough itself stays complete: install (both ways), run,
 // systemd, app-side connect, copyable commands.

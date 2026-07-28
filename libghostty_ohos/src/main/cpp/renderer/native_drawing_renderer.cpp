@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <hitrace/trace.h>
 #include <hilog/log.h>
 #include <inttypes.h>
 #include <native_buffer/buffer_common.h>
@@ -524,6 +525,9 @@ void NativeDrawingRenderer::beginFrame()
     }
 
     m_currentFrameId = ++g_frameCounter;
+    OH_HiTrace_CountTrace(
+        "Emberline.SurfacePixels",
+        static_cast<int64_t>(m_width) * static_cast<int64_t>(m_height));
     // Reset this frame's offscreen-change accounting; shiftOffscreen may set it
     // before renderGrid, and renderGrid records the rows it repaints.
     m_shiftedThisFrame = false;
@@ -1092,14 +1096,21 @@ void NativeDrawingRenderer::endFrame()
         fullDamage = true;
     }
 
+    // Always report whole-surface damage to the compositor. When this opaque
+    // SURFACE is fullscreen and focused it can be promoted to hardware direct
+    // composition, and on that path frames flushed with a small partial
+    // dirtyRegion do not refresh the display at all: with tmux idle, the
+    // per-second timer row (a 1-2 rect partial frame) stays frozen until a
+    // scroll produces a full-damage frame, while a small or unfocused window
+    // (GPU composition) presents the same frames fine. The pre-buffer-age
+    // stable build always flushed full frames and never showed this. The
+    // incremental blit above still skips unchanged rows, so only the damage
+    // *report* is widened; m_damageRects stays collected in case partial
+    // reporting can return behind a direct-composition check.
     Region dirtyRegion {};
-    if (fullDamage || m_damageRects.empty()) {
-        dirtyRegion.rects = nullptr;
-        dirtyRegion.rectNumber = 0;
-    } else {
-        dirtyRegion.rects = m_damageRects.data();
-        dirtyRegion.rectNumber = static_cast<int32_t>(m_damageRects.size());
-    }
+    dirtyRegion.rects = nullptr;
+    dirtyRegion.rectNumber = 0;
+    (void)fullDamage;
     if (m_currentNativeBuffer) {
         OH_NativeBuffer_Unmap(m_currentNativeBuffer);
         m_currentPixels = nullptr;
