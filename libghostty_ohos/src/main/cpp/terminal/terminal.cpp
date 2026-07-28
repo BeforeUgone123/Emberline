@@ -2,6 +2,7 @@
 #include "../renderer/renderer.h"
 #include "../include/ghostty_vt.h"
 #include "color_palette.h"
+#include <hitrace/trace.h>
 #include <hilog/log.h>
 #include <algorithm>
 #include <atomic>
@@ -103,6 +104,34 @@ constexpr uint32_t kSearchMatchForeground = 0xFFFFFFFF;
 constexpr uint32_t kSearchCurrentMatchBackground = 0xFFE0A23A;
 constexpr uint32_t kSearchCurrentMatchForeground = 0xFF111111;
 std::atomic<uint64_t> g_drawFrameCounter {0};
+
+class ScopedHiTrace {
+public:
+    explicit ScopedHiTrace(const char* name)
+    {
+        OH_HiTrace_StartTrace(name);
+    }
+
+    ~ScopedHiTrace()
+    {
+        Finish();
+    }
+
+    ScopedHiTrace(const ScopedHiTrace&) = delete;
+    ScopedHiTrace& operator=(const ScopedHiTrace&) = delete;
+
+    void Finish()
+    {
+        if (!m_active) {
+            return;
+        }
+        OH_HiTrace_FinishTrace();
+        m_active = false;
+    }
+
+private:
+    bool m_active = true;
+};
 
 bool IsSuspiciousCodepoint(uint32_t codepoint)
 {
@@ -525,9 +554,19 @@ void Terminal::resize(int cols, int rows) {
 }
 
 void Terminal::feedOutput(const char* data, size_t len) {
-    std::lock_guard<std::mutex> lock(m_stateMutex);
-    if (m_vt && data && len > 0) {
-        ghostty_terminal_vt_write(m_vt, reinterpret_cast<const uint8_t*>(data), len);
+    ScopedHiTrace feedTrace("Emberline.FeedOutput");
+    OH_HiTrace_CountTrace("Emberline.FeedBytes", static_cast<int64_t>(len));
+
+    std::unique_lock<std::mutex> lock(m_stateMutex, std::defer_lock);
+    {
+        ScopedHiTrace lockTrace("Emberline.FeedOutput.LockWait");
+        lock.lock();
+    }
+    {
+        ScopedHiTrace parseTrace("Emberline.FeedOutput.Parse");
+        if (m_vt && data && len > 0) {
+            ghostty_terminal_vt_write(m_vt, reinterpret_cast<const uint8_t*>(data), len);
+        }
     }
     // Program output counts as activity: keep the cursor solid while printing.
     if (m_renderer && data && len > 0) {
@@ -1072,6 +1111,66 @@ void Terminal::getCursorPosition(int& row, int& col) const {
     }
     ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &row);
     ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_CURSOR_X, &col);
+}
+
+void Terminal::getImeSnapshot(std::string& line, int& cursorCol) const {
+    line.clear();
+    cursorCol = 0;
+
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    if (!m_renderState || !m_vt || !m_rowIterator || !m_rowCells || m_rows <= 0 || m_cols <= 0 ||
+        ghostty_render_state_update(m_renderState, m_vt) != GHOSTTY_SUCCESS) {
+        return;
+    }
+
+    int cursorRow = 0;
+    bool cursorHasViewport = false;
+    bool cursorWideTail = false;
+    ghostty_render_state_get(
+        m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursorHasViewport);
+    if (cursorHasViewport) {
+        ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cursorRow);
+        ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cursorCol);
+        ghostty_render_state_get(
+            m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL, &cursorWideTail);
+        if (cursorWideTail && cursorCol > 0) {
+            --cursorCol;
+        }
+    } else {
+        ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &cursorRow);
+        ghostty_terminal_get(m_vt, GHOSTTY_TERMINAL_DATA_CURSOR_X, &cursorCol);
+    }
+    cursorRow = std::clamp(cursorRow, 0, m_rows - 1);
+    cursorCol = std::clamp(cursorCol, 0, m_cols);
+
+    ghostty_row_iterator_t rowIterator = m_rowIterator;
+    ghostty_row_cells_t rowCells = m_rowCells;
+    ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &rowIterator);
+    for (int row = 0; row < m_rows && ghostty_render_state_row_iterator_next(rowIterator); ++row) {
+        if (row != cursorRow) {
+            continue;
+        }
+
+        ghostty_render_state_row_get(rowIterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &rowCells);
+        line.reserve(static_cast<size_t>(m_cols));
+        for (int col = 0; col < m_cols && ghostty_render_state_row_cells_next(rowCells); ++col) {
+            ghostty_cell_t raw = 0;
+            bool hasText = false;
+            ghostty_cell_wide_t wide = GHOSTTY_CELL_WIDE_NARROW;
+            uint32_t codepoint = 0;
+            ghostty_render_state_row_cells_get(rowCells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
+            ghostty_cell_get(raw, GHOSTTY_CELL_DATA_HAS_TEXT, &hasText);
+            ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+            ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &codepoint);
+            if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ||
+                wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
+                line.push_back(' ');
+                continue;
+            }
+            AppendCodepointUtf8(line, codepoint);
+        }
+        return;
+    }
 }
 
 std::string Terminal::getLinkAt(int row, int col) const
@@ -2037,10 +2136,16 @@ void Terminal::notifyRenderNeeded()
 void Terminal::drawFrame() {
     if (!m_renderer) return;
 
+    ScopedHiTrace frameTrace("Emberline.DrawFrame");
     // Hold the state mutex only while snapshotting terminal state. The
     // expensive pixel work below runs unlocked so keyboard input, mouse
     // events, and feedOutput are never serialized behind a frame render.
-    std::unique_lock<std::mutex> lock(m_stateMutex);
+    std::unique_lock<std::mutex> lock(m_stateMutex, std::defer_lock);
+    {
+        ScopedHiTrace lockTrace("Emberline.DrawFrame.LockWait");
+        lock.lock();
+    }
+    ScopedHiTrace snapshotTrace("Emberline.DrawFrame.Snapshot");
     if (!m_vt || !m_renderState || !m_rowIterator || !m_rowCells) {
         return;
     }
@@ -2342,16 +2447,29 @@ void Terminal::drawFrame() {
     const uint32_t themeCursor = m_theme.cursorColor;
     const uint32_t themeCursorText = m_theme.cursorText;
     lock.unlock();
+    snapshotTrace.Finish();
+    OH_HiTrace_CountTrace(
+        "Emberline.GridCells",
+        static_cast<int64_t>(colsSnapshot) * static_cast<int64_t>(rowsSnapshot));
 
     m_renderer->setColors(themeBackground, themeForeground);
     m_renderer->setCursorColors(themeCursor, themeCursorText);
-    m_renderer->beginFrame();
-    // Scroll-damage fast path: shift the offscreen first so renderGrid only has
-    // to repaint the exposed rows on top of the reused pixels.
-    if (canScrollShift) {
-        m_renderer->shiftOffscreen(static_cast<int>(viewportDelta));
+    {
+        ScopedHiTrace beginTrace("Emberline.DrawFrame.BeginBuffer");
+        m_renderer->beginFrame();
     }
-    m_renderer->renderGrid(cells, colsSnapshot, rowsSnapshot, cursorRow, cursorCol, cursorVisible,
-                           fullRepaint ? std::vector<uint8_t>() : dirtyRows);
-    m_renderer->endFrame();
+    {
+        ScopedHiTrace rasterTrace("Emberline.DrawFrame.Raster");
+        // Scroll-damage fast path: shift the offscreen first so renderGrid only
+        // has to repaint the exposed rows on top of the reused pixels.
+        if (canScrollShift) {
+            m_renderer->shiftOffscreen(static_cast<int>(viewportDelta));
+        }
+        m_renderer->renderGrid(cells, colsSnapshot, rowsSnapshot, cursorRow, cursorCol, cursorVisible,
+                               fullRepaint ? std::vector<uint8_t>() : dirtyRows);
+    }
+    {
+        ScopedHiTrace endTrace("Emberline.DrawFrame.EndBuffer");
+        m_renderer->endFrame();
+    }
 }

@@ -29,23 +29,19 @@ export class TerminalSessionHandle {
   attached: boolean = false;
   autoConnectAttempted: boolean = false;
   manualConnectionSelected: boolean = false;
-  // User overrides from the tab editor (double-tap a tab): a custom title
-  // that beats OSC/cwd auto-naming, and a personal filament color.
+  // User override from the tab editor (right-click a tab): a custom title
+  // that beats OSC/cwd auto-naming.
   customName: string = '';
-  filamentColor: string = '';
   // Image-paste path perspective: 'auto' follows the transport type; the
   // others override it for nested sessions (e.g. ssh typed inside a local
   // shell) where the app cannot know which machine the prompt lives on.
   pasteMode: string = 'auto';
+  // pasteMode 'relay': the agent scp-relays the staged image to this tailnet
+  // host (host or user@host) so a shell ssh'd into that machine can read it.
+  relayTarget: string = '';
+  relayDir: string = '/tmp/emberline-paste';
   // Rate limit for task-finished system notifications (bell storms).
   lastNotifyMs: number = 0;
-  // Filament life-signs epochs (§2): each status edge bumps one counter and the
-  // tab chip replays the matching keyframe. Monotonic so the chip can diff its
-  // last-seen value and never miss/replay a beat.
-  igniteEpoch: number = 0;      // connect established -> "ignite" flash+settle
-  extinguishEpoch: number = 0;  // clean disconnect  -> "extinguish" hold+cool
-  sparkFailEpoch: number = 0;   // connect failed    -> "struggle" glow-less stutter
-  attentionEpoch: number = 0;   // background bell    -> "re-kindle" double-surge (M05)
   // Rising-edge guard for the error transition so a backoff retry storm does not
   // re-fire the struggle keyframe on every identical status callback.
   hadError: boolean = false;

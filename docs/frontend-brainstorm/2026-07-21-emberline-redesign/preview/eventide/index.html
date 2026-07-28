@@ -1,0 +1,1646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emberline · 深场 Eventide 方向预览</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --base: #0B0B15;
+      --rail: #0A0A12;
+      --panel: #14141F;
+      --panel-raised: #1A1A28;
+      --panel-hover: #181824;
+      --panel-pressed: #11111B;
+      --field: #10101A;
+      --hairline: #262636;
+      --hairline-soft: #1D1D2B;
+      --text: #D4D4E4;
+      --text-strong: #EEEEF7;
+      --muted: #82829A;
+      --faint: #5F5F75;
+      --aurora-indigo: #6E7BE0;
+      --aurora-cyan: #46C2C8;
+      --aurora-violet: #9B6ED8;
+      --aurora: linear-gradient(90deg, var(--aurora-indigo) 0%, var(--aurora-cyan) 52%, var(--aurora-violet) 100%);
+      --failure: #8A4A52;
+      --failure-text: #C98991;
+      --success-text: #86CFAF;
+      --warning-text: #D7B978;
+      --terminal-blue: #8EA1FF;
+      --terminal-cyan: #75D3D8;
+      --terminal-green: #86CFAF;
+      --terminal-yellow: #D7B978;
+      --terminal-red: #D47D88;
+      --terminal-violet: #C0A0EF;
+      --terminal-dim: #6D6D85;
+      --shadow-menu: 0 14px 34px rgba(3, 3, 9, 0.42);
+      --shadow-panel: -14px 0 34px rgba(3, 3, 9, 0.20);
+      --focus-ring: 0 0 0 2px rgba(110, 123, 224, 0.74);
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --space-7: 28px;
+      --space-8: 32px;
+      --radius-sm: 4px;
+      --radius-md: 6px;
+      --radius-lg: 8px;
+      --rail-height: 48px;
+      --demo-height: 42px;
+      --inspector-width: 352px;
+      --font-sans: "HarmonyOS Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --font-mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+      --type-10: 10px;
+      --type-11: 11px;
+      --type-12: 12px;
+      --type-13: 13px;
+      --type-14: 14px;
+      --type-16: 16px;
+      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--base);
+      color: var(--text);
+      font-family: var(--font-sans);
+    }
+
+    body {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) var(--demo-height);
+    }
+
+    button,
+    input,
+    select,
+    output {
+      font: inherit;
+    }
+
+    button,
+    select,
+    input {
+      color: inherit;
+    }
+
+    button {
+      border: 0;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    [tabindex]:focus-visible {
+      outline: 0;
+      box-shadow: var(--focus-ring);
+    }
+
+    .app-shell {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--base);
+    }
+
+    .rail {
+      position: relative;
+      z-index: 30;
+      display: flex;
+      width: 100%;
+      height: var(--rail-height);
+      align-items: stretch;
+      background: var(--rail);
+      border-bottom: 1px solid var(--hairline-soft);
+      user-select: none;
+    }
+
+    .tab-region {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      padding-left: var(--space-2);
+    }
+
+    .tab-scroll {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      gap: var(--space-1);
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      scrollbar-width: none;
+    }
+
+    .tab-scroll::-webkit-scrollbar {
+      display: none;
+    }
+
+    .session-tab {
+      position: relative;
+      display: flex;
+      width: 164px;
+      min-width: 136px;
+      max-width: 184px;
+      height: 36px;
+      flex: 1 0 148px;
+      align-items: center;
+      overflow: hidden;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      box-shadow: inset 0 0 0 1px transparent;
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    .session-tab:hover {
+      background: var(--panel-hover);
+      color: var(--text);
+    }
+
+    .session-tab:active {
+      background: var(--panel-pressed);
+    }
+
+    .session-tab.active {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+    }
+
+    .tab-main {
+      display: flex;
+      min-width: 0;
+      height: 100%;
+      flex: 1;
+      align-items: center;
+      gap: var(--space-2);
+      padding: 0 var(--space-3);
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .tab-label {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      font-size: var(--type-12);
+      font-weight: 500;
+      line-height: 1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab-status {
+      flex: 0 0 auto;
+      color: var(--faint);
+      font-size: var(--type-10);
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .session-tab[data-state="connected"] .tab-status {
+      color: var(--muted);
+    }
+
+    .session-tab[data-state="connecting"] .tab-status {
+      color: var(--aurora-cyan);
+    }
+
+    .session-tab[data-state="failed"] .tab-status {
+      color: var(--failure-text);
+    }
+
+    .session-tab[data-state="complete"] .tab-status {
+      color: var(--text);
+    }
+
+    .tab-light-track {
+      position: absolute;
+      right: var(--space-2);
+      bottom: 0;
+      left: var(--space-2);
+      height: 1px;
+      overflow: hidden;
+      border-radius: 1px;
+      pointer-events: none;
+    }
+
+    .tab-light,
+    .tab-sweep {
+      position: absolute;
+      inset: 0;
+      height: 1px;
+      background: var(--aurora);
+    }
+
+    .tab-light {
+      opacity: 0.56;
+    }
+
+    .tab-sweep {
+      opacity: 0;
+      transform: translateX(-105%);
+    }
+
+    .session-tab.active .tab-light {
+      opacity: 1;
+    }
+
+    .session-tab[data-state="connecting"] .tab-light {
+      animation: eventide-breathe 1.8s ease-in-out infinite;
+    }
+
+    .session-tab[data-state="failed"] .tab-light {
+      background: var(--failure);
+      opacity: 0.78;
+    }
+
+    .session-tab[data-state="complete"] .tab-light {
+      opacity: 0.92;
+      box-shadow: 0 -1px 6px rgba(110, 123, 224, 0.14);
+    }
+
+    .session-tab.success-sweep .tab-sweep {
+      animation: eventide-sweep 300ms var(--ease-out) 1;
+    }
+
+    @keyframes eventide-breathe {
+      0%, 100% { opacity: 0.30; }
+      50% { opacity: 0.82; }
+    }
+
+    @keyframes eventide-sweep {
+      0% {
+        opacity: 0;
+        transform: translateX(-105%);
+      }
+      12% {
+        opacity: 0.92;
+      }
+      100% {
+        opacity: 0;
+        transform: translateX(105%);
+      }
+    }
+
+    .rail-actions {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-1);
+      padding: 0 var(--space-2);
+      border-left: 1px solid var(--hairline-soft);
+      background: var(--rail);
+    }
+
+    .icon-button {
+      position: relative;
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: var(--radius-md);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    .icon-button:hover {
+      background: var(--panel-hover);
+      color: var(--text-strong);
+    }
+
+    .icon-button:active {
+      background: var(--panel-pressed);
+      opacity: 0.82;
+    }
+
+    .icon-button.selected {
+      background: var(--panel-raised);
+      color: var(--aurora-cyan);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+    }
+
+    .icon-button svg {
+      width: 16px;
+      height: 16px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .window-dots {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: 7px;
+      padding: 0 var(--space-3);
+      border-left: 1px solid var(--hairline-soft);
+      background: var(--rail);
+    }
+
+    .window-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--faint);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+    }
+
+    .window-dot:nth-child(2) {
+      opacity: 0.76;
+    }
+
+    .window-dot:nth-child(3) {
+      opacity: 0.54;
+    }
+
+    .workspace {
+      position: absolute;
+      inset: var(--rail-height) 0 0;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--base);
+    }
+
+    .terminal-canvas {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: var(--space-6) var(--space-7) 72px;
+      overflow: auto;
+      background: var(--base);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: var(--type-13);
+      font-variant-ligatures: none;
+      line-height: 1.66;
+      tab-size: 2;
+      white-space: pre;
+      caret-color: var(--text-strong);
+    }
+
+    .terminal-canvas::selection,
+    .terminal-canvas *::selection {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+    }
+
+    .term-dim { color: var(--terminal-dim); }
+    .term-blue { color: var(--terminal-blue); }
+    .term-cyan { color: var(--terminal-cyan); }
+    .term-green { color: var(--terminal-green); }
+    .term-yellow { color: var(--terminal-yellow); }
+    .term-red { color: var(--terminal-red); }
+    .term-violet { color: var(--terminal-violet); }
+    .term-strong { color: var(--text-strong); font-weight: 700; }
+    .tmux-title { color: var(--text); background: var(--panel); }
+
+    .terminal-cursor {
+      display: inline-block;
+      width: 8px;
+      height: 15px;
+      vertical-align: -2px;
+      background: var(--text);
+      opacity: 0.82;
+    }
+
+    .input-shield {
+      position: absolute;
+      inset: 0 var(--inspector-width) 0 0;
+      z-index: 8;
+      pointer-events: none;
+    }
+
+    .app-shell.inspector-open .input-shield {
+      pointer-events: auto;
+    }
+
+    .inspector {
+      position: absolute;
+      z-index: 12;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      width: var(--inspector-width);
+      flex-direction: column;
+      overflow: hidden;
+      border-left: 1px solid var(--hairline);
+      background: var(--panel);
+      box-shadow: var(--shadow-panel);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(18px);
+      transition: opacity 220ms var(--ease-out), transform 220ms var(--ease-out);
+    }
+
+    .app-shell.inspector-open .inspector {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+
+    .inspector-top {
+      flex: 0 0 auto;
+      padding: var(--space-4);
+      border-bottom: 1px solid var(--hairline);
+      background: var(--panel);
+    }
+
+    .inspector-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-3);
+      margin-bottom: var(--space-3);
+    }
+
+    .inspector-title-wrap {
+      min-width: 0;
+    }
+
+    .inspector-title {
+      margin: 0;
+      color: var(--text-strong);
+      font-size: var(--type-14);
+      font-weight: 600;
+      line-height: 1.25;
+    }
+
+    .inspector-subtitle {
+      margin: var(--space-1) 0 0;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: var(--type-11);
+      line-height: 1.3;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .segmented {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2px;
+      padding: 2px;
+      border-radius: var(--radius-md);
+      background: var(--field);
+      box-shadow: inset 0 0 0 1px var(--hairline-soft);
+    }
+
+    .segment {
+      min-height: 30px;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: var(--type-12);
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    .segment:hover {
+      background: var(--panel-hover);
+      color: var(--text);
+    }
+
+    .segment:active {
+      opacity: 0.82;
+    }
+
+    .segment.active {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+    }
+
+    .inspector-scroll {
+      min-height: 0;
+      flex: 1;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-color: var(--hairline) transparent;
+    }
+
+    .pane {
+      display: none;
+      padding: 0 var(--space-4) var(--space-6);
+    }
+
+    .pane.active {
+      display: block;
+    }
+
+    .section {
+      padding-top: var(--space-5);
+    }
+
+    .section + .section {
+      margin-top: var(--space-1);
+      border-top: 1px solid var(--hairline-soft);
+    }
+
+    .section-title {
+      margin: 0 0 var(--space-2);
+      color: var(--muted);
+      font-size: var(--type-11);
+      font-weight: 500;
+      letter-spacing: 0.04em;
+    }
+
+    .setting-row {
+      display: grid;
+      min-height: 48px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--space-3);
+      border-bottom: 1px solid var(--hairline-soft);
+    }
+
+    .setting-row:last-child {
+      border-bottom: 0;
+    }
+
+    .setting-copy {
+      min-width: 0;
+    }
+
+    .setting-label {
+      color: var(--text);
+      font-size: var(--type-12);
+      line-height: 1.4;
+    }
+
+    .setting-meta {
+      margin-top: 2px;
+      color: var(--faint);
+      font-size: var(--type-10);
+      line-height: 1.4;
+    }
+
+    .field,
+    .select {
+      min-height: 30px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-sm);
+      background: var(--field);
+      color: var(--text);
+      font-size: var(--type-11);
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+    }
+
+    .field {
+      width: 142px;
+      padding: 0 var(--space-2);
+    }
+
+    .select {
+      max-width: 156px;
+      padding: 0 var(--space-7) 0 var(--space-2);
+    }
+
+    .field:hover,
+    .select:hover {
+      background: var(--panel-pressed);
+      box-shadow: inset 0 0 0 1px var(--faint);
+    }
+
+    .stepper {
+      display: grid;
+      grid-template-columns: 28px 42px 28px;
+      align-items: center;
+      overflow: hidden;
+      border-radius: var(--radius-sm);
+      background: var(--field);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+    }
+
+    .stepper button,
+    .stepper output {
+      display: grid;
+      height: 30px;
+      place-items: center;
+      background: transparent;
+      color: var(--muted);
+      font-size: var(--type-12);
+    }
+
+    .stepper button {
+      cursor: pointer;
+      transition: color 120ms ease, background-color 120ms ease, opacity 120ms ease;
+    }
+
+    .stepper button:hover {
+      background: var(--panel-hover);
+      color: var(--text-strong);
+    }
+
+    .stepper button:active {
+      opacity: 0.72;
+    }
+
+    .stepper output {
+      color: var(--text);
+      border-right: 1px solid var(--hairline-soft);
+      border-left: 1px solid var(--hairline-soft);
+    }
+
+    .switch {
+      position: relative;
+      display: inline-flex;
+      width: 34px;
+      height: 20px;
+      flex: 0 0 34px;
+      align-items: center;
+      padding: 2px;
+      border-radius: 10px;
+      background: var(--field);
+      box-shadow: inset 0 0 0 1px var(--hairline);
+      cursor: pointer;
+      transition: background-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
+    }
+
+    .switch input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .switch-knob {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--muted);
+      transform: translateX(0);
+      transition: transform 160ms var(--ease-out), background-color 160ms ease;
+    }
+
+    .switch:has(input:checked) {
+      background: var(--panel-raised);
+      box-shadow: inset 0 0 0 1px var(--aurora-indigo);
+    }
+
+    .switch input:checked + .switch-knob {
+      background: var(--aurora-cyan);
+      transform: translateX(14px);
+    }
+
+    .switch:has(input:disabled) {
+      cursor: not-allowed;
+      opacity: 0.44;
+    }
+
+    .connection-overview {
+      position: relative;
+      padding: var(--space-5) 0 var(--space-4);
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .connection-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: var(--space-3);
+    }
+
+    .connection-name {
+      color: var(--text-strong);
+      font-size: var(--type-13);
+      font-weight: 600;
+      line-height: 1.35;
+    }
+
+    .connection-detail {
+      margin-top: var(--space-1);
+      color: var(--muted);
+      font-size: var(--type-11);
+      line-height: 1.45;
+    }
+
+    .status-copy {
+      flex: 0 0 auto;
+      color: var(--success-text);
+      font-size: var(--type-11);
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+
+    .connection-overview[data-state="connecting"] .status-copy {
+      color: var(--aurora-cyan);
+    }
+
+    .connection-overview[data-state="failed"] .status-copy {
+      color: var(--failure-text);
+    }
+
+    .connection-overview[data-state="complete"] .status-copy {
+      color: var(--text-strong);
+    }
+
+    .connection-light {
+      position: relative;
+      height: 1px;
+      margin-top: var(--space-4);
+      overflow: hidden;
+      border-radius: 1px;
+      background: var(--aurora);
+      opacity: 0.58;
+    }
+
+    .connection-overview[data-state="connecting"] .connection-light {
+      animation: eventide-breathe 1.8s ease-in-out infinite;
+    }
+
+    .connection-overview[data-state="failed"] .connection-light {
+      background: var(--failure);
+      opacity: 0.78;
+    }
+
+    .connection-overview[data-state="complete"] .connection-light {
+      opacity: 0.92;
+    }
+
+    .recovery {
+      margin-top: var(--space-4);
+      padding: var(--space-3);
+      border-left: 1px solid var(--failure);
+      border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+      background: var(--panel-hover);
+    }
+
+    .recovery-main {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+    }
+
+    .recovery-copy {
+      min-width: 0;
+      color: var(--text);
+      font-size: var(--type-11);
+      line-height: 1.45;
+    }
+
+    .recovery-actions {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-1);
+    }
+
+    .inline-action {
+      padding: var(--space-1) var(--space-2);
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--failure-text);
+      cursor: pointer;
+      font-size: var(--type-11);
+      transition: color 120ms ease, background-color 120ms ease, opacity 120ms ease;
+    }
+
+    .inline-action:hover {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+    }
+
+    .inline-action:active {
+      opacity: 0.72;
+    }
+
+    .recovery-details {
+      margin: var(--space-2) 0 0;
+      padding-top: var(--space-2);
+      border-top: 1px solid var(--hairline);
+      color: var(--muted);
+      font-size: var(--type-10);
+      line-height: 1.55;
+    }
+
+    .inspector-footer {
+      display: flex;
+      flex: 0 0 auto;
+      justify-content: flex-end;
+      gap: var(--space-2);
+      padding: var(--space-3) var(--space-4) var(--space-4);
+      border-top: 1px solid var(--hairline);
+      background: var(--panel);
+    }
+
+    .button {
+      min-height: 32px;
+      padding: 0 var(--space-3);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-md);
+      background: var(--field);
+      color: var(--text);
+      cursor: pointer;
+      font-size: var(--type-12);
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    .button:hover {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+      box-shadow: inset 0 0 0 1px var(--faint);
+    }
+
+    .button:active {
+      opacity: 0.82;
+    }
+
+    .button.primary {
+      border: 1px solid transparent;
+      background: linear-gradient(var(--panel-raised), var(--panel-raised)) padding-box, var(--aurora) border-box;
+      color: var(--text-strong);
+    }
+
+    .button.primary:hover {
+      box-shadow: 0 0 0 1px rgba(70, 194, 200, 0.12);
+    }
+
+    .more-menu {
+      position: absolute;
+      z-index: 60;
+      top: 42px;
+      right: 76px;
+      width: 188px;
+      padding: var(--space-1);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-lg);
+      background: var(--panel);
+      box-shadow: var(--shadow-menu);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-6px);
+      transition: opacity 150ms var(--ease-out), transform 150ms var(--ease-out);
+    }
+
+    .more-menu.open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+    }
+
+    .menu-item {
+      display: flex;
+      width: 100%;
+      min-height: 34px;
+      align-items: center;
+      gap: var(--space-2);
+      padding: 0 var(--space-2);
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      font-size: var(--type-12);
+      text-align: left;
+      transition: color 120ms ease, background-color 120ms ease, opacity 120ms ease;
+    }
+
+    .menu-item:hover {
+      background: var(--panel-raised);
+      color: var(--text-strong);
+    }
+
+    .menu-item:active {
+      opacity: 0.72;
+    }
+
+    .menu-item svg {
+      width: 15px;
+      height: 15px;
+      flex: 0 0 15px;
+      fill: none;
+      stroke: var(--muted);
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .menu-separator {
+      height: 1px;
+      margin: var(--space-1) var(--space-2);
+      background: var(--hairline);
+    }
+
+    .demo-bar {
+      position: relative;
+      z-index: 100;
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: var(--space-3);
+      padding: 0 var(--space-4);
+      border-top: 1px dashed var(--faint);
+      background: #17131D;
+      color: #B9AEC5;
+      font-family: var(--font-sans);
+      user-select: none;
+    }
+
+    .demo-label {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      gap: var(--space-2);
+      overflow: hidden;
+      font-size: var(--type-11);
+      white-space: nowrap;
+    }
+
+    .demo-badge {
+      flex: 0 0 auto;
+      padding: 2px 6px;
+      border: 1px solid #55445E;
+      border-radius: var(--radius-sm);
+      color: #D3C5DE;
+      font-size: var(--type-10);
+      letter-spacing: 0.04em;
+    }
+
+    .demo-status {
+      overflow: hidden;
+      color: #8F829A;
+      text-overflow: ellipsis;
+    }
+
+    .demo-actions {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-2);
+    }
+
+    .demo-button {
+      min-height: 28px;
+      padding: 0 var(--space-3);
+      border: 1px solid #493B52;
+      border-radius: var(--radius-sm);
+      background: #211A29;
+      color: #D3C5DE;
+      cursor: pointer;
+      font-size: var(--type-11);
+      transition: color 120ms ease, background-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+
+    .demo-button:hover {
+      background: #2A2133;
+      color: #EEE7F3;
+      box-shadow: inset 0 0 0 1px #66526F;
+    }
+
+    .demo-button:active {
+      opacity: 0.74;
+    }
+
+    @media (max-width: 1100px) {
+      .session-tab {
+        width: 144px;
+        min-width: 132px;
+        flex-basis: 140px;
+      }
+
+      .tab-main {
+        padding: 0 var(--space-2);
+      }
+    }
+
+    @media (max-width: 820px) {
+      .window-dots {
+        display: none;
+      }
+
+      .more-menu {
+        right: var(--space-2);
+      }
+
+      .demo-status {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .session-tab[data-state="connecting"] .tab-light,
+      .connection-overview[data-state="connecting"] .connection-light,
+      .session-tab.success-sweep .tab-sweep {
+        animation: none;
+      }
+
+      .session-tab[data-state="connecting"] .tab-light,
+      .connection-overview[data-state="connecting"] .connection-light {
+        opacity: 0.62;
+      }
+
+      .inspector,
+      .more-menu {
+        transition: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell inspector-open" id="appShell">
+    <header class="rail">
+      <div class="tab-region">
+        <div class="tab-scroll" id="tabScroll" role="tablist" aria-label="终端会话">
+          <div class="session-tab active" data-session="fusion" data-state="connected">
+            <button class="tab-main" type="button" role="tab" aria-selected="true" aria-label="fusion-vm，已连接">
+              <span class="tab-label">fusion-vm</span>
+              <span class="tab-status">在线</span>
+            </button>
+            <span class="tab-light-track" aria-hidden="true">
+              <span class="tab-light"></span>
+              <span class="tab-sweep"></span>
+            </span>
+          </div>
+          <div class="session-tab" data-session="build" data-state="connecting">
+            <button class="tab-main" type="button" role="tab" aria-selected="false" aria-label="build 构建，连接中">
+              <span class="tab-label">build 构建</span>
+              <span class="tab-status">连接中</span>
+            </button>
+            <span class="tab-light-track" aria-hidden="true">
+              <span class="tab-light"></span>
+              <span class="tab-sweep"></span>
+            </span>
+          </div>
+          <div class="session-tab" data-session="backup" data-state="failed">
+            <button class="tab-main" type="button" role="tab" aria-selected="false" aria-label="ssh 备用，连接失败">
+              <span class="tab-label">ssh 备用</span>
+              <span class="tab-status">失败</span>
+            </button>
+            <span class="tab-light-track" aria-hidden="true">
+              <span class="tab-light"></span>
+              <span class="tab-sweep"></span>
+            </span>
+          </div>
+          <div class="session-tab" data-session="logs" data-state="complete">
+            <button class="tab-main" type="button" role="tab" aria-selected="false" aria-label="logs 日志，完成未读">
+              <span class="tab-label">logs 日志</span>
+              <span class="tab-status">完成</span>
+            </button>
+            <span class="tab-light-track" aria-hidden="true">
+              <span class="tab-light"></span>
+              <span class="tab-sweep"></span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <nav class="rail-actions" aria-label="工作区操作">
+        <button class="icon-button selected" id="connectionButton" type="button" aria-label="连接" title="连接">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M10.5 13.5l3-3"></path>
+            <path d="M7.5 15.8l-1.3 1.3a3.3 3.3 0 0 1-4.7-4.7l3.1-3.1A3.3 3.3 0 0 1 9.3 9"></path>
+            <path d="M14.7 15a3.3 3.3 0 0 0 4.7-.3l3.1-3.1a3.3 3.3 0 0 0-4.7-4.7l-1.3 1.3"></path>
+          </svg>
+        </button>
+        <button class="icon-button" id="settingsButton" type="button" aria-label="设置" title="设置">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"></path>
+          </svg>
+        </button>
+        <button class="icon-button" id="moreButton" type="button" aria-label="溢出菜单" title="更多" aria-haspopup="menu" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="5" cy="12" r="1"></circle>
+            <circle cx="12" cy="12" r="1"></circle>
+            <circle cx="19" cy="12" r="1"></circle>
+          </svg>
+        </button>
+      </nav>
+
+      <div class="window-dots" aria-label="系统窗口控件占位">
+        <span class="window-dot" aria-hidden="true"></span>
+        <span class="window-dot" aria-hidden="true"></span>
+        <span class="window-dot" aria-hidden="true"></span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <pre class="terminal-canvas" id="terminalCanvas" tabindex="0" aria-label="Fusion Development Engine 终端输出"></pre>
+      <div class="input-shield" id="inputShield" aria-hidden="true"></div>
+
+      <aside class="inspector" id="inspector" aria-label="工作区检查器" aria-hidden="false">
+        <div class="inspector-top">
+          <div class="inspector-heading">
+            <div class="inspector-title-wrap">
+              <h1 class="inspector-title" id="inspectorTitle">连接</h1>
+              <p class="inspector-subtitle" id="inspectorSubtitle">fusion-vm · Fusion Agent</p>
+            </div>
+            <button class="icon-button" id="closeInspector" type="button" aria-label="关闭检查器" title="关闭">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18"></path>
+              </svg>
+            </button>
+          </div>
+          <div class="segmented" role="tablist" aria-label="检查器目的地">
+            <button class="segment" type="button" role="tab" data-pane="terminalPane" aria-selected="false">终端</button>
+            <button class="segment" type="button" role="tab" data-pane="appearancePane" aria-selected="false">外观</button>
+            <button class="segment active" type="button" role="tab" data-pane="connectionPane" aria-selected="true">连接</button>
+          </div>
+        </div>
+
+        <div class="inspector-scroll">
+          <section class="pane" id="terminalPane" aria-label="终端设置">
+            <div class="section">
+              <h2 class="section-title">文字与输入</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">终端字号</div>
+                  <div class="setting-meta">当前会话</div>
+                </div>
+                <div class="stepper" role="group" aria-label="终端字号">
+                  <button type="button" id="fontMinus" aria-label="减小字号">−</button>
+                  <output id="fontValue">13</output>
+                  <button type="button" id="fontPlus" aria-label="增大字号">+</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">光标样式</div>
+                  <div class="setting-meta">方块光标</div>
+                </div>
+                <select class="select" aria-label="光标样式">
+                  <option>方块</option>
+                  <option>竖线</option>
+                  <option>下划线</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">复制后取消选择</div>
+                  <div class="setting-meta">保持终端输入连续</div>
+                </div>
+                <label class="switch" aria-label="复制后取消选择">
+                  <input type="checkbox" checked>
+                  <span class="switch-knob" aria-hidden="true"></span>
+                </label>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">光标常驻闪烁</div>
+                  <div class="setting-meta">高负载时不可用</div>
+                </div>
+                <label class="switch" aria-label="光标常驻闪烁，不可用">
+                  <input type="checkbox" disabled>
+                  <span class="switch-knob" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="pane" id="appearancePane" aria-label="外观设置">
+            <div class="section">
+              <h2 class="section-title">终端外观</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">配色主题</div>
+                  <div class="setting-meta">中性偏冷 · 深紫蓝</div>
+                </div>
+                <select class="select" aria-label="配色主题">
+                  <option>深场</option>
+                  <option>冷夜</option>
+                  <option>纸间</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">界面对比度</div>
+                  <div class="setting-meta">面板色差分层</div>
+                </div>
+                <select class="select" aria-label="界面对比度">
+                  <option>标准</option>
+                  <option>增强</option>
+                </select>
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">终端背景</div>
+                  <div class="setting-meta">跟随应用基底</div>
+                </div>
+                <label class="switch" aria-label="终端背景跟随应用">
+                  <input type="checkbox" checked>
+                  <span class="switch-knob" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="pane active" id="connectionPane" aria-label="连接设置">
+            <div class="connection-overview" id="connectionOverview" data-state="connected">
+              <div class="connection-row">
+                <div>
+                  <div class="connection-name">Fusion Development Engine</div>
+                  <div class="connection-detail" id="connectionDetail">172.16.100.2 · 延迟 18 毫秒</div>
+                </div>
+                <div class="status-copy" id="connectionStatus">已连接</div>
+              </div>
+              <div class="connection-light" aria-hidden="true"></div>
+            </div>
+
+            <div class="recovery" id="recoveryRow">
+              <div class="recovery-main">
+                <div class="recovery-copy" id="recoveryCopy">备用连接认证失败，主链路不受影响</div>
+                <div class="recovery-actions">
+                  <button class="inline-action" id="retryInline" type="button">重试</button>
+                  <button class="inline-action" id="detailsInline" type="button" aria-expanded="false">详情</button>
+                </div>
+              </div>
+              <p class="recovery-details" id="recoveryDetails" hidden>握手返回 401。请检查备用 SSH 配置中的令牌或改用当前 Fusion Agent 主链路。</p>
+            </div>
+
+            <div class="section">
+              <h2 class="section-title">Fusion Agent</h2>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">主机</div>
+                  <div class="setting-meta">WebSocket 终端桥接</div>
+                </div>
+                <input class="field" type="text" value="172.16.100.2" aria-label="Fusion Agent 主机">
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">端口</div>
+                  <div class="setting-meta">路径 /ws</div>
+                </div>
+                <input class="field" type="text" value="8765" inputmode="numeric" aria-label="Fusion Agent 端口">
+              </div>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <div class="setting-label">终端类型</div>
+                  <div class="setting-meta">支持真彩色</div>
+                </div>
+                <select class="select" aria-label="终端类型">
+                  <option>xterm-256color</option>
+                  <option>xterm</option>
+                </select>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="inspector-footer">
+          <button class="button" id="disconnectButton" type="button">断开</button>
+          <button class="button primary" id="reconnectButton" type="button">重新连接</button>
+        </div>
+      </aside>
+    </main>
+
+    <div class="more-menu" id="moreMenu" role="menu" aria-label="溢出菜单">
+      <button class="menu-item" type="button" role="menuitem">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM4 9h16"></path></svg>
+        <span>新建窗口</span>
+      </button>
+      <button class="menu-item" type="button" role="menuitem">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5M12 8h.01"></path></svg>
+        <span>帮助与诊断</span>
+      </button>
+      <button class="menu-item" type="button" role="menuitem">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3"></circle><path d="M5 20a7 7 0 0 1 14 0"></path></svg>
+        <span>智能代理设置</span>
+      </button>
+      <div class="menu-separator" aria-hidden="true"></div>
+      <button class="menu-item" type="button" role="menuitem">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M12 4v16"></path></svg>
+        <span>关于 Emberline</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="demo-bar" aria-label="预览演示控制条">
+    <div class="demo-label">
+      <span class="demo-badge">仅预览演示用</span>
+      <span class="demo-status" id="demoStatus" aria-live="polite">当前：fusion-vm 已连接 · 可演示一线光状态</span>
+    </div>
+    <div class="demo-actions">
+      <button class="demo-button" id="cycleButton" type="button">循环连接状态</button>
+      <button class="demo-button" id="connectingButton" type="button">切到连接中</button>
+      <button class="demo-button" id="failedButton" type="button">切到失败</button>
+    </div>
+  </div>
+
+  <script>
+    const appShell = document.getElementById('appShell');
+    const tabScroll = document.getElementById('tabScroll');
+    const terminalCanvas = document.getElementById('terminalCanvas');
+    const inspector = document.getElementById('inspector');
+    const connectionButton = document.getElementById('connectionButton');
+    const settingsButton = document.getElementById('settingsButton');
+    const moreButton = document.getElementById('moreButton');
+    const moreMenu = document.getElementById('moreMenu');
+    const connectionOverview = document.getElementById('connectionOverview');
+    const connectionStatus = document.getElementById('connectionStatus');
+    const connectionDetail = document.getElementById('connectionDetail');
+    const recoveryCopy = document.getElementById('recoveryCopy');
+    const demoStatus = document.getElementById('demoStatus');
+    const inspectorTitle = document.getElementById('inspectorTitle');
+    const inspectorSubtitle = document.getElementById('inspectorSubtitle');
+    const detailsInline = document.getElementById('detailsInline');
+    const recoveryDetails = document.getElementById('recoveryDetails');
+    let demoTimer = 0;
+    let sweepTimer = 0;
+    let fontSize = 13;
+    let activePane = 'connectionPane';
+
+    const sessionBodies = {
+      fusion: [
+        '<span class="tmux-title"> tmux · emberline  0:bash*  1:build-  2:logs- </span>',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~/emberline</span> <span class="term-violet">git:dev</span>$ git status --short --branch',
+        '<span class="term-dim">## dev...origin/dev [ahead 2]</span>',
+        '<span class="term-yellow"> M</span> entry/src/main/ets/pages/Index.ets',
+        '<span class="term-yellow"> M</span> entry/src/main/ets/theme/EmberMotion.ets',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~/emberline</span> <span class="term-violet">git:dev</span>$ ./hvigorw assembleHap --mode module -p product=default',
+        '<span class="term-cyan">[构建]</span> 读取产品配置 default',
+        '<span class="term-dim">[1/5]</span> 校验 ArkTS 源码                         <span class="term-green">完成</span>',
+        '<span class="term-dim">[2/5]</span> 编译 entry@default                     <span class="term-green">完成</span>',
+        '<span class="term-dim">[3/5]</span> 链接 libghostty_ohos                   <span class="term-green">缓存</span>',
+        '<span class="term-dim">[4/5]</span> 打包 Harmony 应用包                    <span class="term-green">完成</span>',
+        '<span class="term-dim">[5/5]</span> 写入调试签名                           <span class="term-green">完成</span>',
+        '',
+        '<span class="term-strong">BUILD SUCCESSFUL</span> <span class="term-dim">用时 3.8 秒</span>',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~/emberline</span> <span class="term-violet">git:dev</span>$ <span class="terminal-cursor" aria-hidden="true"></span>'
+      ].join('\n'),
+      build: [
+        '<span class="tmux-title"> tmux · long-build  0:hvigor*  1:log- </span>',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~/emberline</span>$ tmux attach -t long-build',
+        '<span class="term-cyan">[连接中]</span> 正在恢复构建会话…',
+        '<span class="term-dim">WebSocket</span> ws://172.16.100.2:8765/ws',
+        '<span class="term-dim">终端类型</span> xterm-256color · truecolor',
+        '',
+        '<span class="term-yellow">等待 Fusion Agent 完成握手</span>',
+        '<span class="term-dim">最近输出保留于本地滚动缓冲区，连接恢复后硬切回实时画面。</span>',
+        '',
+        '<span class="term-dim">tmux: long-build · pane 1/2</span>',
+        '<span class="terminal-cursor" aria-hidden="true"></span>'
+      ].join('\n'),
+      backup: [
+        '<span class="tmux-title"> tmux · backup  0:ssh* </span>',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~</span>$ ssh -o ConnectTimeout=5 dev@172.16.100.2',
+        '<span class="term-red">ssh: 连接到主机 172.16.100.2 的 22 端口失败：连接超时</span>',
+        '',
+        '<span class="term-yellow">备用连接失败；Fusion Agent 主链路仍可用。</span>',
+        '<span class="term-dim">建议：检查 SSH 服务，或在“连接”检查器中重试。</span>',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~</span>$ <span class="terminal-cursor" aria-hidden="true"></span>'
+      ].join('\n'),
+      logs: [
+        '<span class="tmux-title"> tmux · agent-log  0:journal* </span>',
+        '',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~</span>$ journalctl -u wand-agent -n 12 --no-pager',
+        '<span class="term-dim">14:26:02</span> <span class="term-cyan">信息</span> 客户端已连接 172.16.100.1',
+        '<span class="term-dim">14:26:02</span> <span class="term-cyan">信息</span> 已创建 PTY，终端类型 xterm-256color',
+        '<span class="term-dim">14:31:48</span> <span class="term-cyan">信息</span> 调整窗口 rows=44 cols=158',
+        '<span class="term-dim">14:34:10</span> <span class="term-green">完成</span> 构建任务退出码 0',
+        '<span class="term-dim">14:34:10</span> <span class="term-green">完成</span> 通知已发送到 Emberline',
+        '',
+        '<span class="term-strong">任务完成：entry-default-signed.hap</span>',
+        '<span class="term-green">dev@fusion-vm</span>:<span class="term-blue">~</span>$ <span class="terminal-cursor" aria-hidden="true"></span>'
+      ].join('\n')
+    };
+
+    const stateLabels = {
+      connected: '在线',
+      connecting: '连接中',
+      failed: '失败',
+      complete: '完成'
+    };
+
+    const ariaStateLabels = {
+      connected: '已连接',
+      connecting: '连接中',
+      failed: '连接失败',
+      complete: '完成未读'
+    };
+
+    function getActiveTab() {
+      return tabScroll.querySelector('.session-tab.active');
+    }
+
+    function renderTerminal(session) {
+      terminalCanvas.innerHTML = sessionBodies[session] || sessionBodies.fusion;
+      terminalCanvas.scrollTop = 0;
+      terminalCanvas.scrollLeft = 0;
+    }
+
+    function updateInspectorForTab(tab) {
+      const label = tab.querySelector('.tab-label').textContent;
+      const state = tab.dataset.state;
+      inspectorSubtitle.textContent = `${label} · Fusion Agent`;
+      connectionOverview.dataset.state = state;
+      if (state === 'connecting') {
+        connectionStatus.textContent = '连接中';
+        connectionDetail.textContent = '172.16.100.2 · 正在恢复会话';
+        recoveryCopy.textContent = '连接尚未完成，可重试或查看握手详情';
+      } else if (state === 'failed') {
+        connectionStatus.textContent = '连接失败';
+        connectionDetail.textContent = '172.16.100.2 · 最近一次握手未完成';
+        recoveryCopy.textContent = '当前会话连接失败，终端缓冲区已保留';
+      } else if (state === 'complete') {
+        connectionStatus.textContent = '任务完成';
+        connectionDetail.textContent = '172.16.100.2 · 会话保持连接';
+        recoveryCopy.textContent = '备用连接认证失败，主链路不受影响';
+      } else {
+        connectionStatus.textContent = '已连接';
+        connectionDetail.textContent = '172.16.100.2 · 延迟 18 毫秒';
+        recoveryCopy.textContent = '备用连接认证失败，主链路不受影响';
+      }
+    }
+
+    function activateTab(tab) {
+      tabScroll.querySelectorAll('.session-tab').forEach((candidate) => {
+        const active = candidate === tab;
+        candidate.classList.toggle('active', active);
+        candidate.querySelector('.tab-main').setAttribute('aria-selected', String(active));
+      });
+      renderTerminal(tab.dataset.session);
+      updateInspectorForTab(tab);
+      demoStatus.textContent = `当前：${tab.querySelector('.tab-label').textContent} ${ariaStateLabels[tab.dataset.state]}`;
+    }
+
+    function setTabState(tab, state) {
+      window.clearTimeout(sweepTimer);
+      tab.classList.remove('success-sweep');
+      tab.dataset.state = state;
+      tab.querySelector('.tab-status').textContent = stateLabels[state];
+      const label = tab.querySelector('.tab-label').textContent;
+      tab.querySelector('.tab-main').setAttribute('aria-label', `${label}，${ariaStateLabels[state]}`);
+      if (tab.classList.contains('active')) {
+        updateInspectorForTab(tab);
+        demoStatus.textContent = `当前：${label} ${ariaStateLabels[state]}`;
+      }
+    }
+
+    function triggerSuccessSweep(tab) {
+      tab.classList.remove('success-sweep');
+      void tab.offsetWidth;
+      tab.classList.add('success-sweep');
+      sweepTimer = window.setTimeout(() => tab.classList.remove('success-sweep'), 340);
+    }
+
+    function runConnectionCycle() {
+      window.clearTimeout(demoTimer);
+      const tab = getActiveTab();
+      setTabState(tab, 'connecting');
+      demoStatus.textContent = `演示：${tab.querySelector('.tab-label').textContent} 正在连接`;
+      demoTimer = window.setTimeout(() => {
+        setTabState(tab, 'connected');
+        triggerSuccessSweep(tab);
+        demoStatus.textContent = `演示：连接成功，一线光已从左到右扫过`;
+      }, 760);
+    }
+
+    function selectPane(paneId) {
+      activePane = paneId;
+      document.querySelectorAll('.segment').forEach((button) => {
+        const active = button.dataset.pane === paneId;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', String(active));
+      });
+      document.querySelectorAll('.pane').forEach((pane) => {
+        pane.classList.toggle('active', pane.id === paneId);
+      });
+      const paneLabels = {
+        terminalPane: '终端',
+        appearancePane: '外观',
+        connectionPane: '连接'
+      };
+      inspectorTitle.textContent = paneLabels[paneId];
+      connectionButton.classList.toggle('selected', paneId === 'connectionPane');
+      settingsButton.classList.toggle('selected', paneId !== 'connectionPane');
+    }
+
+    function openInspector(paneId) {
+      selectPane(paneId || activePane);
+      appShell.classList.add('inspector-open');
+      inspector.setAttribute('aria-hidden', 'false');
+      closeMenu();
+    }
+
+    function closeInspector() {
+      appShell.classList.remove('inspector-open');
+      inspector.setAttribute('aria-hidden', 'true');
+      connectionButton.classList.remove('selected');
+      settingsButton.classList.remove('selected');
+      terminalCanvas.focus({ preventScroll: true });
+    }
+
+    function closeMenu() {
+      moreMenu.classList.remove('open');
+      moreButton.setAttribute('aria-expanded', 'false');
+    }
+
+    tabScroll.addEventListener('click', (event) => {
+      const tab = event.target.closest('.session-tab');
+      if (tab) activateTab(tab);
+    });
+
+    connectionButton.addEventListener('click', () => {
+      const isOpen = appShell.classList.contains('inspector-open');
+      if (isOpen && activePane === 'connectionPane') {
+        closeInspector();
+      } else {
+        openInspector('connectionPane');
+      }
+    });
+
+    settingsButton.addEventListener('click', () => {
+      if (appShell.classList.contains('inspector-open')) {
+        closeInspector();
+      } else {
+        openInspector(activePane === 'connectionPane' ? 'terminalPane' : activePane);
+      }
+    });
+
+    document.getElementById('closeInspector').addEventListener('click', closeInspector);
+
+    document.querySelectorAll('.segment').forEach((button) => {
+      button.addEventListener('click', () => selectPane(button.dataset.pane));
+    });
+
+    moreButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const open = !moreMenu.classList.contains('open');
+      moreMenu.classList.toggle('open', open);
+      moreButton.setAttribute('aria-expanded', String(open));
+    });
+
+    moreMenu.addEventListener('click', (event) => event.stopPropagation());
+    document.addEventListener('click', closeMenu);
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      if (moreMenu.classList.contains('open')) {
+        closeMenu();
+      } else if (appShell.classList.contains('inspector-open')) {
+        closeInspector();
+      }
+    });
+
+    document.getElementById('cycleButton').addEventListener('click', runConnectionCycle);
+    document.getElementById('connectingButton').addEventListener('click', () => {
+      window.clearTimeout(demoTimer);
+      setTabState(getActiveTab(), 'connecting');
+    });
+    document.getElementById('failedButton').addEventListener('click', () => {
+      window.clearTimeout(demoTimer);
+      setTabState(getActiveTab(), 'failed');
+    });
+    document.getElementById('retryInline').addEventListener('click', runConnectionCycle);
+    document.getElementById('reconnectButton').addEventListener('click', runConnectionCycle);
+    document.getElementById('disconnectButton').addEventListener('click', () => {
+      window.clearTimeout(demoTimer);
+      setTabState(getActiveTab(), 'failed');
+      demoStatus.textContent = '演示：当前会话已断开';
+    });
+
+    detailsInline.addEventListener('click', () => {
+      const expanded = detailsInline.getAttribute('aria-expanded') === 'true';
+      detailsInline.setAttribute('aria-expanded', String(!expanded));
+      recoveryDetails.hidden = expanded;
+    });
+
+    document.getElementById('fontMinus').addEventListener('click', () => {
+      fontSize = Math.max(10, fontSize - 1);
+      document.getElementById('fontValue').textContent = String(fontSize);
+      terminalCanvas.style.fontSize = `${fontSize}px`;
+    });
+
+    document.getElementById('fontPlus').addEventListener('click', () => {
+      fontSize = Math.min(18, fontSize + 1);
+      document.getElementById('fontValue').textContent = String(fontSize);
+      terminalCanvas.style.fontSize = `${fontSize}px`;
+    });
+
+    renderTerminal('fusion');
+  </script>
+</body>
+</html>

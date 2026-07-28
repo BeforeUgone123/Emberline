@@ -18,20 +18,18 @@
 // continuous task no matter how many windows/sessions are live.
 //
 // API provenance (verified against developer.huawei.com / OpenHarmony master
-// docs; compile SDK is 5.0.0(12) == API 12):
+// docs; the configured SDK is 6.1.0(23) == API 23):
 //   - backgroundTaskManager.startBackgroundRunning(context, BackgroundMode,
 //     WantAgent): Promise<void>                         -- since API 9
 //   - backgroundTaskManager.stopBackgroundRunning(context): Promise<void>
 //                                                        -- since API 9
 //   - backgroundTaskManager.BackgroundMode.TASK_KEEPING (=== 9)   -- since API 9
 //   - wantAgent.getWantAgent(WantAgentInfo): Promise<WantAgent>   -- since API 9
-//     WantAgentInfo.actionType / .actionFlags are the API 11+ (non-deprecated at
-//     API 12) replacements for operationType / wantAgentFlags.
+//     WantAgentInfo.actionType / .actionFlags are the API 11+ replacements for
+//     operationType / wantAgentFlags.
 //   - on('continuousTaskCancel', Callback<ContinuousTaskCancelInfo>)  -- API 15+
 //   - on('continuousTaskSuspend', Callback<ContinuousTaskSuspendInfo>) -- API 20+
-//     Both events post-date the compile SDK, so they are reached through a
-//     structural cast + try/catch; a platform that lacks them simply throws and
-//     we skip the subscription (the device target, API 21, supports both).
+//     Both events are available in the configured API 23 SDK.
 
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { common, wantAgent, WantAgent, Want } from '@kit.AbilityKit';
@@ -167,11 +165,6 @@ class KeepAliveController {
     }
     this.running = false;
   }
-
-  // Subscribe once to system suspend/cancel of the continuous task so we degrade
-  // gracefully instead of assuming we are still protected. Reached through a
-  // structural cast because the events post-date the compile SDK; unsupported
-  // platforms throw at the call and we simply skip.
 
 }
 

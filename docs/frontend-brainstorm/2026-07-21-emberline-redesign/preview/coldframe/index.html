@@ -1,0 +1,1612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emberline · 冷仪 Coldframe 方向预览</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --steel-950: #0C1014;
+      --rail: #0A0D11;
+      --panel: #12171D;
+      --panel-selected: #182027;
+      --panel-pressed: #1D2730;
+      --field: #0E1318;
+      --text: #C7D2DC;
+      --text-strong: #E0E7ED;
+      --text-secondary: #77828E;
+      --text-faint: #59636E;
+      --hairline: #232B34;
+      --hairline-strong: #34404B;
+      --signal: #4EC9B0;
+      --failure: #D3604F;
+      --ansi-blue: #7EA7C4;
+      --ansi-green: #7FB7A6;
+      --ansi-yellow: #C6A86D;
+      --ansi-magenta: #B2A0BF;
+      --ansi-cyan: #70AEB7;
+      --ansi-red: #C96C61;
+      --demo-bg: #DCE2E6;
+      --demo-surface: #F2F5F6;
+      --demo-text: #151A1F;
+      --demo-muted: #5A6570;
+      --demo-line: #98A3AC;
+      --font-sans: "HarmonyOS Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --font-mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --rail-height: 48px;
+      --inspector-width: 352px;
+      --window-controls-width: 72px;
+      --radius: 2px;
+      --ease-decel: cubic-bezier(.2, 0, 0, 1);
+      --ease-sharp: cubic-bezier(.33, 0, 0, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--steel-950);
+      color: var(--text);
+      font-family: var(--font-sans);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    [tabindex]:focus-visible {
+      outline: 1px solid var(--text-secondary);
+      outline-offset: -1px;
+    }
+
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .app-shell {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--steel-950);
+    }
+
+    .rail {
+      position: relative;
+      z-index: 40;
+      display: flex;
+      width: 100%;
+      height: var(--rail-height);
+      align-items: stretch;
+      background: var(--rail);
+      border-bottom: 1px solid var(--hairline);
+      user-select: none;
+    }
+
+    .tab-strip {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      align-items: center;
+      gap: var(--space-1);
+      padding: 0 var(--space-2);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .tab-strip::-webkit-scrollbar {
+      display: none;
+    }
+
+    .session-tab {
+      position: relative;
+      display: flex;
+      height: 36px;
+      min-width: 132px;
+      max-width: 196px;
+      flex: 0 0 clamp(132px, 15vw, 196px);
+      align-items: center;
+      gap: var(--space-2);
+      padding: 0 var(--space-3) 0 var(--space-4);
+      overflow: hidden;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      text-align: left;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp), border-color 120ms var(--ease-sharp);
+    }
+
+    .session-tab:hover {
+      background: var(--panel);
+      color: var(--text);
+    }
+
+    .session-tab:active {
+      background: var(--panel-pressed);
+    }
+
+    .session-tab.is-active {
+      background: var(--panel-selected);
+      border-color: var(--hairline);
+      color: var(--text-strong);
+    }
+
+    .session-tab.is-unread .tab-title {
+      color: var(--text-strong);
+    }
+
+    .signal-track {
+      position: absolute;
+      top: 6px;
+      bottom: 6px;
+      left: 0;
+      width: 2px;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    .signal-bar {
+      position: absolute;
+      inset: 0;
+      background: var(--signal);
+      opacity: .4;
+      transform: translateY(0);
+    }
+
+    .session-tab.is-active .signal-bar {
+      opacity: 1;
+    }
+
+    .session-tab[data-state="connecting"] .signal-bar {
+      opacity: .58;
+    }
+
+    .session-tab[data-state="connecting"].is-active .signal-bar {
+      opacity: .76;
+    }
+
+    .session-tab[data-state="failed"] .signal-bar {
+      background: var(--failure);
+      opacity: .84;
+    }
+
+    .session-tab[data-state="failed"].is-active .signal-bar {
+      opacity: 1;
+    }
+
+    .signal-bar.is-writing {
+      animation: signal-write 250ms var(--ease-decel) 1 both;
+    }
+
+    @keyframes signal-write {
+      from { transform: translateY(-100%); }
+      to { transform: translateY(0); }
+    }
+
+    .tab-title {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      color: inherit;
+      font-size: 12px;
+      line-height: 1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .state-readout {
+      width: 4ch;
+      flex: 0 0 4ch;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 650;
+      letter-spacing: .02em;
+      line-height: 1;
+      text-align: right;
+      white-space: pre;
+    }
+
+    .session-tab[data-state="connected"] .state-readout {
+      color: var(--signal);
+    }
+
+    .session-tab[data-state="failed"] .state-readout {
+      color: var(--failure);
+    }
+
+    .session-tab[data-state="done"] .state-readout {
+      color: var(--text);
+    }
+
+    .rail-actions {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-1);
+      padding: 0 var(--space-1);
+      border-left: 1px solid var(--hairline);
+    }
+
+    .icon-action {
+      position: relative;
+      display: grid;
+      width: 36px;
+      height: 36px;
+      place-items: center;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp), border-color 120ms var(--ease-sharp);
+    }
+
+    .icon-action svg {
+      width: 17px;
+      height: 17px;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: square;
+      stroke-linejoin: miter;
+      stroke-width: 1.5;
+    }
+
+    .icon-action:hover {
+      background: var(--panel);
+      color: var(--text);
+    }
+
+    .icon-action:active {
+      background: var(--panel-pressed);
+    }
+
+    .icon-action.is-selected {
+      background: var(--panel-selected);
+      border-color: var(--hairline);
+      color: var(--text-strong);
+    }
+
+    .icon-action::after {
+      position: absolute;
+      top: 40px;
+      left: 50%;
+      z-index: 60;
+      padding: 5px 7px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: var(--panel);
+      color: var(--text);
+      content: attr(data-tip);
+      font-family: var(--font-sans);
+      font-size: 11px;
+      line-height: 1;
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, -4px);
+      transition: opacity 120ms var(--ease-sharp), transform 120ms var(--ease-sharp);
+      white-space: nowrap;
+    }
+
+    .icon-action:hover::after,
+    .icon-action:focus-visible::after {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+
+    .window-controls {
+      display: flex;
+      width: var(--window-controls-width);
+      flex: 0 0 var(--window-controls-width);
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-2);
+      border-left: 1px solid var(--hairline);
+    }
+
+    .window-controls span {
+      width: 8px;
+      height: 8px;
+      border: 1px solid var(--text-faint);
+      border-radius: 50%;
+      background: transparent;
+    }
+
+    .terminal-canvas {
+      position: absolute;
+      inset: var(--rail-height) 0 0;
+      overflow: hidden;
+      background: var(--steel-950);
+    }
+
+    .terminal-output {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: var(--space-6) 28px 84px;
+      overflow: auto;
+      background: var(--steel-950);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 13.5px;
+      font-variant-ligatures: none;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.58;
+      tab-size: 2;
+      white-space: pre-wrap;
+      word-break: normal;
+    }
+
+    .terminal-output::selection,
+    .terminal-output *::selection {
+      background: var(--hairline-strong);
+      color: var(--text-strong);
+    }
+
+    .ansi-dim { color: var(--text-faint); }
+    .ansi-secondary { color: var(--text-secondary); }
+    .ansi-blue { color: var(--ansi-blue); }
+    .ansi-green { color: var(--ansi-green); }
+    .ansi-yellow { color: var(--ansi-yellow); }
+    .ansi-magenta { color: var(--ansi-magenta); }
+    .ansi-cyan { color: var(--ansi-cyan); }
+    .ansi-red { color: var(--ansi-red); }
+    .ansi-bold { color: var(--text-strong); font-weight: 650; }
+    .prompt-user { color: var(--ansi-green); }
+    .prompt-path { color: var(--ansi-blue); }
+    .prompt-branch { color: var(--ansi-magenta); }
+    .terminal-cursor {
+      display: inline-block;
+      width: .62em;
+      height: 1.08em;
+      vertical-align: -.18em;
+      background: var(--text);
+    }
+
+    .input-shield {
+      position: absolute;
+      inset: var(--rail-height) 0 0;
+      z-index: 20;
+      display: none;
+      background: transparent;
+    }
+
+    .input-shield.is-active {
+      display: block;
+    }
+
+    .inspector {
+      position: absolute;
+      top: var(--rail-height);
+      right: 0;
+      bottom: 0;
+      z-index: 30;
+      display: flex;
+      width: var(--inspector-width);
+      flex-direction: column;
+      border-left: 1px solid var(--hairline);
+      background: var(--panel);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(16px);
+      transition: opacity 220ms var(--ease-decel), transform 220ms var(--ease-decel);
+    }
+
+    .inspector.is-open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+
+    .inspector-segmented {
+      display: grid;
+      height: 48px;
+      flex: 0 0 48px;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2px;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--hairline);
+      background: var(--panel);
+    }
+
+    .inspector-destination {
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: .04em;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp), border-color 120ms var(--ease-sharp);
+    }
+
+    .inspector-destination:hover {
+      background: var(--steel-950);
+      color: var(--text);
+    }
+
+    .inspector-destination:active {
+      background: var(--panel-pressed);
+    }
+
+    .inspector-destination.is-selected {
+      border-color: var(--hairline);
+      background: var(--panel-selected);
+      color: var(--text-strong);
+    }
+
+    .inspector-scroll {
+      min-height: 0;
+      flex: 1;
+      overflow-y: auto;
+      scrollbar-color: var(--hairline-strong) transparent;
+      scrollbar-width: thin;
+    }
+
+    .inspector-pane {
+      padding: var(--space-4) var(--space-4) 72px;
+    }
+
+    .inspector-pane[hidden] {
+      display: none;
+    }
+
+    .pane-heading {
+      margin: 0 0 var(--space-1);
+      color: var(--text-strong);
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+
+    .pane-description {
+      margin: 0 0 var(--space-5);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      line-height: 1.55;
+    }
+
+    .group-label {
+      margin: var(--space-5) 0 var(--space-1);
+      padding-bottom: var(--space-2);
+      border-bottom: 1px solid var(--hairline);
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .group-label:first-of-type {
+      margin-top: 0;
+    }
+
+    .setting-row {
+      display: flex;
+      min-height: 52px;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-3);
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .setting-copy {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .setting-label {
+      display: block;
+      color: var(--text);
+      font-size: 12.5px;
+      line-height: 1.35;
+    }
+
+    .setting-key,
+    .setting-value {
+      display: block;
+      margin-top: 2px;
+      color: var(--text-faint);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.3;
+    }
+
+    .mini-segmented {
+      display: flex;
+      flex: 0 0 auto;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: var(--field);
+    }
+
+    .mini-segmented button,
+    .stepper button,
+    .stepper output {
+      display: grid;
+      height: 28px;
+      min-width: 28px;
+      place-items: center;
+      padding: 0 7px;
+      border: 0;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-variant-numeric: tabular-nums;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp);
+    }
+
+    .mini-segmented button:hover,
+    .stepper button:hover {
+      background: var(--panel-selected);
+      color: var(--text);
+    }
+
+    .mini-segmented button:active,
+    .stepper button:active {
+      background: var(--panel-pressed);
+    }
+
+    .mini-segmented button.is-selected {
+      background: var(--panel-selected);
+      color: var(--text-strong);
+    }
+
+    .switch {
+      position: relative;
+      width: 34px;
+      height: 18px;
+      flex: 0 0 34px;
+      padding: 0;
+      border: 1px solid var(--hairline-strong);
+      border-radius: var(--radius);
+      background: var(--field);
+      cursor: pointer;
+      transition: background-color 120ms var(--ease-sharp), border-color 120ms var(--ease-sharp);
+    }
+
+    .switch::after {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 12px;
+      height: 12px;
+      border-radius: 1px;
+      background: var(--text-secondary);
+      content: "";
+      transform: translateX(0);
+      transition: background-color 120ms var(--ease-sharp), transform 120ms var(--ease-sharp);
+    }
+
+    .switch[aria-checked="true"] {
+      background: var(--panel-selected);
+      border-color: var(--text-secondary);
+    }
+
+    .switch[aria-checked="true"]::after {
+      background: var(--text-strong);
+      transform: translateX(16px);
+    }
+
+    .stepper {
+      display: flex;
+      flex: 0 0 auto;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: var(--field);
+    }
+
+    .stepper output {
+      width: 34px;
+      color: var(--text);
+      cursor: default;
+    }
+
+    .select-control,
+    .text-field {
+      height: 32px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: var(--field);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+    }
+
+    .select-control {
+      min-width: 126px;
+      padding: 0 28px 0 9px;
+    }
+
+    .text-field {
+      width: 168px;
+      padding: 0 9px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .theme-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      width: 126px;
+      height: 24px;
+      overflow: hidden;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+    }
+
+    .theme-strip span:nth-child(1) { background: var(--steel-950); }
+    .theme-strip span:nth-child(2) { background: var(--ansi-blue); }
+    .theme-strip span:nth-child(3) { background: var(--ansi-green); }
+    .theme-strip span:nth-child(4) { background: var(--ansi-yellow); }
+    .theme-strip span:nth-child(5) { background: var(--ansi-magenta); }
+
+    .connection-summary {
+      margin: var(--space-4) 0 var(--space-5);
+      padding: var(--space-3) 0;
+      border-top: 1px solid var(--hairline);
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .connection-summary-line {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: var(--space-3);
+    }
+
+    .connection-state {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .connection-endpoint {
+      display: block;
+      margin-top: var(--space-1);
+      color: var(--text-faint);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .inline-actions {
+      display: flex;
+      flex: 0 0 auto;
+      gap: var(--space-1);
+    }
+
+    .inline-action {
+      height: 28px;
+      padding: 0 var(--space-2);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-size: 11px;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp), border-color 120ms var(--ease-sharp);
+    }
+
+    .inline-action:hover {
+      background: var(--panel-selected);
+      color: var(--text);
+    }
+
+    .inline-action:active {
+      background: var(--panel-pressed);
+    }
+
+    .connection-details {
+      margin: var(--space-3) 0 0;
+      padding: var(--space-2);
+      border: 1px solid var(--hairline);
+      background: var(--field);
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+
+    .connection-details[hidden] {
+      display: none;
+    }
+
+    .field-stack {
+      display: grid;
+      gap: var(--space-3);
+      margin-top: var(--space-3);
+    }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 86px;
+      gap: var(--space-2);
+    }
+
+    .field-block label {
+      display: block;
+      margin-bottom: var(--space-1);
+      color: var(--text-secondary);
+      font-size: 11px;
+    }
+
+    .field-block .text-field {
+      width: 100%;
+      height: 36px;
+    }
+
+    .primary-button {
+      width: 100%;
+      height: 38px;
+      margin-top: var(--space-4);
+      border: 1px solid var(--signal);
+      border-radius: var(--radius);
+      background: var(--signal);
+      color: var(--steel-950);
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .03em;
+      transition: opacity 120ms var(--ease-sharp), background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp);
+    }
+
+    .primary-button:hover {
+      opacity: .9;
+    }
+
+    .primary-button:active {
+      opacity: .76;
+    }
+
+    .overflow-menu {
+      position: absolute;
+      top: 44px;
+      right: calc(var(--window-controls-width) + var(--space-2));
+      z-index: 55;
+      width: 190px;
+      padding: var(--space-1);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      background: var(--panel);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(-6px);
+      transition: opacity 120ms var(--ease-sharp), transform 120ms var(--ease-sharp);
+    }
+
+    .overflow-menu.is-open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+    }
+
+    .overflow-menu button {
+      width: 100%;
+      height: 34px;
+      padding: 0 var(--space-3);
+      border: 0;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-size: 12px;
+      text-align: left;
+      transition: background-color 120ms var(--ease-sharp), color 120ms var(--ease-sharp);
+    }
+
+    .overflow-menu button:hover {
+      background: var(--panel-selected);
+      color: var(--text);
+    }
+
+    .overflow-menu button:active {
+      background: var(--panel-pressed);
+    }
+
+    .overflow-menu .menu-separator {
+      height: 1px;
+      margin: var(--space-1) var(--space-2);
+      background: var(--hairline);
+    }
+
+    .demo-bar {
+      position: fixed;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 100;
+      display: flex;
+      min-height: 44px;
+      align-items: center;
+      gap: var(--space-2);
+      padding: 6px var(--space-3);
+      border-top: 1px solid var(--demo-line);
+      background: var(--demo-bg);
+      color: var(--demo-text);
+      font-family: var(--font-sans);
+    }
+
+    .demo-label {
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-2);
+      padding-right: var(--space-3);
+      border-right: 1px solid var(--demo-line);
+      font-size: 11.5px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      white-space: nowrap;
+    }
+
+    .demo-label strong {
+      padding: 3px 5px;
+      border: 1px solid var(--demo-text);
+      border-radius: var(--radius);
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      letter-spacing: .08em;
+    }
+
+    .demo-button {
+      height: 30px;
+      padding: 0 var(--space-3);
+      border: 1px solid var(--demo-line);
+      border-radius: var(--radius);
+      background: var(--demo-surface);
+      color: var(--demo-text);
+      cursor: pointer;
+      font-size: 11.5px;
+      transition: background-color 100ms linear, color 100ms linear;
+      white-space: nowrap;
+    }
+
+    .demo-button:hover {
+      background: var(--demo-text);
+      color: var(--demo-surface);
+    }
+
+    .demo-button:active {
+      background: var(--demo-muted);
+      color: var(--demo-surface);
+    }
+
+    .demo-current {
+      min-width: 0;
+      margin-left: auto;
+      overflow: hidden;
+      color: var(--demo-muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-variant-numeric: tabular-nums;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 1050px) {
+      .tab-strip {
+        padding-right: var(--space-1);
+      }
+
+      .session-tab {
+        min-width: 128px;
+        flex-basis: 136px;
+        padding-right: var(--space-2);
+        padding-left: var(--space-3);
+      }
+
+      .rail-actions {
+        gap: 2px;
+      }
+
+      .icon-action {
+        width: 34px;
+      }
+
+      .terminal-output {
+        padding-right: var(--space-5);
+        padding-left: var(--space-5);
+      }
+
+      .demo-current {
+        display: none;
+      }
+    }
+
+    @media (max-width: 760px) {
+      :root {
+        --inspector-width: min(352px, 100vw);
+      }
+
+      .window-controls {
+        width: 56px;
+        flex-basis: 56px;
+        gap: 6px;
+      }
+
+      .window-controls span {
+        width: 7px;
+        height: 7px;
+      }
+
+      .demo-label span {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .inspector,
+      .overflow-menu,
+      .signal-bar.is-writing,
+      .icon-action::after {
+        animation-duration: 1ms !important;
+        transition-duration: 1ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell" id="appShell">
+    <header class="rail" aria-label="Emberline 顶部栏">
+      <nav class="tab-strip" role="tablist" aria-label="终端会话">
+        <button class="session-tab is-active" type="button" role="tab" aria-selected="true" data-session="fusion" data-state="connected" data-template="terminal-fusion">
+          <span class="signal-track" aria-hidden="true"><span class="signal-bar"></span></span>
+          <span class="tab-title">fusion-vm</span>
+          <span class="state-readout" aria-hidden="true">CONN</span>
+        </button>
+        <button class="session-tab" type="button" role="tab" aria-selected="false" data-session="build" data-state="connecting" data-template="terminal-build">
+          <span class="signal-track" aria-hidden="true"><span class="signal-bar"></span></span>
+          <span class="tab-title">build 构建</span>
+          <span class="state-readout" aria-hidden="true">···</span>
+        </button>
+        <button class="session-tab" type="button" role="tab" aria-selected="false" data-session="logs" data-state="failed" data-template="terminal-logs">
+          <span class="signal-track" aria-hidden="true"><span class="signal-bar"></span></span>
+          <span class="tab-title">logs 日志</span>
+          <span class="state-readout" aria-hidden="true">FAIL</span>
+        </button>
+        <button class="session-tab is-unread" type="button" role="tab" aria-selected="false" data-session="ssh" data-state="done" data-template="terminal-ssh">
+          <span class="signal-track" aria-hidden="true"><span class="signal-bar"></span></span>
+          <span class="tab-title">ssh 备用</span>
+          <span class="state-readout" aria-hidden="true">DONE</span>
+        </button>
+      </nav>
+
+      <div class="rail-actions" aria-label="终端动作">
+        <button class="icon-action" id="connectionAction" type="button" data-tip="连接" aria-label="连接" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8.5 6.5 6a3.2 3.2 0 0 0-4.5 4.5l3 3A3.2 3.2 0 0 0 9.5 13l1-1"/><path d="m15 15.5 2.5 2.5a3.2 3.2 0 0 0 4.5-4.5l-3-3a3.2 3.2 0 0 0-4.5.5l-1 1"/><path d="m8.5 15.5 7-7"/></svg>
+        </button>
+        <button class="icon-action" id="settingsAction" type="button" data-tip="设置" aria-label="设置" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.64 5.64 7.2 7.2M16.8 16.8l1.56 1.56M18.36 5.64 16.8 7.2M7.2 16.8l-1.56 1.56"/><circle cx="12" cy="12" r="4"/></svg>
+        </button>
+        <button class="icon-action" id="moreAction" type="button" data-tip="溢出" aria-label="溢出菜单" aria-expanded="false" aria-controls="overflowMenu">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></svg>
+        </button>
+      </div>
+
+      <div class="window-controls" aria-label="系统窗口控件占位">
+        <span aria-hidden="true"></span>
+        <span aria-hidden="true"></span>
+        <span aria-hidden="true"></span>
+      </div>
+    </header>
+
+    <main class="terminal-canvas" id="terminalCanvas" aria-label="终端画布">
+      <pre class="terminal-output" id="terminalOutput" tabindex="0" aria-live="polite"></pre>
+    </main>
+
+    <div class="input-shield" id="inputShield" aria-hidden="true"></div>
+
+    <aside class="inspector" id="inspector" aria-label="设置检查器" aria-hidden="true">
+      <div class="inspector-segmented" role="tablist" aria-label="检查器目的地">
+        <button class="inspector-destination is-selected" type="button" role="tab" aria-selected="true" data-pane-target="terminal">终端</button>
+        <button class="inspector-destination" type="button" role="tab" aria-selected="false" data-pane-target="appearance">外观</button>
+        <button class="inspector-destination" type="button" role="tab" aria-selected="false" data-pane-target="connection">连接</button>
+      </div>
+
+      <div class="inspector-scroll">
+        <section class="inspector-pane" data-pane="terminal">
+          <h2 class="pane-heading">终端设置</h2>
+          <p class="pane-description">调整当前会话的光标与文字。设置行保持标签在左、控件在右。</p>
+
+          <div class="group-label">光标</div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">光标样式</span>
+              <span class="setting-key">= cursor-style</span>
+            </div>
+            <div class="mini-segmented" role="group" aria-label="光标样式">
+              <button class="is-selected" type="button" aria-pressed="true">竖线</button>
+              <button type="button" aria-pressed="false">方块</button>
+              <button type="button" aria-pressed="false">下划线</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">光标闪烁</span>
+              <span class="setting-key">= cursor-style-blink</span>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="光标闪烁" aria-checked="true"></button>
+          </div>
+
+          <div class="group-label">文字</div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">终端字号</span>
+              <span class="setting-key">= font-size</span>
+            </div>
+            <div class="stepper" data-min="11" data-max="20">
+              <button type="button" data-step="-1" aria-label="减小终端字号">−</button>
+              <output aria-live="polite">14</output>
+              <button type="button" data-step="1" aria-label="增大终端字号">+</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">字体</span>
+              <span class="setting-key">= font-family</span>
+            </div>
+            <select class="select-control" aria-label="终端字体">
+              <option>系统等宽</option>
+              <option>JetBrains Mono</option>
+              <option>自定义字体</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">滚动回看</span>
+              <span class="setting-key">= scrollback-limit</span>
+            </div>
+            <span class="setting-value">10,000 行</span>
+          </div>
+        </section>
+
+        <section class="inspector-pane" data-pane="appearance" hidden>
+          <h2 class="pane-heading">外观设置</h2>
+          <p class="pane-description">冷调 ANSI 与发丝线层级保持终端内容优先，不在画布上叠加模糊。</p>
+
+          <div class="group-label">配色</div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">配色方案</span>
+              <span class="setting-key">= theme</span>
+            </div>
+            <select class="select-control" aria-label="配色方案">
+              <option>冷仪</option>
+              <option>北海</option>
+              <option>石墨</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">ANSI 预览</span>
+              <span class="setting-key">= palette</span>
+            </div>
+            <div class="theme-strip" aria-label="冷调 ANSI 色板预览"><span></span><span></span><span></span><span></span><span></span></div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">背景不透明度</span>
+              <span class="setting-key">= background-opacity</span>
+            </div>
+            <span class="setting-value">100%</span>
+          </div>
+
+          <div class="group-label">布局</div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">内边距</span>
+              <span class="setting-key">= window-padding</span>
+            </div>
+            <span class="setting-value">24 × 28</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">紧凑标签</span>
+              <span class="setting-key">= compact-tabs</span>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="紧凑标签" aria-checked="false"></button>
+          </div>
+        </section>
+
+        <section class="inspector-pane" data-pane="connection" hidden>
+          <h2 class="pane-heading">连接设置</h2>
+          <p class="pane-description">融合开发引擎中的 wand-agent，通过 WebSocket 提供 PTY 会话。</p>
+
+          <div class="connection-summary" aria-live="polite">
+            <div class="connection-summary-line">
+              <div>
+                <div class="connection-state" id="recoveryState">握手超时，备用链路可恢复</div>
+                <span class="connection-endpoint">ws://172.16.100.2:8765/ws</span>
+              </div>
+              <div class="inline-actions">
+                <button class="inline-action" id="retryAction" type="button">重试</button>
+                <button class="inline-action" id="detailsAction" type="button" aria-expanded="false">详情</button>
+              </div>
+            </div>
+            <pre class="connection-details" id="connectionDetails" hidden>代码：TRANSPORT_TIMEOUT
+阶段：WebSocket 握手
+建议：确认虚拟机桥接地址与 8765 端口</pre>
+          </div>
+
+          <div class="group-label">Fusion Agent</div>
+          <div class="field-stack">
+            <div class="field-row">
+              <div class="field-block">
+                <label for="hostField">主机</label>
+                <input class="text-field" id="hostField" value="172.16.100.2" spellcheck="false">
+              </div>
+              <div class="field-block">
+                <label for="portField">端口</label>
+                <input class="text-field" id="portField" value="8765" inputmode="numeric" spellcheck="false">
+              </div>
+            </div>
+            <div class="field-block">
+              <label for="tokenField">访问令牌</label>
+              <input class="text-field" id="tokenField" type="password" value="harmonyterm" spellcheck="false">
+            </div>
+          </div>
+          <button class="primary-button" id="connectAgentAction" type="button">连接 AGENT</button>
+
+          <div class="group-label">会话</div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">启动时自动连接</span>
+              <span class="setting-key">= auto-connect</span>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="启动时自动连接" aria-checked="true"></button>
+          </div>
+          <div class="setting-row">
+            <div class="setting-copy">
+              <span class="setting-label">终端类型</span>
+              <span class="setting-key">= TERM</span>
+            </div>
+            <span class="setting-value">xterm-256color</span>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <div class="overflow-menu" id="overflowMenu" role="menu" aria-hidden="true">
+      <button type="button" role="menuitem">新建窗口</button>
+      <button type="button" role="menuitem">标签设置</button>
+      <div class="menu-separator" aria-hidden="true"></div>
+      <button type="button" role="menuitem">帮助与诊断</button>
+      <button type="button" role="menuitem">关于 Emberline</button>
+    </div>
+  </div>
+
+  <div class="demo-bar" role="region" aria-label="预览演示控制条">
+    <div class="demo-label"><strong>预览</strong><span>仅预览演示用</span></div>
+    <button class="demo-button" id="cycleStates" type="button">循环连接状态</button>
+    <button class="demo-button" id="setConnecting" type="button">切到连接中</button>
+    <button class="demo-button" id="setFailed" type="button">切到失败</button>
+    <span class="demo-current" id="demoCurrent">当前：fusion-vm · 已连接</span>
+  </div>
+
+  <template id="terminal-fusion"><span class="ansi-dim">┌─ tmux / emberline:0 / zsh ───────────────────────────────────────────────────────────────</span>
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(feat/coldframe)</span>$ git status --short --branch
+<span class="ansi-blue">## feat/coldframe...origin/feat/coldframe</span>
+ M entry/src/main/ets/pages/Index.ets
+ M entry/src/main/ets/theme/EmberMotion.ets
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(feat/coldframe)</span>$ pnpm run check:structure
+<span class="ansi-dim">&gt; emberline@0.8.0 check:structure /home/dev/src/emberline</span>
+<span class="ansi-dim">&gt; node tools/check-structure.mjs</span>
+
+<span class="ansi-green">通过</span>  rail 高度固定为 48vp
+<span class="ansi-green">通过</span>  inspector 保持 overlay，不触发终端 reflow
+<span class="ansi-green">通过</span>  终端标签切换为 0ms 硬切
+<span class="ansi-green">通过</span>  CJK 元素未使用 scale 变换
+<span class="ansi-secondary">信息</span>  检查 34 项约束，耗时 186 ms
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(feat/coldframe)</span>$ git diff --stat
+ entry/src/main/ets/pages/Index.ets       | 184 ++++++++++++++++++-------
+ entry/src/main/ets/theme/EmberMotion.ets |  32 +++--
+ 2 files changed, 164 insertions(+), 52 deletions(-)
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(feat/coldframe)</span>$ <span class="terminal-cursor" aria-label="光标"></span></template>
+
+  <template id="terminal-build"><span class="ansi-dim">┌─ tmux / emberline:1 / 构建 ──────────────────────────────────────────────────────────────</span>
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(main)</span>$ ./hvigorw assembleHap --mode module -p product=default
+<span class="ansi-blue">hvigor</span>  daemon 已启动，正在解析模块依赖…
+<span class="ansi-secondary">[1/8]</span>  :entry:default@PreBuild
+<span class="ansi-secondary">[2/8]</span>  :entry:default@GenerateProfile
+<span class="ansi-secondary">[3/8]</span>  :entry:default@CompileArkTS
+<span class="ansi-dim">       编译 127 个 ArkTS 文件</span>
+<span class="ansi-secondary">[4/8]</span>  :entry:default@ProcessResource
+<span class="ansi-secondary">[5/8]</span>  :entry:default@CompileNativeWithCmake
+<span class="ansi-dim">       [arm64-v8a] libghostty_ohos.so</span>
+<span class="ansi-yellow">等待</span>  链接 libghostty_vt.a …
+
+<span class="ansi-dim">12:41:08</span>  ninja: Entering directory `entry/.cxx/default/arm64-v8a`
+<span class="ansi-dim">12:41:09</span>  [42/57] Building CXX object terminal_surface.cpp.o
+<span class="ansi-dim">12:41:10</span>  [51/57] Building CXX object native_bridge.cpp.o
+<span class="ansi-cyan">当前任务仍在运行，切换标签不会中断远端 tmux 会话。</span>
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/emberline</span> <span class="prompt-branch">(main)</span>$ <span class="ansi-dim"># 构建完成后将发送 OSC 9 通知</span></template>
+
+  <template id="terminal-logs"><span class="ansi-dim">┌─ tmux / emberline:2 / 日志 ──────────────────────────────────────────────────────────────</span>
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/wand-agent</span> <span class="prompt-branch">(main)</span>$ journalctl -u wand-agent -n 14 --no-pager
+<span class="ansi-dim">7月 21 12:38:02 fusion-vm wand-agent[1842]: client connected peer=172.16.100.1</span>
+<span class="ansi-dim">7月 21 12:38:02 fusion-vm wand-agent[1842]: pty started term=xterm-256color</span>
+<span class="ansi-dim">7月 21 12:40:16 fusion-vm wand-agent[1842]: websocket ping timeout after=8s</span>
+<span class="ansi-red">7月 21 12:40:16 fusion-vm wand-agent[1842]: connection closed code=1006</span>
+<span class="ansi-red">7月 21 12:40:17 fusion-vm wand-agent[1842]: 重连失败：桥接网络不可达</span>
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/wand-agent</span> <span class="prompt-branch">(main)</span>$ ip route get 172.16.100.1
+<span class="ansi-red">RTNETLINK answers: Network is unreachable</span>
+
+<span class="ansi-yellow">诊断</span>  融合开发引擎的虚拟机桥接接口可能已暂停。
+<span class="ansi-secondary">建议</span>  恢复虚拟机后，在「连接」检查器中选择“重试”。
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/wand-agent</span> <span class="prompt-branch">(main)</span>$ systemctl status wand-agent --no-pager
+<span class="ansi-green">●</span> wand-agent.service - Emberline PTY bridge
+     Loaded: loaded (/etc/systemd/system/wand-agent.service; enabled)
+     Active: <span class="ansi-green">active (running)</span> since Tue 2026-07-21 09:12:44 CST
+
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~/src/wand-agent</span> <span class="prompt-branch">(main)</span>$ <span class="terminal-cursor" aria-label="光标"></span></template>
+
+  <template id="terminal-ssh"><span class="ansi-dim">┌─ tmux / emberline:3 / ssh 备用 ──────────────────────────────────────────────────────────</span>
+<span class="prompt-user">dev@fusion-vm</span>:<span class="prompt-path">~</span>$ ssh build@172.16.100.8
+<span class="ansi-secondary">上次登录：2026-07-21 12:14:08，来源 172.16.100.2</span>
+<span class="prompt-user">build@runner-08</span>:<span class="prompt-path">~/jobs/emberline</span> <span class="prompt-branch">(release/0.8)</span>$ ./publish-preview.sh
+<span class="ansi-blue">[同步]</span>  entry-default-signed.hap → /srv/artifacts/emberline/0.8.0/
+<span class="ansi-blue">[校验]</span>  sha256 6d7d3ad2b11e…a821
+<span class="ansi-green">[完成]</span>  制品已写入共享目录
+<span class="ansi-green">[完成]</span>  调试符号与 source map 已归档
+<span class="ansi-secondary">通知</span>  后台任务完成；返回此标签后未读标记将清除。
+
+<span class="prompt-user">build@runner-08</span>:<span class="prompt-path">~/jobs/emberline</span> <span class="prompt-branch">(release/0.8)</span>$ cat artifact.json
+{
+  "应用": "Emberline",
+  "平台": "HarmonyOS NEXT",
+  "架构": "arm64-v8a",
+  "状态": "可供评审"
+}
+
+<span class="prompt-user">build@runner-08</span>:<span class="prompt-path">~/jobs/emberline</span> <span class="prompt-branch">(release/0.8)</span>$ <span class="terminal-cursor" aria-label="光标"></span></template>
+
+  <script>
+    (() => {
+      const tabs = Array.from(document.querySelectorAll('.session-tab'));
+      const terminalOutput = document.getElementById('terminalOutput');
+      const inspector = document.getElementById('inspector');
+      const inputShield = document.getElementById('inputShield');
+      const settingsAction = document.getElementById('settingsAction');
+      const connectionAction = document.getElementById('connectionAction');
+      const moreAction = document.getElementById('moreAction');
+      const overflowMenu = document.getElementById('overflowMenu');
+      const destinations = Array.from(document.querySelectorAll('.inspector-destination'));
+      const panes = Array.from(document.querySelectorAll('.inspector-pane'));
+      const demoCurrent = document.getElementById('demoCurrent');
+      const recoveryState = document.getElementById('recoveryState');
+      const detailsAction = document.getElementById('detailsAction');
+      const connectionDetails = document.getElementById('connectionDetails');
+      const stateLabels = {
+        connected: '已连接',
+        connecting: '连接中',
+        failed: '失败',
+        done: '完成未读'
+      };
+      const stateReadouts = {
+        connected: 'CONN',
+        connecting: '···',
+        failed: 'FAIL',
+        done: 'DONE'
+      };
+      const dotFrames = ['···', '·  ', '·· '];
+      let activeTab = tabs[0];
+      let lastInspectorTrigger = settingsAction;
+      let connectingTimer = null;
+      let dotFrame = 0;
+      let demoTimers = [];
+
+      function renderTerminal(tab) {
+        const template = document.getElementById(tab.dataset.template);
+        terminalOutput.innerHTML = template.innerHTML.trim();
+        terminalOutput.scrollTop = 0;
+      }
+
+      function updateTabAccessibility(tab) {
+        const title = tab.querySelector('.tab-title').textContent;
+        const active = tab === activeTab ? '当前标签，' : '';
+        const unread = tab.dataset.state === 'done' ? '，后台任务完成未读' : '';
+        tab.setAttribute('aria-label', `${active}${title}，${stateLabels[tab.dataset.state]}${unread}`);
+      }
+
+      function updateDemoCurrent() {
+        const title = activeTab.querySelector('.tab-title').textContent;
+        demoCurrent.textContent = `当前：${title} · ${stateLabels[activeTab.dataset.state]}`;
+      }
+
+      function replaySignalWrite(tab) {
+        const bar = tab.querySelector('.signal-bar');
+        bar.classList.remove('is-writing');
+        void bar.offsetHeight;
+        bar.classList.add('is-writing');
+        window.setTimeout(() => bar.classList.remove('is-writing'), 270);
+      }
+
+      function clearConnectingTimer() {
+        if (connectingTimer !== null) {
+          window.clearInterval(connectingTimer);
+          connectingTimer = null;
+        }
+      }
+
+      function syncConnectingTimer() {
+        const hasConnecting = tabs.some((tab) => tab.dataset.state === 'connecting');
+        if (!hasConnecting || document.hidden) {
+          clearConnectingTimer();
+          return;
+        }
+        if (connectingTimer !== null) {
+          return;
+        }
+        connectingTimer = window.setInterval(() => {
+          dotFrame = (dotFrame + 1) % dotFrames.length;
+          tabs.forEach((tab) => {
+            if (tab.dataset.state === 'connecting') {
+              tab.querySelector('.state-readout').textContent = dotFrames[dotFrame];
+            }
+          });
+        }, 420);
+      }
+
+      function setTabState(tab, state, options = {}) {
+        tab.dataset.state = state;
+        tab.classList.toggle('is-unread', state === 'done');
+        tab.querySelector('.state-readout').textContent = state === 'connecting' ? dotFrames[0] : stateReadouts[state];
+        updateTabAccessibility(tab);
+        if (options.write && state === 'connected') {
+          replaySignalWrite(tab);
+        }
+        syncConnectingTimer();
+        updateDemoCurrent();
+      }
+
+      function selectTab(tab) {
+        activeTab = tab;
+        tabs.forEach((item) => {
+          const isActive = item === tab;
+          item.classList.toggle('is-active', isActive);
+          item.setAttribute('aria-selected', String(isActive));
+          updateTabAccessibility(item);
+        });
+        renderTerminal(tab);
+        updateDemoCurrent();
+        closeOverflowMenu();
+      }
+
+      function selectInspectorPane(name) {
+        destinations.forEach((destination) => {
+          const selected = destination.dataset.paneTarget === name;
+          destination.classList.toggle('is-selected', selected);
+          destination.setAttribute('aria-selected', String(selected));
+        });
+        panes.forEach((pane) => {
+          pane.hidden = pane.dataset.pane !== name;
+        });
+      }
+
+      function openInspector(name, trigger) {
+        lastInspectorTrigger = trigger || lastInspectorTrigger;
+        selectInspectorPane(name);
+        inspector.classList.add('is-open');
+        inspector.setAttribute('aria-hidden', 'false');
+        inputShield.classList.add('is-active');
+        settingsAction.classList.toggle('is-selected', name !== 'connection');
+        connectionAction.classList.toggle('is-selected', name === 'connection');
+        settingsAction.setAttribute('aria-expanded', String(name !== 'connection'));
+        connectionAction.setAttribute('aria-expanded', String(name === 'connection'));
+        closeOverflowMenu();
+      }
+
+      function closeInspector(restoreFocus = true) {
+        inspector.classList.remove('is-open');
+        inspector.setAttribute('aria-hidden', 'true');
+        inputShield.classList.remove('is-active');
+        settingsAction.classList.remove('is-selected');
+        connectionAction.classList.remove('is-selected');
+        settingsAction.setAttribute('aria-expanded', 'false');
+        connectionAction.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && lastInspectorTrigger) {
+          lastInspectorTrigger.focus();
+        }
+      }
+
+      function toggleInspector(name, trigger) {
+        const isOpen = inspector.classList.contains('is-open');
+        const current = destinations.find((destination) => destination.classList.contains('is-selected'))?.dataset.paneTarget;
+        if (isOpen && current === name) {
+          closeInspector(false);
+        } else {
+          openInspector(name, trigger);
+        }
+      }
+
+      function openOverflowMenu() {
+        overflowMenu.classList.add('is-open');
+        overflowMenu.setAttribute('aria-hidden', 'false');
+        moreAction.classList.add('is-selected');
+        moreAction.setAttribute('aria-expanded', 'true');
+      }
+
+      function closeOverflowMenu() {
+        overflowMenu.classList.remove('is-open');
+        overflowMenu.setAttribute('aria-hidden', 'true');
+        moreAction.classList.remove('is-selected');
+        moreAction.setAttribute('aria-expanded', 'false');
+      }
+
+      function cancelDemoSequence() {
+        demoTimers.forEach((timer) => window.clearTimeout(timer));
+        demoTimers = [];
+      }
+
+      function runStateCycle() {
+        cancelDemoSequence();
+        setTabState(activeTab, 'connecting');
+        demoTimers.push(window.setTimeout(() => setTabState(activeTab, 'connected', { write: true }), 600));
+        demoTimers.push(window.setTimeout(() => setTabState(activeTab, 'failed'), 1500));
+        demoTimers.push(window.setTimeout(() => setTabState(activeTab, 'done'), 2300));
+        demoTimers.push(window.setTimeout(() => setTabState(activeTab, 'connected', { write: true }), 3100));
+      }
+
+      tabs.forEach((tab) => tab.addEventListener('click', () => selectTab(tab)));
+
+      settingsAction.addEventListener('click', () => toggleInspector('terminal', settingsAction));
+      connectionAction.addEventListener('click', () => toggleInspector('connection', connectionAction));
+      moreAction.addEventListener('click', () => {
+        if (overflowMenu.classList.contains('is-open')) {
+          closeOverflowMenu();
+        } else {
+          openOverflowMenu();
+        }
+      });
+      inputShield.addEventListener('click', () => closeInspector());
+
+      destinations.forEach((destination) => {
+        destination.addEventListener('click', () => {
+          selectInspectorPane(destination.dataset.paneTarget);
+          settingsAction.classList.toggle('is-selected', destination.dataset.paneTarget !== 'connection');
+          connectionAction.classList.toggle('is-selected', destination.dataset.paneTarget === 'connection');
+          settingsAction.setAttribute('aria-expanded', String(destination.dataset.paneTarget !== 'connection'));
+          connectionAction.setAttribute('aria-expanded', String(destination.dataset.paneTarget === 'connection'));
+        });
+      });
+
+      document.querySelectorAll('.switch').forEach((control) => {
+        control.addEventListener('click', () => {
+          control.setAttribute('aria-checked', String(control.getAttribute('aria-checked') !== 'true'));
+        });
+      });
+
+      document.querySelectorAll('.mini-segmented').forEach((control) => {
+        control.querySelectorAll('button').forEach((button) => {
+          button.addEventListener('click', () => {
+            control.querySelectorAll('button').forEach((item) => {
+              const selected = item === button;
+              item.classList.toggle('is-selected', selected);
+              item.setAttribute('aria-pressed', String(selected));
+            });
+          });
+        });
+      });
+
+      document.querySelectorAll('.stepper').forEach((stepper) => {
+        const output = stepper.querySelector('output');
+        stepper.querySelectorAll('button').forEach((button) => {
+          button.addEventListener('click', () => {
+            const next = Number(output.value || output.textContent) + Number(button.dataset.step);
+            const min = Number(stepper.dataset.min);
+            const max = Number(stepper.dataset.max);
+            output.value = String(Math.max(min, Math.min(max, next)));
+          });
+        });
+      });
+
+      detailsAction.addEventListener('click', () => {
+        const expanded = detailsAction.getAttribute('aria-expanded') === 'true';
+        detailsAction.setAttribute('aria-expanded', String(!expanded));
+        connectionDetails.hidden = expanded;
+        detailsAction.textContent = expanded ? '详情' : '收起';
+      });
+
+      function retryConnection() {
+        cancelDemoSequence();
+        recoveryState.textContent = '正在重试连接…';
+        setTabState(activeTab, 'connecting');
+        demoTimers.push(window.setTimeout(() => {
+          recoveryState.textContent = '连接已恢复，PTY 会话可用';
+          setTabState(activeTab, 'connected', { write: true });
+        }, 900));
+      }
+
+      document.getElementById('retryAction').addEventListener('click', retryConnection);
+      document.getElementById('connectAgentAction').addEventListener('click', retryConnection);
+      document.getElementById('cycleStates').addEventListener('click', runStateCycle);
+      document.getElementById('setConnecting').addEventListener('click', () => {
+        cancelDemoSequence();
+        setTabState(activeTab, 'connecting');
+      });
+      document.getElementById('setFailed').addEventListener('click', () => {
+        cancelDemoSequence();
+        setTabState(activeTab, 'failed');
+      });
+
+      document.addEventListener('click', (event) => {
+        if (!overflowMenu.contains(event.target) && !moreAction.contains(event.target)) {
+          closeOverflowMenu();
+        }
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          if (overflowMenu.classList.contains('is-open')) {
+            closeOverflowMenu();
+            moreAction.focus();
+          } else if (inspector.classList.contains('is-open')) {
+            closeInspector();
+          }
+        }
+      });
+
+      document.addEventListener('visibilitychange', syncConnectingTimer);
+      window.addEventListener('beforeunload', () => {
+        cancelDemoSequence();
+        clearConnectingTimer();
+      });
+
+      tabs.forEach(updateTabAccessibility);
+      renderTerminal(activeTab);
+      syncConnectingTimer();
+      updateDemoCurrent();
+    })();
+  </script>
+</body>
+</html>

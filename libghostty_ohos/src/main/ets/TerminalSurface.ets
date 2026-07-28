@@ -9,11 +9,15 @@ import {
   DEFAULT_TERMINAL_CONFIG,
   TerminalConfig,
   TerminalLinkListener,
-  TerminalScrollbarState,
-  TerminalSearchStatus
+  TerminalScrollbarState
 } from './TerminalTypes';
 
 const SCROLLBAR_POLL_INTERVAL_MS: number = 100;
+// Hidden tabs only need prompt title/notification delivery. Polling them every
+// frame multiplied N-API traffic by the tab count and competed with live tmux
+// rendering, while 120 ms remains effectively immediate for chrome updates.
+const INACTIVE_TAB_TITLE_POLL_INTERVAL_MS: number = 120;
+const APP_BACKGROUND_TITLE_POLL_INTERVAL_MS: number = 500;
 const SCROLLBAR_TRACK_WIDTH: number = 12;
 const SCROLLBAR_TOUCH_WIDTH: number = 18;
 const SCROLLBAR_THUMB_WIDTH: number = 4;
@@ -25,7 +29,7 @@ const PRIVILEGED_PASTE_ENABLED: boolean = true;
 const EMBER_BOUNDARY_COLOR: string = '#D08F53';                         // 余烬铜: the accent reserved for the "hit the edge" moment
 const CURVE_DECEL_LOCAL: ICurve = curves.cubicBezierCurve(0.2, 0, 0, 1); // = CURVE_DECEL
 const CURVE_ACCEL_LOCAL: ICurve = curves.cubicBezierCurve(0.4, 0, 1, 1); // = CURVE_ACCEL
-const DUR_FLOAT_OVERLAY: number = 180;  // M17 search / secure-paste float slide + fade
+const DUR_FLOAT_OVERLAY: number = 180;  // M17 secure-paste float slide + fade
 const DUR_OVERLAY_FADE: number = 150;   // M24 scrollbar overlay auto-hide fade
 const DUR_THUMB_TWEEN: number = 100;    // M24 scrollbar thumb catch-up while not dragging
 const DUR_BOUNDARY_IN: number = 120;    // M21 edge glow fade-in
@@ -35,7 +39,6 @@ const DUR_BOUNDARY_OUT: number = 200;   // M21 edge glow fade-out
 export struct TerminalSurface {
   controller: TerminalController = new TerminalController();
   surfaceId: string = 'terminalSurface';
-  searchInputId: string = 'terminalSearchInput';
   @Prop surfaceColor: string = '#0B0D10';
   @Prop @Watch('onActiveChanged') active: boolean = true;
   // Tab visibility, independent of the drawer / tab-edit overlays. A
@@ -43,6 +46,7 @@ export struct TerminalSurface {
   // polling and the scrollbar loop follow tab visibility rather than `active`
   // (which additionally drops while an overlay owns the keyboard).
   @Prop @Watch('onVisibleChanged') visible: boolean = true;
+  @Prop @Watch('onAppBackgroundedChanged') appBackgrounded: boolean = false;
   @Prop @Watch('onForegroundFocusEpochChanged') foregroundFocusEpoch: number = 0;
   onLinkActivated: TerminalLinkListener | null = null;
   // Clipboard images are packed to PNG in the app sandbox and handed to the
@@ -51,7 +55,6 @@ export struct TerminalSurface {
   onImagePasted: ((localPath: string) => void) | null = null;
 
   private context: common.UIAbilityContext | null = null;
-  private searchInputController: TextInputController = new TextInputController();
   private fallbackTimer: number = -1;
   private scrollbarTimer: number = -1;
   private foregroundFocusTimer: number = -1;
@@ -66,16 +69,20 @@ export struct TerminalSurface {
   @State private useTextFallback: boolean = false;
   @State private fallbackContent: string = '';
   @State private fallbackError: string = '';
-  @State private searchVisible: boolean = false;
-  @State private searchText: string = '';
-  @State private searchTotal: number = 0;
-  @State private searchSelected: number = -1;
   @State private scrollbarTotal: number = 0;
   @State private scrollbarOffset: number = 0;
   @State private scrollbarVisible: number = 0;
   @State private scrollbarTrackHeight: number = 0;
   @State private scrollbarDragging: boolean = false;
   @State private securePasteVisible: boolean = false;
+  // Right-click context menu, driven by the native controlled path rather than
+  // ArkUI's unconditional ResponseType.RightClick: the menu only opens when the
+  // native mouse handler decided the right-click was NOT forwarded to a
+  // mouse-tracking shell (see TerminalController.setContextMenuListener), so the
+  // app menu and the shell's own mouse handling are mutually exclusive.
+  @State private contextMenuVisible: boolean = false;
+  @State private contextMenuAnchorX: number = 0;
+  @State private contextMenuAnchorY: number = 0;
   // M21 boundary glow: opacity of the top / bottom ember edge lines, flashed on
   // the rising edge of reaching the scrollback top / bottom. Primed `true` so the
   // initial at-top position on attach never counts as an arrival.
@@ -86,7 +93,7 @@ export struct TerminalSurface {
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    this.controller.setPollingSuspended(!this.visible);
+    this.syncPollingBudget();
     this.controller.setConfigListener((config: TerminalConfig) => {
       this.appliedFontSize = config.fontSize;
     });
@@ -98,6 +105,9 @@ export struct TerminalSurface {
     });
     this.controller.setPasteRequestListener((): void => {
       void this.pasteFromClipboardOrShowSecureButton();
+    });
+    this.controller.setContextMenuListener((x: number, y: number): void => {
+      this.showContextMenuAtPixel(x, y);
     });
     this.appliedFontSize = this.controller.getConfig().fontSize;
   }
@@ -111,20 +121,19 @@ export struct TerminalSurface {
     this.controller.setLinkListener(null);
     this.controller.setCopyRequestListener(null);
     this.controller.setPasteRequestListener(null);
+    this.controller.setContextMenuListener(null);
   }
 
   build() {
     Stack({ alignContent: Alignment.TopEnd }) {
       this.buildTerminalXComponent();
+      this.buildContextMenuAnchor();
       if (this.useTextFallback) {
         this.buildTextFallback();
       }
       if (this.shouldShowScrollbar()) {
         this.buildScrollbarOverlay();
         this.buildBoundaryGlow();
-      }
-      if (this.searchVisible) {
-        this.buildSearchOverlay();
       }
       if (this.securePasteVisible) {
         this.buildSecurePasteOverlay();
@@ -150,6 +159,7 @@ export struct TerminalSurface {
 
         this.controller.bindNative(nativeContext, this.context, this.getDisplayDensity(), this.surfaceId);
         this.controller.setImeActive(this.active);
+        this.controller.setInputBlocked(!this.active);
         this.useTextFallback = !this.controller.isRendererReady();
         this.fallbackError = this.controller.getRendererError();
         this.appliedFontSize = this.controller.getConfig().fontSize;
@@ -187,9 +197,6 @@ export struct TerminalSurface {
         }
       })
       .onTouch((_event?: TouchEvent) => {
-        if (this.searchVisible) {
-          this.searchInputController.stopEditing();
-        }
         this.requestTerminalFocus();
       })
       // The component id must match the surface id: focusControl.requestFocus
@@ -202,7 +209,45 @@ export struct TerminalSurface {
       .width('100%')
       .height('100%')
       .backgroundColor(this.surfaceColor)
-      .bindContextMenu(this.buildTerminalContextMenu(), ResponseType.RightClick)
+  }
+
+  // Invisible 1x1 anchor that tracks the last right-click point. The controlled
+  // context menu (isShown overload, API 11+; visibility is owned by
+  // contextMenuVisible, which only the native controlled path flips true, so a
+  // right-click that was forwarded to a mouse-tracking shell never also pops
+  // the app menu) must bind HERE and not on the XComponent itself: placement is
+  // resolved against the bound component, and against the full-screen surface
+  // every side overflows, so ArkUI falls back to centering the menu on screen
+  // regardless of offset. With a 1x1 anchor at the pointer, BottomLeft means
+  // "open at the pointer, desktop style", and ArkUI still auto-flips near
+  // screen edges.
+  @Builder
+  private buildContextMenuAnchor() {
+    Column()
+      .width(1)
+      .height(1)
+      .hitTestBehavior(HitTestMode.None)
+      .position({ x: this.contextMenuAnchorX, y: this.contextMenuAnchorY })
+      .bindContextMenu(this.contextMenuVisible, this.buildTerminalContextMenu(), {
+        placement: Placement.BottomLeft,
+        onDisappear: () => {
+          // Must clear the flag or the menu can never reopen.
+          this.contextMenuVisible = false;
+        }
+      })
+  }
+
+  // Native reports the right-click point in physical px relative to the surface
+  // (matching the renderer's cell metrics). Convert to vp with the same display
+  // density the surface uses for setSurfaceFrame, move the anchor there, then
+  // open the controlled menu.
+  private showContextMenuAtPixel(pxX: number, pxY: number): void {
+    const density = Math.max(1, this.getDisplayDensity());
+    const vpX = Number.isFinite(pxX) ? pxX / density : 0;
+    const vpY = Number.isFinite(pxY) ? pxY / density : 0;
+    this.contextMenuAnchorX = vpX;
+    this.contextMenuAnchorY = vpY;
+    this.contextMenuVisible = true;
   }
 
   @Builder
@@ -308,84 +353,6 @@ export struct TerminalSurface {
   }
 
   @Builder
-  private buildSearchOverlay() {
-    Column() {
-      Row({ space: 8 }) {
-        TextInput({ text: this.searchText, controller: this.searchInputController })
-          .id(this.searchInputId)
-          .width(220)
-          .height(38)
-          .fontSize(15)
-          .backgroundColor('#FF1C222B')
-          .fontColor('#FFF4F7FB')
-          .borderRadius(8)
-          .onChange((value: string) => {
-            this.searchText = value;
-            this.controller.updateSearch(value);
-            this.syncSearchStatus();
-          })
-          .onSubmit(() => {
-            this.navigateSearch(true);
-          })
-          .onFocus(() => {
-            // Tapping back into the search box after touching the terminal:
-            // the terminal grabbed the IME back (requestTerminalFocus), so
-            // yield it again for the box.
-            this.controller.setImeActive(false);
-          })
-
-        Text(this.searchLabel())
-          .fontSize(13)
-          .fontColor('#FFB8C4D9')
-          .width(64)
-          .textAlign(TextAlign.Center)
-
-        Button('上一个')
-          .height(34)
-          .fontSize(13)
-          .focusable(false)
-          .onClick(() => {
-            this.navigateSearch(false);
-          })
-
-        Button('下一个')
-          .height(34)
-          .fontSize(13)
-          .focusable(false)
-          .onClick(() => {
-            this.navigateSearch(true);
-          })
-
-        Button('关闭')
-          .height(34)
-          .fontSize(13)
-          .focusable(false)
-          .onClick(() => {
-            this.closeSearch();
-          })
-      }
-      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-      .backgroundColor('#EE11161D')
-      .borderRadius(12)
-    }
-    // Size-to-content, pinned to the Stack's TopEnd: a full-screen wrapper
-    // with HitTestMode.Transparent let every tap on the search bar ALSO hit
-    // the XComponent underneath, whose onTouch stopped the input session and
-    // yanked focus back to the terminal (search box could never keep the IME
-    // and the close button fought a losing focus battle).
-    .margin({ top: 12, right: 12 })
-    // Be explicit for XComponent overlays: the panel and its children own this
-    // hit region, so taps on find controls never fall through to native touch.
-    .hitTestBehavior(HitTestMode.Default)
-    .zIndex(20)
-    // M17: slides down from the top edge and fades on show / hide. Small,
-    // structure-preserving overlay — only a transition is added.
-    .transition(TransitionEffect.OPACITY
-      .combine(TransitionEffect.translate({ y: -8 }))
-      .animation({ duration: DUR_FLOAT_OVERLAY, curve: CURVE_DECEL_LOCAL }))
-  }
-
-  @Builder
   private buildSecurePasteOverlay() {
     Column() {
       Row({ space: 8 }) {
@@ -420,10 +387,10 @@ export struct TerminalSurface {
       .backgroundColor('#EE11161D')
       .borderRadius(12)
     }
-    // Same fix as the search overlay: size-to-content, no transparent
-    // full-screen layer for touches to fall through.
+    // Size-to-content on purpose: a transparent full-screen layer would let
+    // touches fall through to the XComponent underneath.
     .margin({ top: 12, right: 12 })
-    // M17: same top-edge slide + fade as the search overlay on show / hide.
+    // M17: top-edge slide + fade on show / hide.
     .transition(TransitionEffect.OPACITY
       .combine(TransitionEffect.translate({ y: -8 }))
       .animation({ duration: DUR_FLOAT_OVERLAY, curve: CURVE_DECEL_LOCAL }))
@@ -451,30 +418,28 @@ export struct TerminalSurface {
   }
 
   // `active` gates only IME ownership and focus: an open drawer / tab editor
-  // flips it false so the keyboard hides and the search field yields, while
-  // the (still on-screen) terminal keeps polling via `visible`.
+  // flips it false so the keyboard hides, while the (still on-screen)
+  // terminal keeps polling via `visible`.
   private onActiveChanged(): void {
     if (this.active) {
+      this.controller.setInputBlocked(false);
       this.controller.setImeActive(true);
       this.scheduleForegroundImeRequest();
       return;
     }
 
+    // Overlay open (drawer / tab editor): key and trackpad-axis events bypass
+    // the ArkUI hit-test shield, so the native side must go deaf explicitly.
+    this.controller.setInputBlocked(true);
     this.controller.setImeActive(false);
     this.stopForegroundImeRequest();
-    try {
-      this.searchInputController.stopEditing();
-    } catch (err) {
-      console.error('Failed to stop terminal search editing session: ' + JSON.stringify(err));
-    }
   }
 
-  // Tab visibility owns the controller polling budget and the scrollbar
-  // refresh loop, so a background tab throttles to the 500ms cadence and stops
-  // scrollbar polling, but a foreground tab under a translucent drawer keeps
-  // running its task output and title at full speed.
+  // Hidden tabs suspend the full input drain, but keep title updates responsive
+  // while the app is foregrounded. Only the app lifecycle selects the slower
+  // title cadence; scrollbar polling still follows tab visibility.
   private onVisibleChanged(): void {
-    this.controller.setPollingSuspended(!this.visible);
+    this.syncPollingBudget();
     if (this.visible) {
       this.syncScrollbarState();
       this.startScrollbarPolling();
@@ -483,11 +448,22 @@ export struct TerminalSurface {
     }
   }
 
+  private onAppBackgroundedChanged(): void {
+    this.syncPollingBudget();
+  }
+
+  private syncPollingBudget(): void {
+    const titlePollIntervalMs: number = this.appBackgrounded
+      ? APP_BACKGROUND_TITLE_POLL_INTERVAL_MS
+      : INACTIVE_TAB_TITLE_POLL_INTERVAL_MS;
+    this.controller.setPollingSuspended(!this.visible, titlePollIntervalMs);
+  }
+
   private scheduleForegroundImeRequest(): void {
     this.stopForegroundImeRequest();
     this.foregroundFocusTimer = setTimeout(() => {
       this.foregroundFocusTimer = -1;
-      if (!this.active || this.searchVisible) {
+      if (!this.active) {
         return;
       }
       this.requestTerminalFocus();
@@ -729,16 +705,6 @@ export struct TerminalSurface {
   @Builder
   private buildTerminalContextMenu() {
     Menu() {
-      MenuItem({ content: '查找' })
-        .onClick(() => {
-          this.openSearch(this.searchVisible ? this.searchText : '');
-        })
-      if (this.hasTerminalSelection()) {
-        MenuItem({ content: '查找所选' })
-          .onClick(() => {
-            this.openSearch(this.controller.getSelectedText());
-          })
-      }
       if (this.hasTerminalSelection()) {
         MenuItem({ content: '复制' })
           .onClick(() => {
@@ -767,65 +733,6 @@ export struct TerminalSurface {
 
   private hasTerminalSelection(): boolean {
     return this.controller.getSelectedText().length > 0;
-  }
-
-  private searchLabel(): string {
-    if (this.searchTotal <= 0) {
-      return '0/0';
-    }
-    if (this.searchSelected >= 0) {
-      return `${this.searchSelected + 1}/${this.searchTotal}`;
-    }
-    return `-/${this.searchTotal}`;
-  }
-
-  private openSearch(initialQuery: string): void {
-    const nextQuery = initialQuery.length > 0 ? initialQuery : this.searchText;
-    this.searchVisible = true;
-    this.searchText = nextQuery;
-    // The terminal's native IME editor must YIELD while the search box owns
-    // the keyboard: with it still active, the two IME clients fight over the
-    // input method and the whole overlay reads as dead (can't type, close
-    // button's click gets broken up by the focus tug-of-war).
-    this.controller.setImeActive(false);
-    this.controller.startSearch(nextQuery);
-    this.syncSearchStatus();
-    setTimeout(() => {
-      focusControl.requestFocus(this.searchInputId);
-    }, 0);
-  }
-
-  private navigateSearch(next: boolean): void {
-    this.controller.navigateSearch(next);
-    this.syncSearchStatus();
-    this.controller.setImeActive(false);
-    setTimeout(() => {
-      focusControl.requestFocus(this.searchInputId);
-    }, 0);
-  }
-
-  private closeSearch(): void {
-    try {
-      this.searchInputController.stopEditing();
-    } catch (err) {
-      console.error('Failed to stop terminal search editing session: ' + JSON.stringify(err));
-    }
-    this.controller.endSearch();
-    this.searchVisible = false;
-    this.searchText = '';
-    this.searchTotal = 0;
-    this.searchSelected = -1;
-    setTimeout(() => {
-      this.requestTerminalFocus();
-    }, 0);
-  }
-
-  private syncSearchStatus(): void {
-    const status: TerminalSearchStatus = this.controller.getSearchStatus();
-    this.searchVisible = status.active || this.searchVisible;
-    this.searchTotal = status.total;
-    this.searchSelected = status.selected;
-    this.searchText = status.query;
   }
 
   private hasTerminalScreenContent(): boolean {

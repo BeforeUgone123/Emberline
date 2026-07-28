@@ -29,13 +29,20 @@ assert.match(index, /const WINDOW_CHROME_HEIGHT: number = 48;/);
 assert.match(index, /const WINDOW_DECOR_BUTTON_RESERVE: number = 148;/);
 assert.match(index, /\.height\(WINDOW_CHROME_HEIGHT\)/);
 assert.match(index, /\.padding\(\{ left: 8, right: WINDOW_DECOR_BUTTON_RESERVE \}\)/);
+assert.doesNotMatch(ability, /setWindowTitleButtonVisible|fusionTermControlsHover/,
+  'window-control hiding retired 2026-07-28 (hover reveal was not workable)');
 assert.match(
   index,
-  /\.backgroundColor\('#080B10'\)\s*\.border\(\{ width: \{ bottom: 1 \}, color: '#121821' \}\)/s,
-  'app tab strip should visually become the custom window chrome instead of a separate toolbar'
+  /\.backgroundColor\(this\.chrome\.barBg\)/,
+  'app tab strip material derives from the active terminal theme (adaptive chrome)'
+);
+assert.doesNotMatch(
+  index,
+  /'#080B10'|'#121821'|'#151A22'/,
+  'no fixed near-black chrome colors may return after the adaptive-chrome cutover'
 );
 assert.match(
   index,
-  /\.backgroundColor\(this\.active \? '#151A22' : '#00000000'\)\s*\.border\(\{[\s\S]*?color: this\.active \? COLOR_BAR_BORDER : '#00000000'[\s\S]*?\}\)/s,
-  'active terminal tab should be integrated into the custom window chrome rail'
+  /\.backgroundColor\(this\.active\s*\? this\.chrome\.capBg[\s\S]*?\.border\(\{[\s\S]*?color: this\.active \? this\.chrome\.capBorder : '#00000000'[\s\S]*?\}\)/s,
+  'active tab is a floating pill capsule over the adaptive bar material'
 );

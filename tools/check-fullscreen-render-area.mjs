@@ -13,7 +13,10 @@ assert.match(terminalLayer, /\.width\('100%'\)/, 'terminal layer should span the
 assert.match(terminalLayer, /\.layoutWeight\(1\)/, 'terminal layer should fill only the available height below the top bar');
 assert.doesNotMatch(terminalLayer, /\.padding\(/, 'terminal layer should not add margins around the renderer');
 
-const buildBody = index.match(/  build\(\) \{[\s\S]*?\n  \}\n\n  @Builder/)?.[0] ?? '';
+// Anchor on struct Index: earlier structs (tab chip, solo title) also have
+// build() methods and would hijack a whole-file first-match.
+const indexStruct = index.slice(index.indexOf('struct Index {'));
+const buildBody = indexStruct.match(/  build\(\) \{[\s\S]*?\n  \}\n\n  @Builder/)?.[0] ?? '';
 const terminalIndex = buildBody.indexOf('this.buildTerminalLayer();');
 const tabIndex = buildBody.indexOf('this.buildTabBar();');
 assert.ok(terminalIndex >= 0, 'root build should render the terminal layer');
