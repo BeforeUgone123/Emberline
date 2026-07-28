@@ -95,8 +95,8 @@ Emberline is a native HarmonyOS Stage terminal application, not a scaffold:
   `com.preview.fusionterm.debug`, label `Emberline Dev`, SDK `6.1.0(23)`
   (API 23).
 - Release: `/mnt/linux_share/preview/harmony-advanced-terminal-release`, branch
-  `main`, bundle `com.preview.fusionterm`, label `Emberline`; its SDK target is
-  unchanged until the dev upgrade is reviewed and promoted.
+  `main`, bundle `com.preview.fusionterm`, label `Emberline`; SDK `6.1.0(23)`
+  as well, promoted with PR #1 (decision 2026-07-28 — see the API 23 section).
 - The release worktree is not a signing toggle for dev. Promote reviewed changes
   from `dev`, then build with the release identity/signing material in the
   release worktree.
@@ -107,9 +107,23 @@ Emberline is a native HarmonyOS Stage terminal application, not a scaffold:
   to `6.1.0(23)`. It therefore requires an API 23 device.
 - `compileSdkVersion` remains implicit and follows the DevEco Studio paired SDK;
   the latest local Hvigor metadata already resolved it to API 23.
-- The release worktree was deliberately left unchanged. A fresh API 23 HAP
-  build, codelinter pass, signing/install test, and device regression run remain
-  required before promotion.
+- **Promoted to `main` on 2026-07-28 (user decision, PR #1).** Both channels now
+  target `6.1.0(23)`. The alternative — holding `main` at `5.0.0(12)` until an
+  API 23 release build had been validated — was considered and rejected: dev has
+  had a device pass on API 23, and keeping the two channels on different SDK
+  targets makes every promotion a two-variable change.
+- Consequence to keep in view: the release build now requires an API 23 device
+  and **cannot install on anything below API 23**. Before the first release HAP
+  ships, the release worktree still needs its own API 23 build, codelinter pass,
+  signing/install test and device regression — those are release gates now, not
+  promotion gates.
+- The code itself does not depend on API 15+/20+ surface: `KeepAliveManager`
+  only calls `WantAgentInfo.actionType/actionFlags` (API 11+) and
+  `BackgroundMode.TASK_KEEPING` (API 9); the `continuousTaskCancel` /
+  `continuousTaskSuspend` events appear in its comments as API provenance only.
+  The window-decor calls go through an interface assertion, so they are not
+  compile-time version checked. A future downgrade is therefore technically
+  possible if a target device ever requires it.
 
 ## 2026-07-27 Fullscreen tmux Freeze Root Cause
 
