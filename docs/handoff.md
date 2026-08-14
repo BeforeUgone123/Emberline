@@ -765,6 +765,54 @@ connection inspector; Help remains the permanent way to reopen the complete
 walkthrough. It is not a standalone welcome page, carousel, dashboard, or
 quick-key surface.
 
+## 2026-08-14 Iteration A — Transport Trust, Lossless I/O, Durable Sessions
+
+All changes are source-level in `dev`; DevEco compilation and device
+verification are still owed. Six new gate scripts bring the total to 46.
+
+- **Lock-screen session death fixed at the root**: the hardened agent no
+  longer SIGHUPs the process group the moment the WebSocket drops. Sessions
+  enter a `--session-grace-seconds` window (default 120s; 0 restores the old
+  semantics), a session-level pump keeps draining the PTY into a 512 KiB
+  replay buffer, and a reconnect carrying `attach=1&sessionId=` rebinds and
+  replays in order. Unknown/expired ids degrade to a fresh session with a new
+  `ready` frame. App side: 25s ping + 40s pong deadline closes the heartbeat
+  loop, foreground/network resume probes or reconnects immediately, and a
+  successful reattach never clears the renderer, so the retained scrollback
+  stays contiguous with the replayed bytes.
+- **CR-003 partial**: Bearer header is the only default auth channel; the
+  query token survives only behind `FusionAgentEndpoint.legacyQueryToken` for
+  stock agents. Settings-UI switch still unwired.
+- **CR-001/002/010**: libssh2 pin moved to immutable master commit `4f271a3b`
+  (carries the CVE-2026-55200/55199/66035 fixes; no fixed release exists yet,
+  latest release remains 1.11.1 — switch back when one ships) with
+  merge-base commit verification in `fetch-third-party.sh`. SSH connect and
+  SFTP upload share `SSHVerifyHostKey`: SHA-256 fingerprint after handshake,
+  before credentials, against a process-wide TOFU store mirrored to
+  `filesDir/ssh_known_hosts`; mismatch fails with an explicit error through
+  the existing inline connection-error path. libssh2 init is process-wide
+  `std::call_once`.
+- **CR-006**: SSH channel and local PTY writes both use an ordered pending
+  queue drained on writable readiness (select writefds / poll POLLOUT), with
+  a failure latch and explicit `[SSH|local PTY] write failed` surfacing. The
+  `writeInput` NAPI now returns an acceptance boolean; the ArkTS declaration
+  still says `void` and should be updated when the UI consumes it.
+- **CR-004 + paste safety**: upload credentials are a per-session in-memory
+  profile bound at connect time; page-global draft fields no longer feed
+  uploads. All text paste funnels through `GuardedTerminalController`;
+  multi-line or C0-control content (excluding LF) needs an explicit
+  confirmation overlay before reaching the native paste channel.
+- **Kitty keyboard protocol wired**: `napi_init.cpp` calls the vendored
+  official key encoder through a local ABI shim (the new `key/*.h` family
+  cannot share a TU with the legacy umbrella header), syncing terminal state
+  per event via `ghostty_key_encoder_setopt_from_terminal()`; kitty flags off
+  keeps the handwritten table byte-for-byte.
+- **CJK blank glyphs**: root cause was the zero-slack typography box plus
+  MaxLines(1) silently dropping wrapped CJK glyphs (CJK can break anywhere,
+  Latin cannot); the layout box now gets 2x slack. Render/copy/search paths
+  also read full grapheme clusters instead of base codepoints only, closing
+  the review's base-codepoint finding.
+
 ## Do Not Drift
 
 Keep the product focused on the Fusion VM terminal path. Earlier brainstorming

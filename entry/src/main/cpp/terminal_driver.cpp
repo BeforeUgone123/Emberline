@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <dlfcn.h>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
@@ -20,6 +22,7 @@
 #include <sys/socket.h>
 #include "pty/pty_handler.h"
 #include "ssh/ssh_session.h"
+#include "ssh/ssh_host_key.h"
 
 #undef LOG_TAG
 #define LOG_TAG "fusion_terminal_driver"
@@ -59,6 +62,9 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_filesDir = filesDir;
+        // Durable mirror for the SSH TOFU trust records (CR-002); the native
+        // store stays authoritative at runtime, this file survives restarts.
+        SSHHostKeyTrustStore::Instance().SetStorageFile(filesDir + "/ssh_known_hosts");
     }
 
     bool StartLocal(int cols, int rows)
@@ -95,6 +101,7 @@ public:
         }
 
         m_localReadThread = std::thread(&FusionTerminalDriver::LocalReadLoop, this);
+        m_localWriteThread = std::thread(&FusionTerminalDriver::LocalWriteLoop, this);
         EmitOutput("Local PTY ready. TERM=xterm-256color COLORTERM=truecolor\r\n");
         return true;
     }
@@ -158,6 +165,9 @@ public:
         if (m_localReadThread.joinable()) {
             m_localReadThread.join();
         }
+        if (m_localWriteThread.joinable()) {
+            m_localWriteThread.join();
+        }
 
         std::unique_ptr<SSHSession> session;
         int masterFd = -1;
@@ -172,6 +182,13 @@ public:
             m_masterFd = -1;
             m_writeFd = -1;
             m_childPid = -1;
+            // Close the write queue: bytes queued for the dead transport are
+            // dropped here exactly once, after the drain thread has joined,
+            // and later writes are rejected via !m_running instead of being
+            // accepted into a queue nobody will drain.
+            m_pendingWrites.clear();
+            m_pendingWriteOffset = 0;
+            m_writeFailed = false;
         }
 
         if (session) {
@@ -185,18 +202,43 @@ public:
         }
     }
 
-    void Write(const std::string& data)
+    // Returns true when every byte was accepted — written to the transport
+    // immediately or held in the ordered pending queue for the
+    // writable-readiness drain. Returns false when the queue is closed
+    // (session stopped or write side already failed) so the rejection is
+    // explicit at the NAPI boundary; no byte is dropped silently.
+    bool Write(const std::string& data)
     {
         if (data.empty()) {
-            return;
+            return true;
         }
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_mode == DriverMode::RemoteSsh && m_sshSession) {
-            m_sshSession->write(data.c_str(), data.size());
-            return;
+        bool accepted = false;
+        bool emitFailure = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_mode == DriverMode::RemoteSsh && m_sshSession) {
+                return m_sshSession->write(data.c_str(), data.size());
+            }
+            if (m_running && m_writeFd >= 0 && !m_writeFailed) {
+                m_pendingWrites.emplace_back(data);
+                // Fast path: drain right away so interactive input keeps its
+                // latency; whatever the nonblocking fd refuses stays queued
+                // for LocalWriteLoop in the original order.
+                std::string error;
+                if (DrainPendingWritesLocked(m_writeFd, error)) {
+                    accepted = true;
+                } else {
+                    m_writeFailed = true;
+                    emitFailure = true;
+                    OH_LOG_ERROR(LOG_APP, "Local PTY write failed: %s", error.c_str());
+                }
+            }
         }
-        WriteToLocalPtyLocked(data.c_str(), data.size());
+        if (emitFailure) {
+            EmitOutput("\r\n[local PTY write failed]\r\n");
+        }
+        return accepted;
     }
 
     void Resize(int cols, int rows)
@@ -330,21 +372,101 @@ private:
         }
     }
 
-    void WriteToLocalPtyLocked(const char* data, size_t length)
+    // Writes as much of the pending FIFO queue as the nonblocking descriptor
+    // accepts right now. EAGAIN keeps the remaining bytes queued for the next
+    // writable-ready pass; only a hard error returns false so the caller can
+    // propagate the failure instead of discarding the unwritten tail.
+    bool DrainPendingWritesLocked(int writeFd, std::string& error)
     {
-        if (m_writeFd < 0 || !data || length == 0) {
-            return;
-        }
-        size_t offset = 0;
-        while (offset < length) {
-            const ssize_t written = write(m_writeFd, data + offset, length - offset);
+        while (!m_pendingWrites.empty()) {
+            const std::string& head = m_pendingWrites.front();
+            const size_t remaining = head.size() - m_pendingWriteOffset;
+            const ssize_t written = write(writeFd, head.data() + m_pendingWriteOffset, remaining);
             if (written < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return true;
+                }
+                error = strerror(errno);
+                return false;
+            }
+            if (written == 0) {
+                // Should not happen for a non-empty buffer; treat it like
+                // would-block so the queue survives for the next pass.
+                return true;
+            }
+            m_pendingWriteOffset += static_cast<size_t>(written);
+            if (m_pendingWriteOffset >= head.size()) {
+                m_pendingWrites.pop_front();
+                m_pendingWriteOffset = 0;
+            }
+        }
+        return true;
+    }
+
+    // Lossless local write path: Write() appends to m_pendingWrites (and
+    // drains inline when the fd accepts it), while this loop flushes whatever
+    // backpressure left behind, driven by poll() writable readiness. A hard
+    // failure is surfaced once through the output callback and closes the
+    // queue for later writes instead of silently dropping bytes.
+    void LocalWriteLoop()
+    {
+        while (true) {
+            int writeFd = -1;
+            bool hasPending = false;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_running || m_mode != DriverMode::LocalPty ||
+                    m_writeFd < 0 || m_writeFailed) {
+                    break;
+                }
+                writeFd = m_writeFd;
+                hasPending = !m_pendingWrites.empty();
+            }
+
+            if (!hasPending) {
+                usleep(4000);
+                continue;
+            }
+
+            struct pollfd pfd {};
+            pfd.fd = writeFd;
+            pfd.events = POLLOUT;
+            // Short timeout so Stop() never waits long on the join; writable
+            // readiness itself wakes the poll immediately.
+            const int ready = poll(&pfd, 1, 25);
+            if (ready == 0 || (ready < 0 && errno == EINTR)) {
+                continue;
+            }
+
+            bool failed = ready < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+            if (!failed && (pfd.revents & POLLOUT) != 0) {
+                std::string error;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    // Stop()/StartLocal() may have swapped the descriptor
+                    // while poll() was blocked; only drain into the live one.
+                    if (m_running && m_writeFd == writeFd &&
+                        !DrainPendingWritesLocked(writeFd, error)) {
+                        m_writeFailed = true;
+                        failed = true;
+                    }
+                }
+                if (!error.empty()) {
+                    OH_LOG_ERROR(LOG_APP, "Local PTY write drain failed: %s", error.c_str());
+                }
+            }
+
+            if (failed) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_writeFailed = true;
+                }
+                EmitOutput("\r\n[local PTY write failed]\r\n");
                 break;
             }
-            offset += static_cast<size_t>(written);
         }
     }
 
@@ -442,6 +564,12 @@ private:
     napi_threadsafe_function m_outputTsfn = nullptr;
     std::string m_filesDir;
     std::thread m_localReadThread;
+    std::thread m_localWriteThread;
+    // Ordered pending-byte queue for the lossless local write path. Guarded
+    // by m_mutex, drained by Write()'s fast path and LocalWriteLoop.
+    std::deque<std::string> m_pendingWrites;
+    size_t m_pendingWriteOffset = 0;
+    bool m_writeFailed = false;
     std::unique_ptr<SSHSession> m_sshSession;
     std::atomic<bool> m_running {false};
     std::atomic<uint64_t> m_generation {0};
@@ -663,17 +791,25 @@ napi_value Stop(napi_env env, napi_callback_info info)
     return ReturnUndefined(env);
 }
 
+// Returns whether the bytes were accepted (written or queued for the
+// lossless drain). false means the write side is closed or has failed, so
+// ArkTS can tell a rejected keystroke apart from an accepted one; transport
+// failures after acceptance are surfaced separately through the output
+// callback ("[local PTY write failed]").
 napi_value WriteInput(napi_env env, napi_callback_info info)
 {
     size_t argc = 2;
     napi_value args[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    bool accepted = false;
     if (argc >= 2) {
         if (auto session = FindSession(ReadIntArg(env, args[0], -1))) {
-            session->Write(ReadStringArg(env, args[1]));
+            accepted = session->Write(ReadStringArg(env, args[1]));
         }
     }
-    return ReturnUndefined(env);
+    napi_value result;
+    napi_get_boolean(env, accepted, &result);
+    return result;
 }
 
 napi_value DrainOutput(napi_env env, napi_callback_info info)
@@ -770,7 +906,9 @@ struct SshUploadContext {
 
 void RunSftpUpload(SshUploadContext* ctx)
 {
-    libssh2_init(0);
+    if (!EnsureLibssh2ProcessInit(ctx->error)) {
+        return;
+    }
 
     addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
@@ -813,6 +951,11 @@ void RunSftpUpload(SshUploadContext* ctx)
     do {
         if (libssh2_session_handshake(session, fd) != 0) {
             ctx->error = "SSH 握手失败";
+            break;
+        }
+        // CR-002: verify the host key against the shared TOFU store before
+        // any credential leaves the device (same gate as the SSH session).
+        if (!SSHVerifyHostKey(session, ctx->host, ctx->port, ctx->error)) {
             break;
         }
         if (libssh2_userauth_password(session, ctx->user.c_str(), ctx->password.c_str()) != 0) {

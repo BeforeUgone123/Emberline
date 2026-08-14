@@ -20,6 +20,9 @@ assert.equal(DEFAULT_FUSION_AGENT_PATH, '/ws');
 assert.equal(DEFAULT_FUSION_AGENT_PORT, 8765);
 assert.equal(DEFAULT_FUSION_AGENT_TOKEN, 'harmonyterm');
 
+// CR-003: the default endpoint authenticates via the Authorization header
+// only; the token must not appear in the URL unless the stock-agent legacy
+// fallback is explicitly requested.
 assert.equal(
   buildFusionAgentUrl({
     host: '',
@@ -28,6 +31,19 @@ assert.equal(
     cols: 0,
     rows: 0,
     token: DEFAULT_FUSION_AGENT_TOKEN
+  }),
+  'ws://172.16.100.2:8765/ws?cols=80&rows=24'
+);
+
+assert.equal(
+  buildFusionAgentUrl({
+    host: '',
+    port: 0,
+    path: '',
+    cols: 0,
+    rows: 0,
+    token: DEFAULT_FUSION_AGENT_TOKEN,
+    legacyQueryToken: true
   }),
   'ws://172.16.100.2:8765/ws?token=harmonyterm&cols=80&rows=24'
 );

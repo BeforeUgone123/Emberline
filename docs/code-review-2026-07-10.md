@@ -21,12 +21,19 @@ named symbols when auditing the current tree.
 
 | Finding | Dev status | Current disposition |
 | --- | --- | --- |
-| CR-001–CR-004 | Unresolved | Still release-blocking. |
+| CR-001 | Resolved in source (2026-08-14) | libssh2 pin is now the immutable master commit `4f271a3b` (2026-08-14) carrying the CVE-2026-55200/55199/66035 fixes; `tools/fetch-third-party.sh` verifies HEAD and fix commits via `merge-base`. No upstream release contains the fixes yet (latest is still 1.11.1) — switch back to a release pin once one ships. DevEco fetch + build verification pending. |
+| CR-002 | Resolved in source (2026-08-14) | SSH and SFTP both gate on `SSHVerifyHostKey` after the handshake and before credentials: SHA-256 fingerprint against a process-wide TOFU store, mismatch fails the connection through the existing inline error path; durable mirror at `filesDir/ssh_known_hosts`. Device verification pending. |
+| CR-003 | Partially resolved (2026-08-14) | The app now sends only `Authorization: Bearer` by default; the query token is confined to an explicit `legacyQueryToken` endpoint flag for stock agents. Random pairing token and secure-element credential storage remain open. |
+| CR-004 | Resolved in source (2026-08-14) | Image upload credentials are a per-session in-memory upload profile bound at connect time (`TerminalSessionHandle.bindUploadProfile`); the page-global draft fields no longer feed uploads. Passwords remain runtime-only. |
 | CR-005 | Resolved; product decision superseded | The 2026-08-01 one-shot deploy prompt intentionally restores automatic onboarding, while guide/editor/inspector state continues to block terminal input and restore focus safely. |
-| CR-006–CR-010 | Unresolved | Native I/O/lifecycle, Agent recovery, renderer disposal, and libssh2 lifetime still need repair. |
+| CR-006 | Resolved in source (2026-08-14) | Both SSH channel writes and local PTY writes now use an ordered pending queue drained on writable readiness with a failure latch and explicit upward error; no byte tail is silently dropped. Device verification pending. |
+| CR-007 | Partially resolved (2026-08-14) | Missed-heartbeat detection closed the loop (25s ping + 40s pong deadline, resume probe). The hardened agent now keeps PTYs alive for a `--session-grace-seconds` window (default 120s) and rebinds on `attach=1&sessionId=` with a 512 KiB replay buffer; reattach no longer clears the renderer. Multi-window/lock-screen survival needs device proof. |
+| CR-008 | Unresolved | Native EOF propagation to ArkTS still open. |
+| CR-009 | Unresolved | Final renderer-host disposal still open. |
+| CR-010 | Resolved in source (2026-08-14) | libssh2 init is `std::call_once` process-wide via `EnsureLibssh2ProcessInit`; per-session init/exit and the unpaired failure paths are gone. |
 | CR-011 | Resolved in source; device gate pending | Owner context, transition generation, system task events, and lifecycle reconciliation are implemented; long-lock survival still needs device proof. |
 | CR-012 | Resolved in dev | Quick-key state, builder, helper, and icons remain removed. A minimal preferences-backed onboarding store returned only for the explicit 2026-08-01 deploy-prompt decision. |
-| CR-013 | Partially resolved | README now uses a fail-fast loop and the gate has 33 scripts; the ignored signing-profile dependency and lack of executable integration/device tests remain. |
+| CR-013 | Partially resolved | README now uses a fail-fast loop and the gate has 46 scripts; the ignored signing-profile dependency and lack of executable integration/device tests remain. |
 | CR-014 | Partially resolved | Dev and release are separate worktrees/bundle identities; signing files remain machine-specific and release signing still needs clean-machine verification. |
 
 The 2026-07-18 UI and lifecycle pass did not change renderer, native driver,

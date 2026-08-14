@@ -89,6 +89,19 @@ public:
     bool cursorKeysApplicationMode() const;
     bool bracketedPasteEnabled() const;
 
+    // Kitty keyboard protocol (DispatchKeyEvent in napi_init.cpp): the official
+    // ghostty key encoder syncs from live VT state (kitty flags, DECCKM, keypad
+    // and modifyOtherKeys modes) through the raw handle, and every m_vt access
+    // must serialize with feedOutput/drawFrame. Runs `fn(m_vt)` with
+    // m_stateMutex held; `fn` must not call back into Terminal (the lock is
+    // not recursive).
+    void withVtHandleLocked(const std::function<void(ghostty_terminal_t)>& fn) const {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (m_vt) {
+            fn(m_vt);
+        }
+    }
+
     // Encode clipboard text (bracketed-paste aware, unsafe bytes stripped)
     // and write it to the terminal input path.
     void pasteText(const std::string& text);

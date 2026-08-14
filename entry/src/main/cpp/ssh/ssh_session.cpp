@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cerrno>
 #include <sys/select.h>
+#include "ssh_host_key.h"
 
 #undef LOG_TAG
 #define LOG_TAG "SSHSession"
@@ -29,7 +30,8 @@ bool SetRemoteEnv(_LIBSSH2_CHANNEL* channel, const char* key, const char* value)
 
 SSHSession::SSHSession()
     : m_socketFd(-1), m_session(nullptr), m_channel(nullptr),
-      m_connected(false), m_running(false) {}
+      m_connected(false), m_running(false),
+      m_pendingWriteOffset(0), m_writeFailed(false) {}
 
 SSHSession::~SSHSession() {
     disconnect();
@@ -39,8 +41,9 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
                          const std::string& password, int cols, int rows, std::string& error) {
     disconnect();
 
-    if (libssh2_init(0) != 0) {
-        error = "libssh2_init failed";
+    // CR-010: one process-wide libssh2 init, never paired with a per-session
+    // libssh2_exit() that would free global state other sessions still use.
+    if (!EnsureLibssh2ProcessInit(error)) {
         return false;
     }
 
@@ -53,7 +56,6 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
     int rc = getaddrinfo(host.c_str(), portString.c_str(), &hints, &result);
     if (rc != 0 || !result) {
         error = "Failed to resolve host";
-        libssh2_exit();
         return false;
     }
 
@@ -72,7 +74,6 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
 
     if (m_socketFd < 0) {
         error = "Failed to connect socket";
-        libssh2_exit();
         return false;
     }
 
@@ -81,7 +82,6 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
         error = "Failed to create SSH session";
         ::close(m_socketFd);
         m_socketFd = -1;
-        libssh2_exit();
         return false;
     }
 
@@ -94,7 +94,14 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
         return false;
     }
 
-    // Initial implementation skips host-key verification.
+    // CR-002: authenticate the server — SHA-256 fingerprint against the TOFU
+    // trust store — before any credential leaves the device. SFTP uploads pass
+    // through the same verifier.
+    if (!SSHVerifyHostKey(m_session, host, port, error)) {
+        disconnect();
+        return false;
+    }
+
     rc = libssh2_userauth_password(m_session, user.c_str(), password.c_str());
     if (rc != 0) {
         error = "SSH password authentication failed";
@@ -152,6 +159,13 @@ void SSHSession::disconnect() {
 
     std::lock_guard<std::mutex> lock(m_ioMutex);
 
+    // Close the write queue: bytes still queued for the dead transport are
+    // dropped here exactly once, and later writes fail explicitly instead of
+    // being accepted into a queue nobody will drain.
+    m_pendingWrites.clear();
+    m_pendingWriteOffset = 0;
+    m_writeFailed = false;
+
     if (m_channel) {
         libssh2_channel_close(m_channel);
         libssh2_channel_free(m_channel);
@@ -169,30 +183,81 @@ void SSHSession::disconnect() {
         m_socketFd = -1;
     }
 
-    if (m_connected.load()) {
-        libssh2_exit();
-    }
     m_connected = false;
+    // No libssh2_exit() here: the library is initialized once per process via
+    // EnsureLibssh2ProcessInit() and lives until process teardown (CR-010).
 }
 
+// CR-006 (SSH half): every byte lands in the ordered pending queue first and
+// is drained in FIFO order — inline right away so interactive input keeps its
+// latency, otherwise by the writable-readiness pass in readLoop(). EAGAIN
+// keeps the tail queued; a hard channel error latches m_writeFailed, surfaces
+// one terminal-visible notice, and rejects this and later writes. No byte is
+// dropped silently.
 bool SSHSession::write(const char* data, size_t len) {
-    if (!m_connected || !m_channel || len == 0) {
+    if (!data || len == 0) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_ioMutex);
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t written = libssh2_channel_write(m_channel, data + offset, len - offset);
-        if (written == LIBSSH2_ERROR_EAGAIN) {
-            break;
-        }
-        if (written < 0) {
+    bool emitFailure = false;
+    {
+        std::lock_guard<std::mutex> lock(m_ioMutex);
+        if (!m_connected || !m_channel || m_writeFailed) {
             return false;
         }
-        offset += static_cast<size_t>(written);
+        m_pendingWrites.emplace_back(data, len);
+        // Fast path: drain right away; whatever the nonblocking channel
+        // refuses stays queued for readLoop() in the original order.
+        if (drainPendingWritesLocked()) {
+            return true;
+        }
+        m_writeFailed = true;
+        emitFailure = true;
+    }
+
+    if (emitFailure) {
+        notifyWriteFailure();
+    }
+    return false;
+}
+
+// Writes as much of the pending FIFO queue as the nonblocking channel accepts
+// right now. EAGAIN keeps the remaining bytes queued for the next
+// writable-ready pass; only a hard error returns false so the caller can
+// propagate the failure instead of discarding the unwritten tail.
+bool SSHSession::drainPendingWritesLocked() {
+    while (!m_pendingWrites.empty()) {
+        const std::string& head = m_pendingWrites.front();
+        const size_t remaining = head.size() - m_pendingWriteOffset;
+        const ssize_t written = libssh2_channel_write(m_channel, head.data() + m_pendingWriteOffset,
+                                                      remaining);
+        if (written == LIBSSH2_ERROR_EAGAIN) {
+            return true;
+        }
+        if (written < 0) {
+            OH_LOG_ERROR(LOG_APP, "SSH channel write failed: %d", static_cast<int>(written));
+            return false;
+        }
+        if (written == 0) {
+            // Should not happen for a non-empty buffer; treat it like
+            // would-block so the queue survives for the next pass.
+            return true;
+        }
+        m_pendingWriteOffset += static_cast<size_t>(written);
+        if (m_pendingWriteOffset >= head.size()) {
+            m_pendingWrites.pop_front();
+            m_pendingWriteOffset = 0;
+        }
     }
     return true;
+}
+
+// Surfaces a latched write failure once through the existing output callback
+// so the rejection is visible on the terminal instead of silent.
+void SSHSession::notifyWriteFailure() {
+    if (m_outputCallback) {
+        m_outputCallback("\r\n[SSH write failed]\r\n");
+    }
 }
 
 void SSHSession::resize(int cols, int rows) {
@@ -231,11 +296,41 @@ void SSHSession::readLoop() {
             break;
         }
 
+        // Writable-readiness drive for the pending write queue: watch the
+        // session socket for writability whenever backpressure left bytes
+        // behind (select() on the session fd is the documented libssh2
+        // nonblocking pattern), then drain the queue in order.
+        bool wantWrite = false;
+        {
+            std::lock_guard<std::mutex> lock(m_ioMutex);
+            wantWrite = !m_pendingWrites.empty() && !m_writeFailed;
+        }
+
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(m_socketFd, &readfds);
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        if (wantWrite) {
+            FD_SET(m_socketFd, &writefds);
+        }
         struct timeval tv = {0, 16000};
-        select(m_socketFd + 1, &readfds, nullptr, nullptr, &tv);
+        select(m_socketFd + 1, &readfds, wantWrite ? &writefds : nullptr, nullptr, &tv);
+
+        if (wantWrite) {
+            bool emitFailure = false;
+            {
+                std::lock_guard<std::mutex> lock(m_ioMutex);
+                if (m_connected && m_channel && !m_writeFailed &&
+                    !drainPendingWritesLocked()) {
+                    m_writeFailed = true;
+                    emitFailure = true;
+                }
+            }
+            if (emitFailure) {
+                notifyWriteFailure();
+            }
+        }
     }
 
     m_connected = false;

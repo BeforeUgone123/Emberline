@@ -555,6 +555,505 @@ int XtermModifierCode(bool shift, bool alt, bool ctrl)
     return 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
 }
 
+// ── Kitty keyboard protocol: official ghostty key encoder shim ──────────────
+// The vendored libghostty_vt.a exports the full ghostty_key_encoder_* /
+// ghostty_key_event_* API, but its headers (include/ghostty/vt/key/*.h) cannot
+// share a translation unit with the legacy umbrella include/ghostty_vt.h that
+// terminal/terminal.h pulls in: both define the same GHOSTTY_* enumerator
+// names. The declarations below mirror that ABI exactly — enum bodies are
+// copied verbatim from include/ghostty/vt/key/event.h and encoder.h and must
+// be updated together with the vendored library (the same local-declaration
+// pattern terminal.cpp already uses for ghostty_terminal_mode_get).
+// tools/check-kitty-keyboard.mjs pins the GhosttyKey enum order against the
+// official header.
+typedef enum {
+    GHOSTTY_KEY_ACTION_RELEASE = 0,
+    GHOSTTY_KEY_ACTION_PRESS = 1,
+    GHOSTTY_KEY_ACTION_REPEAT = 2,
+} GhosttyKeyAction;
+
+typedef uint16_t GhosttyMods;
+constexpr GhosttyMods GHOSTTY_MODS_SHIFT = 1 << 0;
+constexpr GhosttyMods GHOSTTY_MODS_CTRL = 1 << 1;
+constexpr GhosttyMods GHOSTTY_MODS_ALT = 1 << 2;
+constexpr GhosttyMods GHOSTTY_MODS_SUPER = 1 << 3;
+constexpr GhosttyMods GHOSTTY_MODS_CAPS_LOCK = 1 << 4;
+constexpr GhosttyMods GHOSTTY_MODS_NUM_LOCK = 1 << 5;
+
+typedef uint8_t GhosttyKittyKeyFlags;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_DISABLED = 0;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_DISAMBIGUATE = 1 << 0;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_REPORT_EVENTS = 1 << 1;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_REPORT_ALTERNATES = 1 << 2;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_REPORT_ALL = 1 << 3;
+constexpr GhosttyKittyKeyFlags GHOSTTY_KITTY_KEY_REPORT_ASSOCIATED = 1 << 4;
+
+// Physical key codes, layout-independent, verbatim from event.h (W3C UI Events
+// KeyboardEvent code standard).
+typedef enum {
+    GHOSTTY_KEY_UNIDENTIFIED = 0,
+
+    // Writing System Keys (W3C § 3.1.1)
+    GHOSTTY_KEY_BACKQUOTE,
+    GHOSTTY_KEY_BACKSLASH,
+    GHOSTTY_KEY_BRACKET_LEFT,
+    GHOSTTY_KEY_BRACKET_RIGHT,
+    GHOSTTY_KEY_COMMA,
+    GHOSTTY_KEY_DIGIT_0,
+    GHOSTTY_KEY_DIGIT_1,
+    GHOSTTY_KEY_DIGIT_2,
+    GHOSTTY_KEY_DIGIT_3,
+    GHOSTTY_KEY_DIGIT_4,
+    GHOSTTY_KEY_DIGIT_5,
+    GHOSTTY_KEY_DIGIT_6,
+    GHOSTTY_KEY_DIGIT_7,
+    GHOSTTY_KEY_DIGIT_8,
+    GHOSTTY_KEY_DIGIT_9,
+    GHOSTTY_KEY_EQUAL,
+    GHOSTTY_KEY_INTL_BACKSLASH,
+    GHOSTTY_KEY_INTL_RO,
+    GHOSTTY_KEY_INTL_YEN,
+    GHOSTTY_KEY_A,
+    GHOSTTY_KEY_B,
+    GHOSTTY_KEY_C,
+    GHOSTTY_KEY_D,
+    GHOSTTY_KEY_E,
+    GHOSTTY_KEY_F,
+    GHOSTTY_KEY_G,
+    GHOSTTY_KEY_H,
+    GHOSTTY_KEY_I,
+    GHOSTTY_KEY_J,
+    GHOSTTY_KEY_K,
+    GHOSTTY_KEY_L,
+    GHOSTTY_KEY_M,
+    GHOSTTY_KEY_N,
+    GHOSTTY_KEY_O,
+    GHOSTTY_KEY_P,
+    GHOSTTY_KEY_Q,
+    GHOSTTY_KEY_R,
+    GHOSTTY_KEY_S,
+    GHOSTTY_KEY_T,
+    GHOSTTY_KEY_U,
+    GHOSTTY_KEY_V,
+    GHOSTTY_KEY_W,
+    GHOSTTY_KEY_X,
+    GHOSTTY_KEY_Y,
+    GHOSTTY_KEY_Z,
+    GHOSTTY_KEY_MINUS,
+    GHOSTTY_KEY_PERIOD,
+    GHOSTTY_KEY_QUOTE,
+    GHOSTTY_KEY_SEMICOLON,
+    GHOSTTY_KEY_SLASH,
+
+    // Functional Keys (W3C § 3.1.2)
+    GHOSTTY_KEY_ALT_LEFT,
+    GHOSTTY_KEY_ALT_RIGHT,
+    GHOSTTY_KEY_BACKSPACE,
+    GHOSTTY_KEY_CAPS_LOCK,
+    GHOSTTY_KEY_CONTEXT_MENU,
+    GHOSTTY_KEY_CONTROL_LEFT,
+    GHOSTTY_KEY_CONTROL_RIGHT,
+    GHOSTTY_KEY_ENTER,
+    GHOSTTY_KEY_META_LEFT,
+    GHOSTTY_KEY_META_RIGHT,
+    GHOSTTY_KEY_SHIFT_LEFT,
+    GHOSTTY_KEY_SHIFT_RIGHT,
+    GHOSTTY_KEY_SPACE,
+    GHOSTTY_KEY_TAB,
+    GHOSTTY_KEY_CONVERT,
+    GHOSTTY_KEY_KANA_MODE,
+    GHOSTTY_KEY_NON_CONVERT,
+
+    // Control Pad Section (W3C § 3.2)
+    GHOSTTY_KEY_DELETE,
+    GHOSTTY_KEY_END,
+    GHOSTTY_KEY_HELP,
+    GHOSTTY_KEY_HOME,
+    GHOSTTY_KEY_INSERT,
+    GHOSTTY_KEY_PAGE_DOWN,
+    GHOSTTY_KEY_PAGE_UP,
+
+    // Arrow Pad Section (W3C § 3.3)
+    GHOSTTY_KEY_ARROW_DOWN,
+    GHOSTTY_KEY_ARROW_LEFT,
+    GHOSTTY_KEY_ARROW_RIGHT,
+    GHOSTTY_KEY_ARROW_UP,
+
+    // Numpad Section (W3C § 3.4)
+    GHOSTTY_KEY_NUM_LOCK,
+    GHOSTTY_KEY_NUMPAD_0,
+    GHOSTTY_KEY_NUMPAD_1,
+    GHOSTTY_KEY_NUMPAD_2,
+    GHOSTTY_KEY_NUMPAD_3,
+    GHOSTTY_KEY_NUMPAD_4,
+    GHOSTTY_KEY_NUMPAD_5,
+    GHOSTTY_KEY_NUMPAD_6,
+    GHOSTTY_KEY_NUMPAD_7,
+    GHOSTTY_KEY_NUMPAD_8,
+    GHOSTTY_KEY_NUMPAD_9,
+    GHOSTTY_KEY_NUMPAD_ADD,
+    GHOSTTY_KEY_NUMPAD_BACKSPACE,
+    GHOSTTY_KEY_NUMPAD_CLEAR,
+    GHOSTTY_KEY_NUMPAD_CLEAR_ENTRY,
+    GHOSTTY_KEY_NUMPAD_COMMA,
+    GHOSTTY_KEY_NUMPAD_DECIMAL,
+    GHOSTTY_KEY_NUMPAD_DIVIDE,
+    GHOSTTY_KEY_NUMPAD_ENTER,
+    GHOSTTY_KEY_NUMPAD_EQUAL,
+    GHOSTTY_KEY_NUMPAD_MEMORY_ADD,
+    GHOSTTY_KEY_NUMPAD_MEMORY_CLEAR,
+    GHOSTTY_KEY_NUMPAD_MEMORY_RECALL,
+    GHOSTTY_KEY_NUMPAD_MEMORY_STORE,
+    GHOSTTY_KEY_NUMPAD_MEMORY_SUBTRACT,
+    GHOSTTY_KEY_NUMPAD_MULTIPLY,
+    GHOSTTY_KEY_NUMPAD_PAREN_LEFT,
+    GHOSTTY_KEY_NUMPAD_PAREN_RIGHT,
+    GHOSTTY_KEY_NUMPAD_SUBTRACT,
+    GHOSTTY_KEY_NUMPAD_SEPARATOR,
+    GHOSTTY_KEY_NUMPAD_UP,
+    GHOSTTY_KEY_NUMPAD_DOWN,
+    GHOSTTY_KEY_NUMPAD_RIGHT,
+    GHOSTTY_KEY_NUMPAD_LEFT,
+    GHOSTTY_KEY_NUMPAD_BEGIN,
+    GHOSTTY_KEY_NUMPAD_HOME,
+    GHOSTTY_KEY_NUMPAD_END,
+    GHOSTTY_KEY_NUMPAD_INSERT,
+    GHOSTTY_KEY_NUMPAD_DELETE,
+    GHOSTTY_KEY_NUMPAD_PAGE_UP,
+    GHOSTTY_KEY_NUMPAD_PAGE_DOWN,
+
+    // Function Section (W3C § 3.5)
+    GHOSTTY_KEY_ESCAPE,
+    GHOSTTY_KEY_F1,
+    GHOSTTY_KEY_F2,
+    GHOSTTY_KEY_F3,
+    GHOSTTY_KEY_F4,
+    GHOSTTY_KEY_F5,
+    GHOSTTY_KEY_F6,
+    GHOSTTY_KEY_F7,
+    GHOSTTY_KEY_F8,
+    GHOSTTY_KEY_F9,
+    GHOSTTY_KEY_F10,
+    GHOSTTY_KEY_F11,
+    GHOSTTY_KEY_F12,
+    GHOSTTY_KEY_F13,
+    GHOSTTY_KEY_F14,
+    GHOSTTY_KEY_F15,
+    GHOSTTY_KEY_F16,
+    GHOSTTY_KEY_F17,
+    GHOSTTY_KEY_F18,
+    GHOSTTY_KEY_F19,
+    GHOSTTY_KEY_F20,
+    GHOSTTY_KEY_F21,
+    GHOSTTY_KEY_F22,
+    GHOSTTY_KEY_F23,
+    GHOSTTY_KEY_F24,
+    GHOSTTY_KEY_F25,
+    GHOSTTY_KEY_FN,
+    GHOSTTY_KEY_FN_LOCK,
+    GHOSTTY_KEY_PRINT_SCREEN,
+    GHOSTTY_KEY_SCROLL_LOCK,
+    GHOSTTY_KEY_PAUSE,
+
+    // Media Keys (W3C § 3.6)
+    GHOSTTY_KEY_BROWSER_BACK,
+    GHOSTTY_KEY_BROWSER_FAVORITES,
+    GHOSTTY_KEY_BROWSER_FORWARD,
+    GHOSTTY_KEY_BROWSER_HOME,
+    GHOSTTY_KEY_BROWSER_REFRESH,
+    GHOSTTY_KEY_BROWSER_SEARCH,
+    GHOSTTY_KEY_BROWSER_STOP,
+    GHOSTTY_KEY_EJECT,
+    GHOSTTY_KEY_LAUNCH_APP_1,
+    GHOSTTY_KEY_LAUNCH_APP_2,
+    GHOSTTY_KEY_LAUNCH_MAIL,
+    GHOSTTY_KEY_MEDIA_PLAY_PAUSE,
+    GHOSTTY_KEY_MEDIA_SELECT,
+    GHOSTTY_KEY_MEDIA_STOP,
+    GHOSTTY_KEY_MEDIA_TRACK_NEXT,
+    GHOSTTY_KEY_MEDIA_TRACK_PREVIOUS,
+    GHOSTTY_KEY_POWER,
+    GHOSTTY_KEY_SLEEP,
+    GHOSTTY_KEY_AUDIO_VOLUME_DOWN,
+    GHOSTTY_KEY_AUDIO_VOLUME_MUTE,
+    GHOSTTY_KEY_AUDIO_VOLUME_UP,
+    GHOSTTY_KEY_WAKE_UP,
+
+    // Legacy, Non-standard, and Special Keys (W3C § 3.7)
+    GHOSTTY_KEY_COPY,
+    GHOSTTY_KEY_CUT,
+    GHOSTTY_KEY_PASTE,
+} GhosttyKey;
+
+extern "C" {
+typedef struct GhosttyKeyEncoder* GhosttyKeyEncoder;
+typedef struct GhosttyKeyEvent* GhosttyKeyEvent;
+struct GhosttyAllocator;
+
+ghostty_result_t ghostty_key_encoder_new(const GhosttyAllocator* allocator, GhosttyKeyEncoder* encoder);
+void ghostty_key_encoder_free(GhosttyKeyEncoder encoder);
+// The official header declares the second parameter as its own opaque
+// GhosttyTerminal; both names wrap the single terminal object the vendored
+// library creates, so the shim declares it with the ghostty_terminal_t type
+// already visible in this translation unit.
+void ghostty_key_encoder_setopt_from_terminal(GhosttyKeyEncoder encoder, ghostty_terminal_t terminal);
+ghostty_result_t ghostty_key_encoder_encode(
+    GhosttyKeyEncoder encoder, GhosttyKeyEvent event, char* out_buf, size_t out_buf_size, size_t* out_len);
+ghostty_result_t ghostty_key_event_new(const GhosttyAllocator* allocator, GhosttyKeyEvent* event);
+void ghostty_key_event_free(GhosttyKeyEvent event);
+void ghostty_key_event_set_action(GhosttyKeyEvent event, GhosttyKeyAction action);
+void ghostty_key_event_set_key(GhosttyKeyEvent event, GhosttyKey key);
+void ghostty_key_event_set_mods(GhosttyKeyEvent event, GhosttyMods mods);
+void ghostty_key_event_set_consumed_mods(GhosttyKeyEvent event, GhosttyMods consumed_mods);
+void ghostty_key_event_set_utf8(GhosttyKeyEvent event, const char* utf8, size_t len);
+void ghostty_key_event_set_unshifted_codepoint(GhosttyKeyEvent event, uint32_t codepoint);
+}
+
+GhosttyMods GhosttyModsFromOhModifiers(uint64_t modifiers, bool capsLock)
+{
+    GhosttyMods mods = 0;
+    if (IsShiftPressed(modifiers)) {
+        mods |= GHOSTTY_MODS_SHIFT;
+    }
+    if (IsCtrlPressed(modifiers)) {
+        mods |= GHOSTTY_MODS_CTRL;
+    }
+    if (IsAltPressed(modifiers)) {
+        mods |= GHOSTTY_MODS_ALT;
+    }
+    if (capsLock) {
+        mods |= GHOSTTY_MODS_CAPS_LOCK;
+    }
+    return mods;
+}
+
+// OH key code (HarmonyOS KEY_* enum or mirrored raw evdev code) to the
+// physical GhosttyKey, covering the same key universe as BuildKeySequence.
+// Returns GHOSTTY_KEY_UNIDENTIFIED for anything else, which keeps the caller
+// on the legacy hand-written path.
+GhosttyKey GhosttyKeyFromOhKeyCode(OH_NativeXComponent_KeyCode code)
+{
+    // Contiguous HarmonyOS ranges, same assumption AppendPrintableKey makes.
+    if (code >= KEY_A && code <= KEY_Z) {
+        return static_cast<GhosttyKey>(GHOSTTY_KEY_A + (code - KEY_A));
+    }
+    if (code >= KEY_0 && code <= KEY_9) {
+        return static_cast<GhosttyKey>(GHOSTTY_KEY_DIGIT_0 + (code - KEY_0));
+    }
+    // The evdev digit row is 1..9,0 in scan order.
+    if (code >= LINUX_KEY_1 && code <= LINUX_KEY_0) {
+        const int index = code - LINUX_KEY_1;
+        return index < 9
+            ? static_cast<GhosttyKey>(GHOSTTY_KEY_DIGIT_1 + index)
+            : GHOSTTY_KEY_DIGIT_0;
+    }
+    const int linuxLetter = LinuxLetterOffset(code);
+    if (linuxLetter >= 0) {
+        return static_cast<GhosttyKey>(GHOSTTY_KEY_A + linuxLetter);
+    }
+
+    switch (code) {
+        case LINUX_KEY_TAB:
+        case KEY_TAB: return GHOSTTY_KEY_TAB;
+        case LINUX_KEY_ENTER:
+        case KEY_ENTER: return GHOSTTY_KEY_ENTER;
+        case KEY_NUMPAD_ENTER: return GHOSTTY_KEY_NUMPAD_ENTER;
+        case KEY_ESCAPE: return GHOSTTY_KEY_ESCAPE;
+        case LINUX_KEY_BACKSPACE:
+        case KEY_DEL: return GHOSTTY_KEY_BACKSPACE;
+        case LINUX_KEY_DELETE:
+        case KEY_FORWARD_DEL: return GHOSTTY_KEY_DELETE;
+        case LINUX_KEY_INSERT:
+        case KEY_INSERT: return GHOSTTY_KEY_INSERT;
+        case LINUX_KEY_HOME:
+        case KEY_MOVE_HOME:
+        case KEY_HOME: return GHOSTTY_KEY_HOME;
+        case LINUX_KEY_END:
+        case KEY_MOVE_END: return GHOSTTY_KEY_END;
+        case LINUX_KEY_PAGE_UP:
+        case KEY_PAGE_UP: return GHOSTTY_KEY_PAGE_UP;
+        case LINUX_KEY_PAGE_DOWN:
+        case KEY_PAGE_DOWN: return GHOSTTY_KEY_PAGE_DOWN;
+        case LINUX_KEY_UP:
+        case KEY_DPAD_UP: return GHOSTTY_KEY_ARROW_UP;
+        case LINUX_KEY_DOWN:
+        case KEY_DPAD_DOWN: return GHOSTTY_KEY_ARROW_DOWN;
+        case LINUX_KEY_RIGHT:
+        case KEY_DPAD_RIGHT: return GHOSTTY_KEY_ARROW_RIGHT;
+        case LINUX_KEY_LEFT:
+        case KEY_DPAD_LEFT: return GHOSTTY_KEY_ARROW_LEFT;
+        case LINUX_KEY_SPACE:
+        case KEY_SPACE: return GHOSTTY_KEY_SPACE;
+        case LINUX_KEY_GRAVE:
+        case KEY_GRAVE: return GHOSTTY_KEY_BACKQUOTE;
+        case LINUX_KEY_MINUS:
+        case KEY_MINUS: return GHOSTTY_KEY_MINUS;
+        case LINUX_KEY_EQUALS:
+        case KEY_EQUALS: return GHOSTTY_KEY_EQUAL;
+        case LINUX_KEY_LEFT_BRACE:
+        case KEY_LEFT_BRACKET: return GHOSTTY_KEY_BRACKET_LEFT;
+        case LINUX_KEY_RIGHT_BRACE:
+        case KEY_RIGHT_BRACKET: return GHOSTTY_KEY_BRACKET_RIGHT;
+        case LINUX_KEY_BACKSLASH:
+        case KEY_BACKSLASH: return GHOSTTY_KEY_BACKSLASH;
+        case LINUX_KEY_SEMICOLON:
+        case KEY_SEMICOLON: return GHOSTTY_KEY_SEMICOLON;
+        case LINUX_KEY_APOSTROPHE:
+        case KEY_APOSTROPHE: return GHOSTTY_KEY_QUOTE;
+        case LINUX_KEY_COMMA:
+        case KEY_COMMA: return GHOSTTY_KEY_COMMA;
+        case LINUX_KEY_DOT:
+        case KEY_PERIOD: return GHOSTTY_KEY_PERIOD;
+        case LINUX_KEY_SLASH:
+        case KEY_SLASH: return GHOSTTY_KEY_SLASH;
+        case KEY_F1: return GHOSTTY_KEY_F1;
+        case KEY_F2: return GHOSTTY_KEY_F2;
+        case KEY_F3: return GHOSTTY_KEY_F3;
+        case KEY_F4: return GHOSTTY_KEY_F4;
+        case KEY_F5: return GHOSTTY_KEY_F5;
+        case KEY_F6: return GHOSTTY_KEY_F6;
+        case KEY_F7: return GHOSTTY_KEY_F7;
+        case KEY_F8: return GHOSTTY_KEY_F8;
+        case KEY_F9: return GHOSTTY_KEY_F9;
+        case KEY_F10: return GHOSTTY_KEY_F10;
+        case KEY_F11: return GHOSTTY_KEY_F11;
+        case KEY_F12: return GHOSTTY_KEY_F12;
+        case KEY_NUMPAD_0: return GHOSTTY_KEY_NUMPAD_0;
+        case KEY_NUMPAD_1: return GHOSTTY_KEY_NUMPAD_1;
+        case KEY_NUMPAD_2: return GHOSTTY_KEY_NUMPAD_2;
+        case KEY_NUMPAD_3: return GHOSTTY_KEY_NUMPAD_3;
+        case KEY_NUMPAD_4: return GHOSTTY_KEY_NUMPAD_4;
+        case KEY_NUMPAD_5: return GHOSTTY_KEY_NUMPAD_5;
+        case KEY_NUMPAD_6: return GHOSTTY_KEY_NUMPAD_6;
+        case KEY_NUMPAD_7: return GHOSTTY_KEY_NUMPAD_7;
+        case KEY_NUMPAD_8: return GHOSTTY_KEY_NUMPAD_8;
+        case KEY_NUMPAD_9: return GHOSTTY_KEY_NUMPAD_9;
+        case KEY_NUMPAD_DOT: return GHOSTTY_KEY_NUMPAD_DECIMAL;
+        case KEY_NUMPAD_COMMA: return GHOSTTY_KEY_NUMPAD_COMMA;
+        case KEY_NUMPAD_DIVIDE: return GHOSTTY_KEY_NUMPAD_DIVIDE;
+        case KEY_NUMPAD_MULTIPLY: return GHOSTTY_KEY_NUMPAD_MULTIPLY;
+        case KEY_NUMPAD_SUBTRACT: return GHOSTTY_KEY_NUMPAD_SUBTRACT;
+        case KEY_NUMPAD_ADD: return GHOSTTY_KEY_NUMPAD_ADD;
+        default: return GHOSTTY_KEY_UNIDENTIFIED;
+    }
+}
+
+GhosttyKeyEncoder EnsureGhosttyKeyEncoder(GhosttyKeyEncoder& slot)
+{
+    if (slot == nullptr && ghostty_key_encoder_new(nullptr, &slot) != GHOSTTY_SUCCESS) {
+        slot = nullptr; // allocation failure falls back to the legacy table
+    }
+    return slot;
+}
+
+// Encodes one key event with the official encoder. Returns true only when the
+// event produced bytes; an empty result (bare modifiers, protocol-internal
+// keys) lets the caller keep its legacy behavior.
+bool EncodeGhosttyKeyEvent(
+    GhosttyKeyEncoder encoder,
+    OH_NativeXComponent_KeyCode code,
+    uint64_t modifiers,
+    bool capsLock,
+    GhosttyKeyAction keyAction,
+    std::string& sequence)
+{
+    sequence.clear();
+    const GhosttyKey key = GhosttyKeyFromOhKeyCode(code);
+    if (key == GHOSTTY_KEY_UNIDENTIFIED) {
+        return false;
+    }
+
+    GhosttyKeyEvent event = nullptr;
+    if (ghostty_key_event_new(nullptr, &event) != GHOSTTY_SUCCESS || event == nullptr) {
+        return false;
+    }
+
+    ghostty_key_event_set_action(event, keyAction);
+    ghostty_key_event_set_key(event, key);
+    const GhosttyMods mods = GhosttyModsFromOhModifiers(modifiers, capsLock);
+    ghostty_key_event_set_mods(event, mods);
+
+    // Associated text for the kitty text paths, identical to the printable the
+    // legacy table would emit. Tab is excluded: AppendPrintableKey maps it to
+    // "\t", which must not become associated text (Shift-Tab stays CSI Z, as
+    // decided by the encoder).
+    std::string text;
+    if (code != KEY_TAB && code != LINUX_KEY_TAB &&
+        AppendPrintableKey(code, (mods & GHOSTTY_MODS_SHIFT) != 0, capsLock, text) && !text.empty()) {
+        ghostty_key_event_set_utf8(event, text.data(), text.size());
+        // Shift that only case-folded the text is consumed, not reported.
+        if ((mods & (GHOSTTY_MODS_CTRL | GHOSTTY_MODS_ALT)) == 0 &&
+            (mods & GHOSTTY_MODS_SHIFT) != 0) {
+            ghostty_key_event_set_consumed_mods(event, GHOSTTY_MODS_SHIFT);
+        }
+    }
+    std::string unshifted;
+    if (AppendPrintableKey(code, false, false, unshifted) && unshifted.size() == 1) {
+        ghostty_key_event_set_unshifted_codepoint(event, static_cast<unsigned char>(unshifted[0]));
+    }
+
+    char stackBuffer[64];
+    size_t written = 0;
+    ghostty_result_t rc = ghostty_key_encoder_encode(
+        encoder, event, stackBuffer, sizeof(stackBuffer), &written);
+    if (rc == GHOSTTY_OUT_OF_SPACE && written > sizeof(stackBuffer)) {
+        // The encoder reports the required buffer size in out_len.
+        std::vector<char> heapBuffer(written);
+        rc = ghostty_key_encoder_encode(encoder, event, heapBuffer.data(), heapBuffer.size(), &written);
+        if (rc == GHOSTTY_SUCCESS && written > 0) {
+            sequence.assign(heapBuffer.data(), written);
+        }
+    } else if (rc == GHOSTTY_SUCCESS && written > 0) {
+        sequence.assign(stackBuffer, written);
+    }
+
+    ghostty_key_event_free(event);
+    return !sequence.empty();
+}
+
+// Kitty keyboard protocol gate plus official encoding, serialized with every
+// other VT access through Terminal::withVtHandleLocked (feedOutput/drawFrame
+// touch m_vt on other threads). Returns false unless a TUI actually pushed
+// kitty flags — and, for releases, the REPORT_EVENTS bit — so the hand-written
+// key table keeps its exact behavior while the protocol is off.
+bool TryEncodeKittyKey(
+    Terminal* terminal,
+    GhosttyKeyEncoder& encoderSlot,
+    OH_NativeXComponent_KeyCode code,
+    uint64_t modifiers,
+    bool capsLock,
+    GhosttyKeyAction keyAction,
+    GhosttyKittyKeyFlags requiredKittyFlags,
+    std::string& sequence)
+{
+    sequence.clear();
+    if (terminal == nullptr) {
+        return false;
+    }
+
+    bool encoded = false;
+    terminal->withVtHandleLocked([&](ghostty_terminal_t vt) {
+        uint8_t kittyFlags = 0;
+        if (ghostty_terminal_get(vt, GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS, &kittyFlags) != GHOSTTY_SUCCESS ||
+            kittyFlags == GHOSTTY_KITTY_KEY_DISABLED ||
+            (requiredKittyFlags != GHOSTTY_KITTY_KEY_DISABLED &&
+                (kittyFlags & requiredKittyFlags) != requiredKittyFlags)) {
+            return;
+        }
+
+        GhosttyKeyEncoder encoder = EnsureGhosttyKeyEncoder(encoderSlot);
+        if (encoder == nullptr) {
+            return;
+        }
+
+        // Sync kitty flags, cursor/keypad application modes, and
+        // modifyOtherKeys from live VT state on every key event.
+        ghostty_key_encoder_setopt_from_terminal(encoder, vt);
+        encoded = EncodeGhosttyKeyEvent(encoder, code, modifiers, capsLock, keyAction, sequence);
+    });
+    return encoded;
+}
+
 // Cursor-style key (arrows/Home/End). Modified keys always use CSI 1;m<final>;
 // unmodified keys honor DECCKM application cursor mode (SS3 <final>).
 void BuildCursorKey(std::string& sequence, char finalByte, int modCode, bool appCursorKeys)
@@ -787,6 +1286,10 @@ public:
         RetireImeProxyLocked();
         std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         CleanupSurfaceLocked();
+        if (m_keyEncoder) {
+            ghostty_key_encoder_free(m_keyEncoder);
+            m_keyEncoder = nullptr;
+        }
         if (m_terminal) {
             m_terminal->stop();
             delete m_terminal;
@@ -1020,8 +1523,32 @@ public:
             return false;
         }
 
-        // Everything below only reacts to key presses; releases fall through
-        // untouched exactly as before.
+        // Kitty keyboard protocol: once a TUI (nvim/helix/fish) pushes kitty
+        // flags, the official ghostty key encoder owns encoding, synced from
+        // live VT state per key event (TryEncodeKittyKey). Releases are
+        // reported only when the TUI also asked for event reporting
+        // (REPORT_EVENTS); every other release falls through untouched.
+        if (action == OH_NATIVEXCOMPONENT_KEY_ACTION_UP) {
+            uint64_t releaseModifiers = 0;
+            OH_NativeXComponent_GetKeyEventModifierKeyStates(keyEvent, &releaseModifiers);
+            bool releaseCapsLock = false;
+            OH_NativeXComponent_GetKeyEventCapsLockState(keyEvent, &releaseCapsLock);
+            std::string sequence;
+            if (TryEncodeKittyKey(m_terminal, m_keyEncoder, code, releaseModifiers, releaseCapsLock,
+                    GHOSTTY_KEY_ACTION_RELEASE, GHOSTTY_KITTY_KEY_REPORT_EVENTS, sequence)) {
+                ExampleDriverWriteInputFn nativeSink = ResolveExampleDriverWriteInput();
+                if (nativeSink != nullptr && nativeSink(sequence.data(), sequence.size())) {
+                    return true;
+                }
+                m_terminal->writeInput(sequence.data(), sequence.size());
+                return true;
+            }
+            return false;
+        }
+
+        // Everything below only reacts to key presses; releases other than the
+        // kitty REPORT_EVENTS ones above fall through untouched exactly as
+        // before.
         if (action != OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN) {
             return false;
         }
@@ -1047,10 +1574,15 @@ public:
             return true;
         }
 
-        const bool appCursorKeys = m_terminal->cursorKeysApplicationMode();
         std::string sequence;
-        if (!BuildKeySequence(code, modifiers, capsLock, appCursorKeys, sequence) || sequence.empty()) {
-            return false;
+        if (!TryEncodeKittyKey(m_terminal, m_keyEncoder, code, modifiers, capsLock,
+                GHOSTTY_KEY_ACTION_PRESS, GHOSTTY_KITTY_KEY_DISABLED, sequence)) {
+            // Kitty protocol off (or the key is unknown to the official
+            // encoder): the hand-written table keeps its exact legacy behavior.
+            const bool appCursorKeys = m_terminal->cursorKeysApplicationMode();
+            if (!BuildKeySequence(code, modifiers, capsLock, appCursorKeys, sequence) || sequence.empty()) {
+                return false;
+            }
         }
 
         ExampleDriverWriteInputFn nativeSink = ResolveExampleDriverWriteInput();
@@ -3773,6 +4305,11 @@ private:
     // callback and reset on focus loss; read from the mouse/wheel callbacks. All
     // three run on the UI thread, so no lock is needed.
     bool m_physShiftDown = false;
+    // Official ghostty key encoder for the kitty keyboard path, lazily created
+    // on the first kitty-mode key event and freed with the host. UI-thread only
+    // (DispatchKeyEvent), so no lock; it syncs from live VT state through
+    // Terminal::withVtHandleLocked on every event.
+    GhosttyKeyEncoder m_keyEncoder = nullptr;
     // Overlay input gate (settings drawer / tab editor open). ArkUI hit-test
     // only shields touch and mouse: XComponent key events (focus-routed) and
     // UIInput axis events (trackpad two-finger scroll) bypass sibling

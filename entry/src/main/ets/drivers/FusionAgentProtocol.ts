@@ -16,6 +16,18 @@ export interface FusionAgentEndpoint {
   shell?: string;
   token?: string;
   secure?: boolean;
+  // Stock wand-agent authenticates via ?token= only; the hardened fork prefers
+  // Authorization: Bearer and can reject query auth server-side. Emberline
+  // therefore keeps the token out of the URL unless this legacy fallback is
+  // explicitly requested for a stock agent (CR-003).
+  legacyQueryToken?: boolean;
+}
+
+// Durable-session reattach: when the driver still remembers a sessionId from
+// a previous connection, the reconnect asks the hardened fork to rebind to
+// that detached PTY instead of spawning a fresh shell.
+export interface FusionAgentAttachRequest {
+  sessionId: string;
 }
 
 export interface FusionAgentMessage {
@@ -73,7 +85,7 @@ function appendQueryParam(parts: Array<string>, key: string, value: string | num
   parts.push(`${encodeQueryValue(key)}=${encodeQueryValue(text)}`);
 }
 
-export function buildFusionAgentUrl(endpoint: FusionAgentEndpoint): string {
+export function buildFusionAgentUrl(endpoint: FusionAgentEndpoint, attach?: FusionAgentAttachRequest): string {
   const scheme = endpoint.secure ? 'wss' : 'ws';
   const host = endpoint.host.trim().length > 0 ? endpoint.host.trim() : DEFAULT_FUSION_AGENT_HOST;
   const port = normalizePositiveInteger(endpoint.port, DEFAULT_FUSION_AGENT_PORT);
@@ -82,11 +94,17 @@ export function buildFusionAgentUrl(endpoint: FusionAgentEndpoint): string {
   const rows = normalizePositiveInteger(endpoint.rows, DEFAULT_AGENT_ROWS);
   const query: Array<string> = [];
 
-  if (endpoint.token && endpoint.token.length > 0) {
+  // CR-003: the hardened fork authenticates via the Authorization header only;
+  // the query token survives solely as an explicit stock-agent fallback.
+  if (endpoint.legacyQueryToken && endpoint.token && endpoint.token.length > 0) {
     appendQueryParam(query, 'token', endpoint.token);
   }
   appendQueryParam(query, 'cols', cols);
   appendQueryParam(query, 'rows', rows);
+  if (attach && attach.sessionId.length > 0) {
+    appendQueryParam(query, 'attach', '1');
+    appendQueryParam(query, 'sessionId', attach.sessionId);
+  }
   if (endpoint.cwd && endpoint.cwd.length > 0) {
     appendQueryParam(query, 'cwd', endpoint.cwd);
   }

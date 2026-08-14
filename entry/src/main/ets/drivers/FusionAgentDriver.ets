@@ -1,5 +1,6 @@
 import { webSocket } from '@kit.NetworkKit';
 import { TerminalController, TerminalInputListener, TerminalSize } from 'libghostty-ohos';
+import { appResumeEvents } from '../common/AppResumeEvents';
 import {
   buildFusionAgentUrl,
   createCwdQueryMessage,
@@ -41,6 +42,15 @@ const RELAY_REPLY_TIMEOUT_MS = 35000;
 // Stock wand-agent accepts JSON `ping` control messages. Keep a small margin
 // below hardened-agent 30s read deadlines so an idle terminal stays attached.
 const AGENT_HEARTBEAT_INTERVAL_MS = 25000;
+// A keepalive ping must be answered within this window. A missed deadline means
+// the socket died silently (screen lock, suspended process) without ever
+// raising close/error, so the connection enters the guarded failure path
+// instead of trusting the stale connected flag. Comfortably above the 25s
+// heartbeat interval so a single late pong never false-positives.
+const AGENT_PONG_DEADLINE_MS = 40000;
+// After a foreground/network resume the socket is probed immediately with a
+// much shorter deadline, so a lock-screen drop reconnects within seconds.
+const RESUME_PROBE_PONG_TIMEOUT_MS = 10000;
 
 export class FusionAgentDriver {
   private controller: TerminalController | null = null;
@@ -69,6 +79,15 @@ export class FusionAgentDriver {
   private reconnectAttempt: number = 0;
   private reconnectTimer: number = -1;
   private heartbeatTimer: number = -1;
+  // Missed-pong watchdog armed by every keepalive/probe ping; any incoming pong
+  // disarms it. Firing routes into handleUnexpectedSocketFailure.
+  private pongDeadlineTimer: number = -1;
+  // Durable-session state learned from the hardened fork's ready/attached
+  // frames: transport-level reconnects rebind to the same PTY via the attach
+  // handshake instead of spawning a fresh shell. A deliberate connect() resets
+  // both (the user asked for a new session).
+  private agentSessionId: string = '';
+  private supportsSessionAttach: boolean = false;
   // PTY output arrives in arbitrary WebSocket frame chunks, so a multi-byte
   // UTF-8 sequence can be split across frames; the incomplete tail is kept
   // here until the next frame arrives.
@@ -100,6 +119,27 @@ export class FusionAgentDriver {
     this.reconnectTimer = -1;
     this.openSocket(this.lastEndpoint);
   }
+
+  // Foreground edge (lock screen -> unlock) or network recovery. The socket
+  // may be half-open without any close/error event, so a still-"connected"
+  // socket gets an immediate probe ping with a short pong deadline; a pending
+  // backoff retry simply fires now. Reconnects prefer reattaching the
+  // remembered session id.
+  private readonly resumeListener = (): void => {
+    if (!this.autoReconnect || !this.lastEndpoint) {
+      return;
+    }
+    if (this.reconnectTimer >= 0) {
+      this.reconnectNowIfWaiting();
+      return;
+    }
+    if (this.socket && this.connected) {
+      // A pong deadline armed before a suspension may already be expired
+      // through no fault of the socket; replace it with the probe deadline.
+      this.sendSocketPayload(stringifyFusionAgentMessage(createPingMessage(Date.now())));
+      this.armPongDeadline(this.socket, RESUME_PROBE_PONG_TIMEOUT_MS);
+    }
+  };
 
   private readonly sizeListener = (size: TerminalSize): void => {
     const cols = Math.max(1, size.cols || DEFAULT_AGENT_COLS);
@@ -179,14 +219,20 @@ export class FusionAgentDriver {
 
   connect(endpoint: FusionAgentEndpoint): void {
     this.closeConnection(false, 0);
+    // A deliberate connect starts a brand-new remote session; attach state
+    // belongs to transport-level reconnects only.
+    this.agentSessionId = '';
+    this.supportsSessionAttach = false;
     this.lastEndpoint = endpoint;
     this.autoReconnect = true;
     this.reconnectAttempt = 0;
+    appResumeEvents.subscribe(this.resumeListener);
     this.openSocket(endpoint);
   }
 
   private openSocket(endpoint: FusionAgentEndpoint): void {
     this.stopHeartbeat();
+    this.stopPongDeadline();
     if (this.socket) {
       this.closeSocket(this.socket);
       this.socket = null;
@@ -202,6 +248,11 @@ export class FusionAgentDriver {
     const size: TerminalSize = this.controller ? this.controller.getTerminalSize() : fallbackSize;
     this.lastCols = Math.max(1, size.cols || endpoint.cols || DEFAULT_AGENT_COLS);
     this.lastRows = Math.max(1, size.rows || endpoint.rows || DEFAULT_AGENT_ROWS);
+    // Reconnects rebind to the remembered PTY when the agent advertised
+    // attach; a deliberate connect() cleared that state, so it always spawns
+    // a fresh session.
+    const attachSessionId: string = this.agentSessionId.length > 0 && this.supportsSessionAttach ?
+      this.agentSessionId : '';
     const url = buildFusionAgentUrl({
       host: endpoint.host,
       port: endpoint.port,
@@ -211,16 +262,18 @@ export class FusionAgentDriver {
       cwd: endpoint.cwd,
       shell: endpoint.shell,
       token: endpoint.token,
+      legacyQueryToken: endpoint.legacyQueryToken,
       secure: endpoint.secure
-    });
+    }, attachSessionId.length > 0 ? { sessionId: attachSessionId } : undefined);
 
     try {
       const ownSocket = webSocket.createWebSocket();
       this.socket = ownSocket;
       this.registerSocketHandlers();
       this.emitStatus(false, `正在连接 ${endpointLabel}`, '');
-      // The hardened wand-agent fork prefers Authorization: Bearer; the token
-      // stays in the URL query as well for stock wand-agent compatibility.
+      // CR-003: the hardened wand-agent fork gets the token only in the
+      // Authorization header; the query token survives solely behind the
+      // endpoint's legacyQueryToken fallback for stock wand-agent.
       if (endpoint.token && endpoint.token.length > 0) {
         const options: webSocket.WebSocketRequestOptions = {
           header: { 'Authorization': `Bearer ${endpoint.token}` }
@@ -268,9 +321,11 @@ export class FusionAgentDriver {
 
   private closeConnection(terminateRemote: boolean, closeDelayMs: number): void {
     this.autoReconnect = false;
+    appResumeEvents.unsubscribe(this.resumeListener);
     this.cancelReconnectTimer();
     this.stopTerminateCloseTimer();
     this.stopHeartbeat();
+    this.stopPongDeadline();
     const socketToClose = this.socket;
     if (terminateRemote) {
       this.sendRemoteTerminationRequest();
@@ -332,9 +387,11 @@ export class FusionAgentDriver {
     this.heartbeatTimer = setInterval(() => {
       if (this.socket !== ownSocket || !this.connected) {
         this.stopHeartbeat();
+        this.stopPongDeadline();
         return;
       }
       this.sendSocketPayload(stringifyFusionAgentMessage(createPingMessage(Date.now())));
+      this.armPongDeadline(ownSocket, AGENT_PONG_DEADLINE_MS);
     }, AGENT_HEARTBEAT_INTERVAL_MS) as number;
   }
 
@@ -346,6 +403,25 @@ export class FusionAgentDriver {
     this.heartbeatTimer = -1;
   }
 
+  // Any pong (for the 25s keepalive ping or a resume probe) satisfies the
+  // deadline; the next ping re-arms it. Firing means the agent stopped
+  // answering even though the socket never raised close/error.
+  private armPongDeadline(ownSocket: webSocket.WebSocket, timeoutMs: number): void {
+    this.stopPongDeadline();
+    this.pongDeadlineTimer = setTimeout(() => {
+      this.pongDeadlineTimer = -1;
+      this.handleUnexpectedSocketFailure(ownSocket, 'Agent 心跳超时', 'pong 应答超时,判定连接已死');
+    }, timeoutMs) as number;
+  }
+
+  private stopPongDeadline(): void {
+    if (this.pongDeadlineTimer < 0) {
+      return;
+    }
+    clearTimeout(this.pongDeadlineTimer);
+    this.pongDeadlineTimer = -1;
+  }
+
   private handleUnexpectedSocketFailure(ownSocket: webSocket.WebSocket, label: string, error: string): void {
     if (this.socket !== ownSocket) {
       return;
@@ -355,6 +431,7 @@ export class FusionAgentDriver {
     // failure transition twice or mutate a newer connection generation.
     this.socket = null;
     this.stopHeartbeat();
+    this.stopPongDeadline();
     this.connected = false;
     this.ready = false;
     this.supportsTerminateControl = false;
@@ -507,8 +584,23 @@ export class FusionAgentDriver {
       case 'ready':
         this.ready = true;
         this.currentCwd = message.cwd || message.dir || this.currentCwd;
+        this.agentSessionId = message.sessionId || '';
+        this.supportsSessionAttach = this.hasAttachCapability(message.capabilities);
         this.supportsTerminateControl = this.hasTerminateCapability(message.capabilities);
         this.emitStatus(true, message.sessionId ? `Agent ${message.sessionId}` : 'Agent 就绪', '');
+        break;
+      case 'attached':
+        // Reattach succeeded: the agent replays exactly the output produced
+        // while the socket was down, so the renderer grid must NOT be
+        // cleared -- the old content and the incremental replay stay coherent.
+        this.ready = true;
+        if (message.sessionId && message.sessionId.length > 0) {
+          this.agentSessionId = message.sessionId;
+        }
+        this.supportsSessionAttach = true;
+        this.emitStatus(true, 'Agent 会话已恢复', '');
+        // The grid may have changed while the socket was down.
+        this.sendSocketPayload(stringifyFusionAgentMessage(createResizeMessage(this.lastCols, this.lastRows)));
         break;
       case 'cwd':
         this.currentCwd = message.dir || message.cwd || this.currentCwd;
@@ -518,7 +610,10 @@ export class FusionAgentDriver {
         // The remote shell is gone: tear the socket down so stale input can
         // no longer be sent, then report the exit label (closeConnection nulls
         // the socket first, so the late 'close' event cannot overwrite it).
+        // There is nothing left to reattach to, so drop the attach state too.
         const exitLabel = message.message || 'Shell 已退出';
+        this.agentSessionId = '';
+        this.supportsSessionAttach = false;
         this.closeConnection(false, 0);
         this.emitStatus(false, exitLabel, '');
         break;
@@ -538,6 +633,8 @@ export class FusionAgentDriver {
         this.sendSocketPayload(stringifyFusionAgentMessage(createPingMessage(message.ts || Date.now())));
         break;
       case 'pong':
+        // Any pong satisfies the outstanding keepalive/probe deadline.
+        this.stopPongDeadline();
         break;
       default:
         break;
@@ -608,6 +705,19 @@ export class FusionAgentDriver {
       if (capability === 'terminate' ||
         capability === 'session.terminate' ||
         capability === 'control.terminate') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasAttachCapability(capabilities?: Array<string>): boolean {
+    if (!capabilities) {
+      return false;
+    }
+
+    for (const capability of capabilities) {
+      if (capability === 'attach' || capability === 'session.attach') {
         return true;
       }
     }

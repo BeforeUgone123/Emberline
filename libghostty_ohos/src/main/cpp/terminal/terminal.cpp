@@ -92,6 +92,17 @@ ghostty_result_t ghostty_paste_encode(char* data,
                                       char* buf,
                                       size_t buf_len,
                                       size_t* out_written);
+
+// Full-grapheme readback for grid_ref cells, present in the prebuilt
+// libghostty-vt (verified in the archive symbol table) but missing from the
+// flat ghostty_vt.h this translation unit compiles against; the new-style
+// ghostty/vt/grid_ref.h cannot be included here (enum name collisions).
+// Unlike GRAPHEMES_BUF this API sizes the caller buffer: it returns
+// GHOSTTY_OUT_OF_SPACE with the required length instead of overrunning.
+ghostty_result_t ghostty_grid_ref_graphemes(const ghostty_grid_ref_t* ref,
+                                            uint32_t* buf,
+                                            size_t buf_len,
+                                            size_t* out_len);
 }
 
 #undef LOG_TAG
@@ -99,6 +110,12 @@ ghostty_result_t ghostty_paste_encode(char* data,
 
 namespace {
 constexpr size_t kGhosttyTextCapacity = 64;
+// Upper bound for codepoints read from one cell's grapheme buffer. The cell
+// text field holds at most kGhosttyTextCapacity-1 UTF-8 bytes, so clusters
+// longer than this are truncated anyway; the cap only bounds the stack read
+// buffer. The GRAPHEMES_BUF API writes graphemes_len entries unconditionally,
+// so callers must never pass a buffer smaller than graphemes_len.
+constexpr size_t kGraphemeCodepointCap = 32;
 constexpr uint32_t kSearchMatchBackground = 0xFF2F4159;
 constexpr uint32_t kSearchMatchForeground = 0xFFFFFFFF;
 constexpr uint32_t kSearchCurrentMatchBackground = 0xFFE0A23A;
@@ -236,10 +253,19 @@ void SetCellTextFromCodepoints(Cell& cell, const uint32_t* codepoints, size_t co
     std::string utf8;
     utf8.reserve(count * 4);
     for (size_t i = 0; i < count; ++i) {
+        const size_t cpLen = codepoints[i] <= 0x7F ? 1 :
+            codepoints[i] <= 0x7FF ? 2 :
+            codepoints[i] <= 0xFFFF ? 3 : 4;
+        // Stop at a codepoint boundary: byte-level truncation of a cluster
+        // can split a multi-byte UTF-8 sequence, and invalid UTF-8 makes the
+        // typography paint nothing for the run (blank cell).
+        if (utf8.size() + cpLen > kGhosttyTextCapacity - 1) {
+            break;
+        }
         AppendCodepointUtf8(utf8, codepoints[i]);
     }
 
-    const size_t len = std::min(utf8.size(), kGhosttyTextCapacity - 1);
+    const size_t len = utf8.size();
     if (len > 0) {
         std::memcpy(cell.text, utf8.data(), len);
     }
@@ -266,6 +292,65 @@ uint8_t CellWidthFromGhostty(ghostty_cell_wide_t wide)
         default:
             return 1;
     }
+}
+
+// Fill `out` with the current cell's full grapheme cluster (base codepoint
+// first) and return the codepoint count (always >= 1 for a renderable cell:
+// every failure path falls back to the base codepoint so a cell never loses
+// its text over a grapheme-read hiccup). The cell's
+// GHOSTTY_CELL_DATA_CODEPOINT only carries the BASE codepoint; combining
+// marks, variation selectors, and ZWJ sequences live in the graphemes
+// buffer. Base-only extraction silently degrades those clusters (review
+// 2026-07-10 finding) and, when the base alone resolves to .notdef in the
+// font chain, renders nothing at all.
+size_t ReadCellGraphemes(
+    ghostty_row_cells_t rowCells,
+    uint32_t baseCodepoint,
+    uint32_t* out,
+    size_t outCap)
+{
+    uint32_t len = 0;
+    if (ghostty_render_state_row_cells_get(
+            rowCells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &len) != GHOSTTY_SUCCESS ||
+        len <= 1) {
+        // 0 = no text (should not happen for a renderable cell), 1 = plain
+        // single-codepoint cell: the base codepoint is the whole cluster.
+        out[0] = baseCodepoint;
+        return 1;
+    }
+    if (len > outCap) {
+        // GRAPHEMES_BUF writes `len` entries unconditionally; a pathological
+        // cluster longer than the read buffer falls back to its base
+        // codepoint rather than risk a stack overwrite.
+        out[0] = baseCodepoint;
+        return 1;
+    }
+    if (ghostty_render_state_row_cells_get(
+            rowCells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, out) != GHOSTTY_SUCCESS) {
+        out[0] = baseCodepoint;
+        return 1;
+    }
+    return len;
+}
+
+// Append the grid_ref cell's full grapheme cluster (base codepoint first) as
+// UTF-8. ghostty_grid_ref_graphemes sizes the buffer safely (OUT_OF_SPACE
+// reports the required length), so a pathological cluster is truncated to
+// the cap at a codepoint boundary instead of risking an overwrite; any read
+// failure falls back to the base codepoint so the text is never lost.
+void AppendGridRefGraphemesUtf8(std::string& out, const ghostty_grid_ref_t* ref, uint32_t baseCodepoint)
+{
+    uint32_t buf[kGraphemeCodepointCap];
+    size_t len = 0;
+    const ghostty_result_t rc =
+        ghostty_grid_ref_graphemes(ref, buf, kGraphemeCodepointCap, &len);
+    if (rc == GHOSTTY_SUCCESS && len > 0) {
+        for (size_t i = 0; i < len; ++i) {
+            AppendCodepointUtf8(out, buf[i]);
+        }
+        return;
+    }
+    AppendCodepointUtf8(out, baseCodepoint);
 }
 
 bool IsCellSelected(
@@ -1081,7 +1166,11 @@ std::string Terminal::getScreenContent() const {
                 result.push_back(' ');
                 continue;
             }
-            AppendCodepointUtf8(result, codepoint);
+            uint32_t cluster[kGraphemeCodepointCap];
+            const size_t clusterLen = ReadCellGraphemes(rowCells, codepoint, cluster, kGraphemeCodepointCap);
+            for (size_t i = 0; i < clusterLen; ++i) {
+                AppendCodepointUtf8(result, cluster[i]);
+            }
         }
         result.push_back('\n');
     }
@@ -1167,7 +1256,11 @@ void Terminal::getImeSnapshot(std::string& line, int& cursorCol) const {
                 line.push_back(' ');
                 continue;
             }
-            AppendCodepointUtf8(line, codepoint);
+            uint32_t cluster[kGraphemeCodepointCap];
+            const size_t clusterLen = ReadCellGraphemes(rowCells, codepoint, cluster, kGraphemeCodepointCap);
+            for (size_t i = 0; i < clusterLen; ++i) {
+                AppendCodepointUtf8(line, cluster[i]);
+            }
         }
         return;
     }
@@ -1599,7 +1692,7 @@ std::vector<std::string> Terminal::captureScrollbackSnapshotLocked(size_t& viewp
                 wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
                 line.push_back(' ');
             } else {
-                AppendCodepointUtf8(line, codepoint);
+                AppendGridRefGraphemesUtf8(line, &ref, codepoint);
             }
         }
         snapshot.push_back(std::move(line));
@@ -2090,7 +2183,7 @@ std::string Terminal::getSelectedText() const {
                 wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
                 result.push_back(' ');
             } else {
-                AppendCodepointUtf8(result, codepoint);
+                AppendGridRefGraphemesUtf8(result, &ref, codepoint);
             }
         }
         if (rowTouched && !isLast) {
@@ -2314,12 +2407,27 @@ void Terminal::drawFrame() {
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &codepoint);
 
+            // Resolve the cell's text once for both the search table and the
+            // render snapshot so the two never disagree on a cluster.
+            const bool renderableText = hasText &&
+                wide != GHOSTTY_CELL_WIDE_SPACER_TAIL &&
+                wide != GHOSTTY_CELL_WIDE_SPACER_HEAD &&
+                codepoint != 0;
+            uint32_t cellCodepoints[kGraphemeCodepointCap];
+            size_t cellCodepointCount = 0;
+            if (renderableText) {
+                cellCodepointCount = ReadCellGraphemes(
+                    m_rowCells, codepoint, cellCodepoints, kGraphemeCodepointCap);
+            }
+
             if (buildSearchText) {
                 rowByteStart[static_cast<size_t>(col)] = rowText.size();
-                if (!hasText || wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD || codepoint == 0) {
+                if (cellCodepointCount == 0) {
                     rowText.push_back(' ');
                 } else {
-                    AppendCodepointUtf8(rowText, codepoint);
+                    for (size_t i = 0; i < cellCodepointCount; ++i) {
+                        AppendCodepointUtf8(rowText, cellCodepoints[i]);
+                    }
                 }
                 rowByteEnd[static_cast<size_t>(col)] = rowText.size();
             }
@@ -2358,10 +2466,8 @@ void Terminal::drawFrame() {
                 dst.attrs.bg = ResolveStyleColor(bgColor, colors, dst.attrs.bg);
             }
 
-            if (hasText && wide != GHOSTTY_CELL_WIDE_SPACER_TAIL && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD) {
-                if (codepoint != 0) {
-                    SetCellTextFromCodepoints(dst, &codepoint, 1);
-                }
+            if (cellCodepointCount > 0) {
+                SetCellTextFromCodepoints(dst, cellCodepoints, cellCodepointCount);
             }
 
             if (IsSuspiciousCodepoint(codepoint) && suspiciousCells < 8) {

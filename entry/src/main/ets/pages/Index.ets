@@ -16,8 +16,13 @@ import {
   DEFAULT_FUSION_ENGINE_VM_LABEL
 } from '../drivers/FusionAgentProtocol';
 import { FusionTerminalDriver } from '../drivers/FusionTerminalDriver';
-import { createFusionVmProfile } from '../models/ConnectionProfile';
-import { TerminalSessionHandle } from '../model/TerminalSession';
+import { ConnectionProfile, createFusionVmProfile } from '../models/ConnectionProfile';
+import {
+  TerminalSessionHandle,
+  countPasteLines,
+  pasteTextHasControlChars,
+  pasteTextNeedsConfirm
+} from '../model/TerminalSession';
 import { WindowRegistration, sessionRegistry } from '../model/SessionRegistry';
 import { AppearanceSettings, AppearanceStore, DEFAULT_APPEARANCE } from '../settings/AppearanceStore';
 import { ConnectionSettings, ConnectionStore } from '../settings/ConnectionStore';
@@ -65,6 +70,9 @@ const INSPECTOR_COMPACT_WIDTH: number = 352;
 const INSPECTOR_DEFAULT_WIDTH: number = 400;
 const INSPECTOR_BREAKPOINT: number = 900;
 const THEME_PREVIEW_BATCH_SIZE: number = 24;
+// CR-004 paste confirm dialog: the clipboard preview is capped so a huge
+// clipboard payload never materializes as one giant Text node.
+const PASTE_PREVIEW_MAX_CHARS: number = 500;
 // Choreography-specific durations (ms) that are deliberately NOT part of the
 // shared EmberMotion token set: these are the asymmetric micro-timings the spec
 // calls out per moment, distinct from the folded 200/240 -> DUR_STANDARD family.
@@ -773,6 +781,12 @@ struct Index {
   @State private tabEditOpen: boolean = false;
   @State private agentGuideOpen: boolean = false;
   @State private agentGuideMode: string = 'help';
+  // CR-004 paste confirmation: clipboard text that is multi-line or carries
+  // C0 control characters is held here until the user confirms; only then
+  // does it enter the native paste channel (Ghostty-style paste protection).
+  @State private pasteConfirmOpen: boolean = false;
+  @State private pendingPasteText: string = '';
+  private pendingPasteSessionId: number = -1;
   @State private connectionAdvancedOpen: boolean = false;
   @State private connectionErrorDetailsOpen: boolean = false;
   @State private tabEditDraft: string = '';
@@ -968,6 +982,11 @@ struct Index {
         }
       }
     });
+    // CR-004 paste guard: all text pastes (native Ctrl+V / Shift+Insert,
+    // right-click menu, secure PasteButton) pass through this gate before the
+    // native paste channel. Re-armed here on every bind so a session adopted
+    // from a sibling window confirms against THIS window's overlay.
+    session.controller.pasteGate = (text: string): boolean => this.gateTextPaste(session, text);
   }
 
   private addSession(refocus: boolean = false): void {
@@ -1499,6 +1518,7 @@ struct Index {
       !this.drawerOpen &&
       !this.tabEditOpen &&
       !this.agentGuideOpen &&
+      !this.pasteConfirmOpen &&
       !this.appInBackground;
   }
 
@@ -1815,7 +1835,7 @@ struct Index {
   // Keep F6 for desktop keyboards and Ctrl+Alt+. for compact keyboards without
   // a function row; neither steals Tab/Shift+Tab from terminal programs.
   private cycleWorkbenchFocus(): void {
-    if (this.tabEditOpen || this.agentGuideOpen) {
+    if (this.tabEditOpen || this.agentGuideOpen || this.pasteConfirmOpen) {
       return;
     }
     if (this.workbenchFocusZone === 0) {
@@ -1835,11 +1855,14 @@ struct Index {
   }
 
   private workbenchOverlayOpen(): boolean {
-    return this.drawerOpen || this.tabEditOpen || this.agentGuideOpen;
+    return this.drawerOpen || this.tabEditOpen || this.agentGuideOpen || this.pasteConfirmOpen;
   }
 
   private closeTopmostOverlay(): void {
-    if (this.agentGuideOpen) {
+    if (this.pasteConfirmOpen) {
+      // Esc on a paste confirmation always cancels, never pastes.
+      this.dismissPasteConfirm();
+    } else if (this.agentGuideOpen) {
       this.dismissAgentGuide();
     } else if (this.tabEditOpen) {
       this.commitTabEditor();
@@ -1914,6 +1937,11 @@ struct Index {
         this.buildAgentGuidePanel();
       }
 
+      if (this.pasteConfirmOpen) {
+        this.buildPasteConfirmScrim();
+        this.buildPasteConfirmDialog();
+      }
+
       Button('')
         .width(1)
         .height(1)
@@ -1955,6 +1983,7 @@ struct Index {
               !this.drawerOpen &&
               !this.tabEditOpen &&
               !this.agentGuideOpen &&
+              !this.pasteConfirmOpen &&
               !this.appInBackground,
             // Polling / scrollbar follow raw tab visibility: a translucent
             // drawer must not throttle the terminal still showing behind it.
@@ -3536,6 +3565,93 @@ struct Index {
 
 
   @Builder
+  private buildPasteConfirmScrim() {
+    Column()
+      .width('100%')
+      .height('100%')
+      .backgroundColor('#00000000')
+      .onClick(() => {
+        // Scrim click cancels: a risky paste must never be confirmed by an
+        // accidental tap outside the dialog.
+        this.dismissPasteConfirm();
+      })
+  }
+
+  // CR-004 paste confirmation (Ghostty-style paste protection): the held
+  // clipboard text is previewed here and only enters the terminal on an
+  // explicit click. Hard cut on open/close -- deliberately no transition --
+  // and every visible color is a theme-derived chrome token.
+  @Builder
+  private buildPasteConfirmDialog() {
+    Column({ space: 14 }) {
+      Text('确认粘贴')
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.chrome.textPrimary)
+        .width('100%')
+
+      Text(this.pendingPasteSummary())
+        .fontSize(12)
+        .fontColor(this.chrome.textSecondary)
+        .width('100%')
+
+      Scroll() {
+        Text(this.pendingPastePreview())
+          .fontSize(11)
+          .fontColor(this.chrome.textPrimary)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+      }
+      .width('100%')
+      .height(96)
+      .padding(8)
+      .backgroundColor(this.chrome.panelBg2)
+      .borderRadius(8)
+      .border({ width: 1, color: this.chrome.panelBorder })
+
+      Row({ space: 8 }) {
+        Button('取消')
+          .height(40)
+          .fontSize(12)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
+          .borderRadius(8)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.pasteConfirmOpen)
+          .onClick(() => {
+            this.dismissPasteConfirm();
+          })
+        Blank()
+        Button('粘贴')
+          .height(40)
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .backgroundColor(this.chrome.primaryBtnBg)
+          .fontColor(this.chrome.primaryBtnText)
+          .borderRadius(8)
+          // Same pressed feedback as the other primary actions.
+          .stateStyles({
+            pressed: {
+              .opacity(0.82)
+            }
+          })
+          .focusable(this.pasteConfirmOpen)
+          .onClick(() => {
+            this.confirmPendingPaste();
+          })
+      }
+      .width('100%')
+    }
+    .width(this.dialogWidth(360))
+    .padding(18)
+    .backgroundColor(this.chrome.panelBg)
+    .borderRadius(8)
+    .border({ width: 1, color: this.chrome.panelBorder })
+    .shadow({ radius: 28, color: '#B3000000', offsetX: 0, offsetY: 12 })
+  }
+
+
+  @Builder
   private buildFieldLabel(label: string) {
     Text(label)
       .fontSize(11)
@@ -3577,19 +3693,30 @@ struct Index {
   private connectFusionVm(): void {
     const session = this.activeSession();
     this.markManualConnection(session);
-    const sshPort = Number(this.draftSshPort);
-    const profile = createFusionVmProfile(
-      this.draftHost,
-      Number.isFinite(sshPort) ? sshPort : 22,
-      this.draftUser,
-      this.draftPassword
-    );
+    const profile = this.bindSessionUploadProfile(session);
     this.closeDrawer();
     this.persistConnection();
     session.agentDriver.disconnect();
     this.ensureDriverAttached(session);
     this.clearTerminalForLiveSession(session);
     session.driver.connectSsh(profile);
+  }
+
+  // CR-004: capture the current SSH endpoint as THIS session's image-upload
+  // identity at connect time. The per-session binding makes cross-tab upload
+  // leaks structural: editing the shared connection draft afterwards (or
+  // connecting another tab elsewhere) can never redirect this tab's uploads.
+  // Returns the normalized profile so the SSH connect path reuses it.
+  private bindSessionUploadProfile(session: TerminalSessionHandle): ConnectionProfile {
+    const sshPort = Number(this.draftSshPort);
+    const profile: ConnectionProfile = createFusionVmProfile(
+      this.draftHost,
+      Number.isFinite(sshPort) ? sshPort : 22,
+      this.draftUser,
+      this.draftPassword
+    );
+    session.bindUploadProfile(profile.host, profile.port, profile.user, profile.password);
+    return profile;
   }
 
   private connectFusionAgent(): void {
@@ -3608,6 +3735,10 @@ struct Index {
     session.driver.detach();
     session.agentDriver.attach(session.controller);
     this.clearTerminalForLiveSession(session);
+    // The agent channel terminates on the Fusion VM and the SSH draft fields
+    // describe that same VM, so its endpoint doubles as this tab's upload
+    // identity for the explicit 'sftp' paste mode.
+    this.bindSessionUploadProfile(session);
     session.agentDriver.connect({
       host: this.draftHost,
       port: Number.isFinite(port) && port > 0 ? port : DEFAULT_FUSION_AGENT_PORT,
@@ -3622,6 +3753,9 @@ struct Index {
     const session = this.activeSession();
     this.markManualConnection(session);
     session.agentDriver.disconnect();
+    // A local PTY has no remote host: drop any upload identity a previous
+    // connection bound to this tab so sftp paste degrades to the sandbox path.
+    session.clearUploadProfile();
     this.ensureDriverAttached(session);
     this.clearTerminalForLiveSession(session);
     session.driver.startLocal();
@@ -3827,19 +3961,21 @@ struct Index {
       });
   }
 
+  // SFTP upload reads the per-session upload identity bound at connect time
+  // (CR-004) -- never the page-global connection draft, which may meanwhile
+  // point at another tab's host.
   private uploadPastedImage(session: TerminalSessionHandle, localPath: string): void {
-    if (this.draftPassword.length === 0) {
+    if (session.uploadPassword.length === 0) {
       session.controller.paste(localPath);
       session.controller.feed('\r\n[FusionTerm] 已粘贴本地路径;设置共享文件夹或填写 SSH 密码后可直达远端\r\n');
       return;
     }
-    const sshPort = Number(this.draftSshPort);
     const remotePath = `/tmp/fusionterm-paste-${Date.now()}.png`;
     FusionTerminalDriver.uploadFile(
-      this.draftHost,
-      Number.isFinite(sshPort) && sshPort > 0 ? sshPort : 22,
-      this.draftUser,
-      this.draftPassword,
+      session.uploadHost,
+      session.uploadPort,
+      session.uploadUser,
+      session.uploadPassword,
       localPath,
       remotePath
     ).then((remote: string) => {
@@ -3847,6 +3983,67 @@ struct Index {
     }).catch((err: Object) => {
       session.controller.feed('\r\n[FusionTerm] 图片上传失败:' + JSON.stringify(err) + '\r\n');
     });
+  }
+
+  // ── CR-004 paste confirmation ───────────────────────────────────────────
+  // Gate installed on every session controller (see GuardedTerminalController
+  // in model/TerminalSession.ets): safe text passes synchronously; risky text
+  // (multi-line or C0 control characters) opens the confirm overlay and this
+  // attempt returns false, so nothing reaches the PTY before consent.
+  private gateTextPaste(session: TerminalSessionHandle, text: string): boolean {
+    if (!pasteTextNeedsConfirm(text)) {
+      return true;
+    }
+    this.pendingPasteSessionId = session.id;
+    this.pendingPasteText = text;
+    this.pasteConfirmOpen = true;
+    return false;
+  }
+
+  private confirmPendingPaste(): void {
+    const text: string = this.pendingPasteText;
+    const sessionId: number = this.pendingPasteSessionId;
+    this.dismissPasteConfirm();
+    // The tab may have closed while the dialog was up; a vanished session
+    // simply drops the held text.
+    for (const session of this.sessions) {
+      if (session.id === sessionId) {
+        session.controller.pasteConfirmed(text);
+        return;
+      }
+    }
+  }
+
+  private dismissPasteConfirm(): void {
+    if (!this.pasteConfirmOpen) {
+      return;
+    }
+    this.pasteConfirmOpen = false;
+    this.pendingPasteText = '';
+    this.pendingPasteSessionId = -1;
+    this.focusActiveTerminalSoon();
+  }
+
+  private pendingPasteSummary(): string {
+    const parts: string[] = [];
+    const lines: number = countPasteLines(this.pendingPasteText);
+    if (lines > 1) {
+      parts.push(`${lines} 行`);
+    }
+    if (pasteTextHasControlChars(this.pendingPasteText)) {
+      parts.push('控制字符');
+    }
+    if (parts.length === 0) {
+      return '';
+    }
+    return `剪贴板内容包含${parts.join('和')},粘贴后会在终端中直接执行。确认粘贴这段内容?`;
+  }
+
+  private pendingPastePreview(): string {
+    const text: string = this.pendingPasteText;
+    return text.length > PASTE_PREVIEW_MAX_CHARS
+      ? `${text.slice(0, PASTE_PREVIEW_MAX_CHARS)}…`
+      : text;
   }
 
   private clearTerminalForLiveSession(session: TerminalSessionHandle): void {

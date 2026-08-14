@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <deque>
 #include <functional>
 #include <atomic>
 #include <thread>
@@ -20,6 +21,10 @@ public:
     void disconnect();
 
     bool isConnected() const { return m_connected.load(); }
+    // Returns true when every byte was accepted — written to the channel
+    // immediately or held in the ordered pending queue for the
+    // writable-readiness drain in readLoop(). Returns false once the write
+    // side has failed so the rejection is explicit at the NAPI boundary.
     bool write(const char* data, size_t len);
     void resize(int cols, int rows);
 
@@ -29,6 +34,8 @@ public:
 
 private:
     void readLoop();
+    bool drainPendingWritesLocked();
+    void notifyWriteFailure();
 
     int m_socketFd;
     _LIBSSH2_SESSION* m_session;
@@ -37,5 +44,11 @@ private:
     std::atomic<bool> m_running;
     std::thread m_readThread;
     std::mutex m_ioMutex;
+    // CR-006 (SSH half): ordered pending-byte queue for the lossless write
+    // path. Guarded by m_ioMutex, drained by write()'s fast path and the
+    // writable-ready pass in readLoop().
+    std::deque<std::string> m_pendingWrites;
+    size_t m_pendingWriteOffset;
+    bool m_writeFailed;
     std::function<void(const std::string&)> m_outputCallback;
 };

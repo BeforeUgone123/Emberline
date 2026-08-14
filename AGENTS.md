@@ -84,7 +84,31 @@ encoder. Do not add soft key rows back without an explicit user request.
   (`check-adaptive-chrome.mjs`). The tab strip is ghostty-macOS shaped:
   equal-split tabs, a floating pill capsule as the active face, and a
   solo tab collapses to a centered title.
-- The source-level quality gate currently contains 40 `tools/check-*.mjs`
+- 2026-08-14 iteration A (source-level; DevEco/device verification pending):
+  - Durable Agent sessions: the hardened wand-agent keeps PTYs alive for a
+    `--session-grace-seconds` window (default 120s) after a WebSocket drop and
+    rebinds on `attach=1&sessionId=`, replaying a 512 KiB ring buffer. The app
+    closes the ping/pong loop (25s ping + 40s pong deadline), probes on
+    foreground/network resume, and reattach never clears the renderer. This
+    fixes the lock-screen-kills-tmux chain (CR-007 direction).
+  - Agent auth defaults to header-only `Authorization: Bearer`; the query
+    token is confined to an explicit `legacyQueryToken` flag (CR-003 partial).
+  - SSH/SFTP host keys are verified against a process-wide TOFU store before
+    credentials are sent; libssh2 init is process-wide `std::call_once`; the
+    pin moved to immutable master commit `4f271a3b` with merge-base fix
+    verification (CR-001/002/010).
+  - SSH and local-PTY writes are lossless: ordered pending queue, writable
+    readiness drain, failure latch with explicit error (CR-006).
+  - Image-upload credentials are a per-session in-memory profile bound at
+    connect time; text paste with multiple lines or C0 control characters
+    requires confirmation before entering the native paste channel (CR-004).
+  - The kitty keyboard protocol is wired through the vendored official key
+    encoder (per-event `setopt_from_terminal`, kitty flags off = legacy
+    handwritten table byte-for-byte).
+  - CJK blank-glyph fix: the typography layout box gets 2x slack so
+    MaxLines(1) no longer drops wrapped CJK glyphs, and render/copy/search
+    paths read full grapheme clusters instead of base codepoints only.
+- The source-level quality gate currently contains 46 `tools/check-*.mjs`
   scripts. These are structural checks, not a substitute for HAP compilation,
   profiler evidence, or device QA.
 
@@ -151,17 +175,21 @@ verified patched revision and shared SSH/SFTP host-key verification.
 
 ## Next Best Work
 
-1. Read `docs/code-review-2026-07-10.md`; unresolved Critical and High findings
-   remain the engineering queue.
-2. Do not ship `libssh2-1.11.1`. Compile SSH/SFTP out or pin an audited patched
-   revision, then implement shared SSH/SFTP host-key verification.
-3. Harden Fusion Agent pairing, credential storage, and transport; finish
-   missed-heartbeat detection and design durable session reattachment.
-4. Fix cross-tab image-upload credentials, lossless native writes, native EOF
-   propagation, final renderer-host disposal, and process-level native cleanup.
+1. Read `docs/code-review-2026-07-10.md`; unresolved findings (CR-008 native
+   EOF propagation, CR-009 final renderer-host disposal, CR-003 pairing/secure
+   storage remainder) remain the engineering queue.
+2. Verify the 2026-08-14 iteration A source-level fixes on the DevEco machine
+   and on device: SSH/SFTP host-key TOFU flow, lossless writes under backpressure,
+   kitty keyboard disambiguation in nvim/helix/fish, CJK rendering in long
+   Chinese TUIs, and lock-screen/session reattach survival.
+3. Harden Fusion Agent pairing and credential storage (random per-instance
+   token, secure-element storage); wire the `legacyQueryToken` stock-agent
+   fallback into the settings UI.
+4. Fix native EOF propagation, final renderer-host disposal, and process-level
+   native cleanup.
 5. Repair the clean-clone gate and make signing inputs reproducible without
    committing machine-specific material.
-6. On the DevEco machine, run all 40 structural checks, `ohpm install --all`, a
+6. On the DevEco machine, run all 46 structural checks, `ohpm install --all`, a
    full `hvigorw` build, codelinter, and the Direction A device/profiler matrix,
    including long tmux output, background keep-alive, and foreground screen-on.
 7. Split `Index.ets` only after the primary VM path and release blockers are

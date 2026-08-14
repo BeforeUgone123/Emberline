@@ -3,6 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { SYS_DARK_KEY } from '../theme/ChromeTheme';
+import { appResumeEvents } from '../common/AppResumeEvents';
 
 const DOMAIN = 0x0001;
 const TAG = 'FusionTermAbility';
@@ -134,6 +135,11 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    // Socket-owning transports probe/reconnect on foreground edges: a
+    // lock-screen suspension can leave a WebSocket half-open with no
+    // close/error event. Subscribers no-op unless a session is armed, so the
+    // initial-launch foreground is harmless here.
+    appResumeEvents.publishForeground();
     this.windowForeground = true;
     this.applyForegroundScreenPolicy();
     if (!this.wasBackgrounded) {

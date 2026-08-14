@@ -1342,6 +1342,10 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
 
     OH_Drawing_TypographyCreate* handler = OH_Drawing_CreateTypographyHandler(typographyStyle, m_fontCollection);
     if (!handler) {
+        OH_LOG_ERROR(LOG_APP,
+            "Typography handler creation failed frame=%{public}" PRIu64 " span=%{public}u: run paints blank",
+            m_currentFrameId,
+            span);
         OH_Drawing_DestroyTextStyle(textStyle);
         OH_Drawing_DestroyTypographyStyle(typographyStyle);
         return nullptr;
@@ -1357,10 +1361,29 @@ NativeDrawingRenderer::GlyphLayout* NativeDrawingRenderer::getGlyphLayout(
     OH_Drawing_DestroyTextStyle(textStyle);
     OH_Drawing_DestroyTypographyStyle(typographyStyle);
     if (!typography) {
+        OH_LOG_ERROR(LOG_APP,
+            "CreateTypography failed frame=%{public}" PRIu64 " span=%{public}u preview=%{public}s: run paints blank",
+            m_currentFrameId,
+            span,
+            HexPreview(glyph).c_str());
         return nullptr;
     }
 
-    const double maxWidth = std::max(1.0, static_cast<double>(m_cellWidth * span));
+    // The layout box must never constrain the run: glyphs are shaped by
+    // fallback faces whose advances are NOT guaranteed to equal
+    // span * m_cellWidth (m_cellWidth is measured from the primary face's
+    // "M"; CJK usually resolves to a different face with its own full-width
+    // advance). If the shaped width exceeds the box by even a fraction of a
+    // pixel, the paragraph wraps the overflow onto a second line and
+    // MaxLines(1) then silently drops those glyphs -- the reported
+    // intermittent blank CJK cells (same char visible in one run, blank in
+    // another, because run grouping changes the cumulative slack). Double
+    // the box instead: painting is anchored at the cell origin with
+    // TEXT_ALIGN_START, so slack never shifts output, and an oversized glyph
+    // simply bleeds into the next cell (the same overhang ghostty allows)
+    // instead of vanishing.
+    const double maxWidth =
+        std::max(1.0, static_cast<double>(m_cellWidth) * static_cast<double>(span) * 2.0);
     OH_Drawing_TypographyLayout(typography, maxWidth);
     const size_t unresolvedCount = OH_Drawing_TypographyGetUnresolvedGlyphsCount(typography);
     if (unresolvedCount > 0) {
