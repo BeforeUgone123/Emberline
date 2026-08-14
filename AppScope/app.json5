@@ -3,8 +3,8 @@
     "bundleName": "com.preview.fusionterm",
     "debug": false,
     "vendor": "preview",
-    "versionCode": 1000000,
-    "versionName": "1.0.0",
+    "versionCode": 2000000,
+    "versionName": "2.0.0",
     "icon": "$media:fusionterm_icon",
     "label": "$string:app_name"
   }

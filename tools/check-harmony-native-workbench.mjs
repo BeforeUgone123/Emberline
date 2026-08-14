@@ -71,10 +71,7 @@ assert.match(workspaceMenu, /MenuItem\(\{ content: '关于 Emberline' \}\)/);
 for (const removed of [
   /accessoryVisible/,
   /buildAccessoryBar/,
-  /sendAccessoryKey/,
-  /OnboardingStore/,
-  /loadOnboarding/,
-  /onboardingStore/
+  /sendAccessoryKey/
 ]) {
   assert.doesNotMatch(index, removed);
 }

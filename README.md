@@ -159,31 +159,65 @@ Agent 会话面向 HarmonyOS PC「融合开发引擎」(Fusion Development Engin
 `172.16.100.2`),Emberline 通过 WebSocket PTY 直连,零上传共享目录、断线
 自动重连。SSH 与本地 shell 无需任何服务端组件,可跳过本节。
 
-**1. 安装(VM 内,二选一)**
+**1. 一行安装并启动(VM 内)**
 
-方式 A — 从源码构建(需要 Go 1.21+):
+需要 Node.js 16 或以上。任选一个入口;三条命令都会识别已安装的 Go 版本,
+版本过旧或未安装时自动下载带 SHA-256 校验的 Go 工具链,编译 agent,写入
+systemd 服务并立即启动。示例 token 与 Emberline 默认值一致,只适用于可信的
+虚拟机桥接网络:
 
 ```sh
-git clone https://github.com/beforeugone520/wand-agent.git
+# pnpm(推荐)
+pnpm add -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
+
+# npm
+npm install -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
+
+# curl
+curl -fsSL https://raw.githubusercontent.com/BeforeUgone123/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm
+```
+
+安装器会把 agent 二进制复制到稳定目录,把 token 存入权限为 `0600` 的
+EnvironmentFile,并输出 Emberline 要填写的端点和 token。省略 `--host` 会
+自动探测融合开发引擎桥接地址;省略 `--token` 会生成随机 token。可先给任一
+入口末尾加 `--dry-run` 预览,不写文件也不启动服务。
+
+通用的服务检查命令:
+
+```sh
+sudo systemctl status wand-agent --no-pager
+sudo journalctl -u wand-agent -f
+```
+
+npm/pnpm 全局安装还可用 `wand-agent doctor` 检查 Go、桥接
+地址、缓存和 systemd。curl 入口只把服务所需二进制复制到稳定
+目录,引导脚本退出后服务仍会继续运行。
+
+**2. 手动源码构建(备用)**
+
+不使用一行安装器时,按 `go.mod` 声明的 Go 版本手动构建:
+
+```sh
+git clone https://github.com/BeforeUgone123/wand-agent.git
 cd wand-agent
-go build -o wand-agent .
-install -m 755 wand-agent /usr/local/bin/
+go build -buildvcs=false -o wand-agent .
+sudo install -m 755 wand-agent /usr/local/bin/
+wand-agent --host 172.16.100.2 --token harmonyterm
 ```
 
-方式 B — 直接部署预构建二进制:把构建好的 `wand-agent` 拷进 VM(如经共享
-目录),放到 `/usr/local/bin/` 并 `chmod +x`。
+默认监听 `8765` 端口、路径 `/ws`;`--host` 绑定 VM 桥接网卡地址。前台手动
+运行时可用 `--shell /usr/bin/fish` 显式指定新会话的 shell。不指定时跟随
+启动环境的 `$SHELL`。
 
-**2. 运行**
+**3. 手动配置 systemd(备用)**
+
+先把 token 写入只有 root 可读的环境文件:
 
 ```sh
-wand-agent --host 172.16.100.2 --token <你的token>
+sudo install -d -m 755 /etc/wand-agent
+printf 'WAND_AGENT_TOKEN=%s\n' 'harmonyterm' | sudo tee /etc/wand-agent/wand-agent.env >/dev/null
+sudo chmod 600 /etc/wand-agent/wand-agent.env
 ```
-
-默认监听 `8765` 端口、路径 `/ws`;`--host` 绑定 VM 桥接网卡地址,`--token`
-是 Bearer 鉴权令牌(应用侧需填一致);`--shell /usr/bin/fish` 可显式指定
-新会话的默认 shell(不指定时跟随启动环境的 `$SHELL`,从 ssh 一行命令或
-systemd 启动时往往不是你交互用的那个,建议显式指定)。前台跑通后建议改为
-systemd 常驻:
 
 ```ini
 # /etc/systemd/system/wand-agent.service
@@ -192,7 +226,8 @@ Description=wand-agent WebSocket PTY for Emberline
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2 --token <你的token>
+EnvironmentFile=/etc/wand-agent/wand-agent.env
+ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2
 Restart=always
 RestartSec=2
 
@@ -201,17 +236,19 @@ WantedBy=multi-user.target
 ```
 
 ```sh
-systemctl daemon-reload && systemctl enable --now wand-agent
+sudo systemctl daemon-reload && sudo systemctl enable --now wand-agent
 ```
 
-**3. 应用侧连接**
+**4. 应用侧连接**
 
 在 Emberline 右侧检查器「连接」页填入地址与 token(默认示例
 `ws://172.16.100.2:8765/ws`),点「连接 Agent」;应用会自动记住并在下次
 启动时重连。
 
-应用内也内置了同一份部署教程,但不会在启动时遮住终端;从顶栏「更多 →
-帮助与诊断」按需打开,命令可长按复制。
+应用内也内置了同一份部署教程。首次打开 Emberline 时会在已挂载的
+终端上方弹出一次,可直接复制 pnpm/npm/curl 安装命令并进入连接
+设置;关闭后不再自动弹出。以后可从顶栏「更多 → 帮助与诊断」重新打开,
+命令可长按复制。
 
 ### 启用 Codex 任务完成提醒
 
@@ -294,10 +331,10 @@ Profiler。Direction A 界面、后台 `taskKeeping` 与前台常亮策略在
 
 本项目基于两个上游仓库的 fork,修改如下:
 
-### 1. `libghostty_ohos/` — fork [beforeugone520/libghostty-ohos](https://github.com/beforeugone520/libghostty-ohos)(基于 [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos))
+### 1. `libghostty_ohos/` — fork 自 [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos)
 
-上游提供了 libghostty-vt 在 HarmonyOS 上的基础渲染 HAR;fork 仓库承载本项目
-的全部渲染层改动,并以内置形式随本仓库的 `libghostty_ohos/` 演进。相对上游
+上游提供了 libghostty-vt 在 HarmonyOS 上的基础渲染 HAR;本项目不再维护独立
+fork 仓库,全部渲染层改动以内置形式随本仓库的 `libghostty_ohos/` 演进。相对上游
 的大规模重写与扩展主要包括:
 
 - **渲染器**:脏行级重绘 + 持久离屏缓冲;视口滚动改 scroll-damage(离屏
@@ -315,7 +352,7 @@ Profiler。Direction A 界面、后台 `taskKeeping` 与前台常亮策略在
 - **ETS 层**:TerminalController / TerminalSurface 重做(输出直连跨 so
   投递、后台标签轮询门控、滚动条 overlay、安全粘贴)。
 
-### 2. VM Agent — fork [beforeugone520/wand-agent](https://github.com/beforeugone520/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
+### 2. VM Agent — fork [BeforeUgone123/wand-agent](https://github.com/BeforeUgone123/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
 
 推荐使用加固 fork,相对上游的修改:WebSocket frame routing、Bearer 鉴权、
 Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为、PTY 环境净化
@@ -332,7 +369,7 @@ Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为
 
 | 组件 | 来源 | 引入方式 | 协议 |
 | --- | --- | --- | --- |
-| libghostty-ohos | fork `beforeugone520/libghostty-ohos`(上游 `wiedymi/libghostty-ohos`) | 内置于 `libghostty_ohos/` | MIT(`libghostty_ohos/LICENSE`) |
+| libghostty-ohos | fork 自 `wiedymi/libghostty-ohos` | 内置于 `libghostty_ohos/` | MIT(`libghostty_ohos/LICENSE`) |
 | libghostty-vt | `ghostty-org/ghostty` | 预编译静态库 `libghostty_ohos/prebuilt/` | MIT |
 | wand-agent | `ystyle/wand-agent` 及其 fork | VM 侧独立部署,不随应用分发 | MIT |
 | libssh2 | `libssh2/libssh2` `libssh2-1.11.1` | 脚本拉取到 `third_party/` | BSD-3-Clause |

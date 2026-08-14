@@ -58,6 +58,10 @@ Emberline is a native HarmonyOS Stage terminal application, not a scaffold:
   `prebuilt/arm64-v8a/libghostty_vt.a` terminal core.
 - The primary transport is one wand-agent-compatible WebSocket PTY per tab,
   targeting `ws://172.16.100.2:8765/ws` with development token `harmonyterm`.
+- VM setup now exposes npm, pnpm, and curl one-line installers. All three
+  delegate to the fork's package CLI, which reads the minimum Go version from
+  `go.mod`, downloads a checksum-verified toolchain when needed, builds the
+  agent, writes a 0600 token EnvironmentFile, and enables the systemd service.
 - Multiple tabs/windows, drag reorder and handoff, hardware-key encoding, IME,
   terminal mouse, OSC 52, OSC 9/BEL notification, theme/font customization,
   and target-aware image paste are present in source.
@@ -520,7 +524,7 @@ the surface-alpha check above.
 
 ## 2026-07-03 Hardened wand-agent Fork
 
-The VM backend now has a hardened fork: `beforeugone520/wand-agent`
+The VM backend now has a hardened fork: `BeforeUgone123/wand-agent`
 (commit `2974ee3`, upstream `ystyle/wand-agent` v0.2.3). Fixes: frame-type
 routing (binary -> PTY, text -> control), single serialized WebSocket writer,
 Bearer auth + constant-time compare + Origin allowlist + default bind
@@ -537,6 +541,30 @@ wand-agent --host 172.16.100.2 --token harmonyterm
 
 `FusionAgentDriver.connect` now also sends `Authorization: Bearer <token>`
 (query token kept for stock-agent compatibility).
+
+## 2026-08-01 One-line Agent Setup
+
+The fork now ships an npm/pnpm package CLI (`wand-agent` 0.3.0). Emberline's
+`tools/install-wand-agent.sh` is deliberately a thin curl bootstrap: it checks
+Node 16+, downloads the selected fork ref, and delegates to
+`wand-agent service install`. Go version selection, verified toolchain
+downloads, the build, stable binary copy, token storage, and `systemd
+enable --now` remain owned by the agent package rather than being duplicated
+in the app repository.
+
+The release README and in-app Help expose equivalent pnpm, npm, and curl
+one-line commands. `tools/check-agent-setup-guide.mjs` pins those entry points
+and the delegation boundary. The default examples use `harmonyterm` only for
+the trusted Fusion VM bridge; omitting `--token` generates a random token.
+
+The same decision restores a deliberately narrow first-launch prompt,
+superseding Direction A's blanket automatic-onboarding removal. The terminal
+surface is mounted first, then `OnboardingStore` lets one window claim the
+deploy/connect walkthrough and persists the versioned setup-seen key. The
+prompt opens directly on the install commands and can hand off to the
+connection inspector;
+Help remains the permanent way to reopen the complete walkthrough. It is not a
+standalone welcome page, carousel, dashboard, or quick-key surface.
 
 ## Do Not Drift
 

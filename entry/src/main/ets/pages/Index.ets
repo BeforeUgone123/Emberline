@@ -19,6 +19,7 @@ import { TerminalSessionHandle } from '../model/TerminalSession';
 import { WindowRegistration, sessionRegistry } from '../model/SessionRegistry';
 import { AppearanceSettings, AppearanceStore, DEFAULT_APPEARANCE } from '../settings/AppearanceStore';
 import { ConnectionSettings, ConnectionStore } from '../settings/ConnectionStore';
+import { OnboardingStore } from '../settings/OnboardingStore';
 import {
   CURVE_ACCEL,
   CURVE_DECEL,
@@ -661,7 +662,8 @@ const AGENT_GUIDE_SERVICE_UNIT: string =
   'After=network-online.target\n' +
   '\n' +
   '[Service]\n' +
-  'ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2 --token 你的token\n' +
+  'EnvironmentFile=/etc/wand-agent/wand-agent.env\n' +
+  'ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2\n' +
   'Restart=always\n' +
   'RestartSec=2\n' +
   '\n' +
@@ -733,6 +735,7 @@ struct Index {
   @State private focusedChromeAction: string = '';
   @State private tabEditOpen: boolean = false;
   @State private agentGuideOpen: boolean = false;
+  @State private agentGuideMode: string = 'help';
   @State private connectionAdvancedOpen: boolean = false;
   @State private connectionErrorDetailsOpen: boolean = false;
   @State private tabEditDraft: string = '';
@@ -793,6 +796,7 @@ struct Index {
   private connectionSettingsLoaded: boolean = false;
   private appearanceStore: AppearanceStore = new AppearanceStore();
   private connectionStore: ConnectionStore = new ConnectionStore();
+  private onboardingStore: OnboardingStore = new OnboardingStore();
   private drawerTransitionEpoch: number = 0;
   private demoRendered: boolean = false;
   @State private taskNotificationEnabled: boolean = false;
@@ -830,6 +834,26 @@ struct Index {
       this.addSession();
     }
     void this.loadAppearance();
+    void this.loadOnboarding();
+  }
+
+  private async loadOnboarding(): Promise<void> {
+    const context: common.UIAbilityContext | null = this.context;
+    if (!context) {
+      return;
+    }
+    try {
+      const shouldShow: boolean = await this.onboardingStore.claimAgentGuide(context);
+      if (!shouldShow) {
+        return;
+      }
+      this.workbenchFocusZone = 0;
+      this.agentGuideMode = 'onboarding';
+      this.agentGuideOpen = true;
+      this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
+    } catch (err) {
+      console.error('Failed to load onboarding state: ' + JSON.stringify(err));
+    }
   }
 
   aboutToDisappear(): void {
@@ -2156,6 +2180,7 @@ struct Index {
       MenuItem({ content: '帮助与诊断' })
         .onClick(() => {
           this.workbenchFocusZone = 0;
+          this.agentGuideMode = 'help';
           this.agentGuideOpen = true;
           void this.refreshTaskNotificationState();
           this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
@@ -2163,6 +2188,7 @@ struct Index {
       MenuItem({ content: '关于 Emberline' })
         .onClick(() => {
           this.workbenchFocusZone = 0;
+          this.agentGuideMode = 'help';
           this.agentGuideOpen = true;
           void this.refreshTaskNotificationState();
           this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
@@ -3121,31 +3147,23 @@ struct Index {
 
     this.buildHelpRow('第 1 步 · 进入虚拟机', '打开融合开发引擎的 Linux 虚拟机终端(或任何能进入虚拟机 shell 的方式),以下命令都在虚拟机里执行')
 
-    this.buildHelpRow('第 2 步 · 安装 wand-agent', '方式一,源码构建(需要 Go 1.21 及以上):')
-    this.buildGuideCommand('git clone https://github.com/beforeugone520/wand-agent.git\ncd wand-agent\ngo build -o wand-agent .\ninstall -m 755 wand-agent /usr/local/bin/')
-    Text('方式二,预构建二进制:把 wand-agent 经共享目录拷进虚拟机,再执行:')
+    this.buildHelpRow('第 2 步 · 一行安装并启动', '需要 Node.js 16 或以上。以下任选一条:Go 缺失或版本过旧时会自动下载带 SHA-256 校验的工具链,然后编译 Agent、注册 systemd 并立即启动:')
+    this.buildGuideCommand('pnpm add -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('npm install -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('curl -fsSL https://raw.githubusercontent.com/BeforeUgone123/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm')
+    Text('省略 --host 会自动探测桥接地址;省略 --token 会生成随机 token。末尾加 --dry-run 可先预览,不写文件也不启动服务。')
       .fontSize(11)
       .fontColor(this.chrome.textSecondary)
       .lineHeight(16)
       .padding({ top: 2 })
-    this.buildGuideCommand('install -m 755 wand-agent /usr/local/bin/')
 
-    this.buildHelpRow('第 3 步 · 试运行', '--host 填虚拟机桥接网卡地址(融合引擎通常是 172.16.100.2),--token 是鉴权令牌,应用侧需填一致:')
-    this.buildGuideCommand('wand-agent --host 172.16.100.2 --token 你的token')
-    Text('默认监听 8765 端口、路径 /ws。前台跑通即可先做第 5 步连一次。')
-      .fontSize(10.5)
-      .fontColor(this.chrome.textFaint)
-      .lineHeight(15)
+    this.buildHelpRow('第 3 步 · 检查服务', '安装器会输出 Emberline 要填的端点和 token;token 保存在 0600 EnvironmentFile,不会出现在 ps 命令行中:')
+    this.buildGuideCommand('sudo systemctl status wand-agent --no-pager\nsudo journalctl -u wand-agent -f')
 
-    this.buildHelpRow('第 4 步 · 开机常驻(推荐)', '把 agent 改为 systemd 服务,先写入 /etc/systemd/system/wand-agent.service:')
+    this.buildHelpRow('手动 systemd 模板(备用)', '一行安装器已自动完成以下配置,只在需要手工排查时使用:')
     this.buildGuideCommand(AGENT_GUIDE_SERVICE_UNIT)
-    Text('然后启用:')
-      .fontSize(11)
-      .fontColor(this.chrome.textSecondary)
-      .padding({ top: 2 })
-    this.buildGuideCommand('systemctl daemon-reload && systemctl enable --now wand-agent')
 
-    this.buildHelpRow('第 5 步 · 回到应用连接', '检查器「连接」页填入地址与 token(默认 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
+    this.buildHelpRow('第 4 步 · 回到应用连接', '检查器「连接」页填入安装器输出的地址与 token(默认示例 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
 
     Text('安全提示:token 鉴权面向可信的虚拟机桥接网络;若把 agent 暴露到桥接网络之外,请更换强随机 token 并用防火墙限制来源。')
       .fontSize(10.5)
@@ -3184,7 +3202,7 @@ struct Index {
   @Builder
   private buildAgentGuidePanel() {
     Column({ space: 12 }) {
-      Text('帮助与诊断')
+      Text(this.agentGuideMode === 'onboarding' ? '连接融合开发引擎' : '帮助与诊断')
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
         .fontColor(this.chrome.textPrimary)
@@ -3192,7 +3210,11 @@ struct Index {
 
       Scroll() {
         Column() {
-          this.buildHelpPane()
+          if (this.agentGuideMode === 'onboarding') {
+            this.buildAgentGuideContent()
+          } else {
+            this.buildHelpPane()
+          }
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
@@ -3202,18 +3224,50 @@ struct Index {
       .layoutWeight(1)
       .width('100%')
 
-      Row({ space: 8 }) {
-        Text('顶栏更多菜单可随时重新打开')
+      if (this.agentGuideMode === 'onboarding') {
+        Text('以后可从顶栏更多菜单重新打开')
           .fontSize(10.5)
           .fontColor(this.chrome.textFaint)
+          .width('100%')
+      }
+
+      Row({ space: 8 }) {
+        if (this.agentGuideMode !== 'onboarding') {
+          Text('顶栏更多菜单可随时重新打开')
+            .fontSize(10.5)
+            .fontColor(this.chrome.textFaint)
+        }
         Blank()
+        if (this.agentGuideMode === 'onboarding') {
+          Button('打开连接设置')
+            .height(40)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .backgroundColor(this.chrome.primaryBtnBg)
+            .fontColor(this.chrome.primaryBtnText)
+            .borderRadius(8)
+            .stateStyles({
+              pressed: {
+                .opacity(0.82)
+              }
+            })
+            .focusable(this.agentGuideOpen)
+            .onClick(() => {
+              this.dismissAgentGuide();
+              this.openDrawer('conn');
+            })
+        }
         Button('关闭')
           .height(40)
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
-          .backgroundColor(this.chrome.primaryBtnBg)
-          .fontColor(this.chrome.primaryBtnText)
+          .backgroundColor(this.agentGuideMode === 'onboarding' ? this.chrome.panelBg2 : this.chrome.primaryBtnBg)
+          .fontColor(this.agentGuideMode === 'onboarding' ? this.chrome.textPrimary : this.chrome.primaryBtnText)
           .borderRadius(8)
+          .border({
+            width: this.agentGuideMode === 'onboarding' ? 1 : 0,
+            color: this.agentGuideMode === 'onboarding' ? this.chrome.panelBorder : '#00000000'
+          })
           .stateStyles({
             pressed: {
               .opacity(0.82)

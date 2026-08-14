@@ -44,8 +44,10 @@ encoder. Do not add soft key rows back without an explicit user request.
 - The right inspector is an overlay, not a terminal resize. It exposes exactly
   `终端`, `外观`, and `连接`, uses 352/400 vp responsive widths, blocks native
   terminal input while open, and returns focus on close.
-- Help and Agent setup are explicit overflow actions. Automatic onboarding and
-  all quick-key UI/state/resources have been removed.
+- Help and Agent setup remain explicit overflow actions. Decision 2026-08-01:
+  the already-mounted terminal shows the wand-agent deploy/connect walkthrough
+  once on first launch and persists the one-shot state. All quick-key
+  UI/state/resources remain removed.
 - `F6` or `Ctrl+Alt+.` cycles terminal -> chrome -> inspector without stealing
   `Tab` or `Shift+Tab` from terminal programs; `Esc` closes the topmost app
   overlay.

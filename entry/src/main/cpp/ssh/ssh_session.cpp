@@ -120,13 +120,13 @@ bool SSHSession::connect(const std::string& host, int port, const std::string& u
     SetRemoteEnv(m_channel, "TERM", "xterm-256color");
     SetRemoteEnv(m_channel, "COLORTERM", "truecolor");
     SetRemoteEnv(m_channel, "TERM_PROGRAM", "ghostty");
-    SetRemoteEnv(m_channel, "TERM_PROGRAM_VERSION", "1.0.0");
+    SetRemoteEnv(m_channel, "TERM_PROGRAM_VERSION", "2.0.0");
 
     const char* loginShellCommand =
         "env TERM=xterm-256color "
         "COLORTERM=truecolor "
         "TERM_PROGRAM=ghostty "
-        "TERM_PROGRAM_VERSION=1.0.0 "
+        "TERM_PROGRAM_VERSION=2.0.0 "
         "/bin/sh -lc 'exec \"${SHELL:-/bin/sh}\" -l'";
     rc = libssh2_channel_exec(m_channel, loginShellCommand);
     if (rc != 0) {

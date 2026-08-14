@@ -22,9 +22,9 @@ named symbols when auditing the current tree.
 | Finding | Dev status | Current disposition |
 | --- | --- | --- |
 | CR-001–CR-004 | Unresolved | Still release-blocking. |
-| CR-005 | Resolved in dev | Automatic onboarding was removed; guide/editor/inspector state now participates in terminal input blocking and focus return. |
+| CR-005 | Resolved; product decision superseded | The 2026-08-01 one-shot deploy prompt intentionally restores automatic onboarding, while guide/editor/inspector state continues to block terminal input and restore focus safely. |
 | CR-006–CR-011 | Unresolved | Native I/O/lifecycle, Agent recovery, renderer disposal, libssh2 lifetime, and keep-alive races still need repair. |
-| CR-012 | Resolved in dev | Quick-key state, builder, helper, icons, and onboarding store were removed by Direction A. |
+| CR-012 | Resolved in dev | Quick-key state, builder, helper, and icons remain removed. A minimal preferences-backed onboarding store returned only for the explicit 2026-08-01 deploy-prompt decision. |
 | CR-013 | Partially resolved | README now uses a fail-fast loop and the gate has 33 scripts; the ignored signing-profile dependency and lack of executable integration/device tests remain. |
 | CR-014 | Partially resolved | Dev and release are separate worktrees/bundle identities; signing files remain machine-specific and release signing still needs clean-machine verification. |
 
@@ -108,10 +108,11 @@ Physical keyboard, mouse, and axis events can reach the live terminal behind the
 modal, and delayed focus timers can refocus it. Every modal must participate in
 the native input-block predicate; focus should be restored only after dismissal.
 
-**2026-07-18 status — resolved in dev:** the automatic guide was removed.
-`terminalInputActive()` and `TerminalSurface.active` now include the guide,
-editor, inspector, and background state; dismissal returns focus to the active
-terminal. Direction A structural checks pin this behavior.
+**2026-08-01 status — resolved:** the automatic guide now intentionally opens
+once for wand-agent setup. `terminalInputActive()` and
+`TerminalSurface.active` include the guide, editor, inspector, and background
+state; dismissal returns focus to the active terminal. Structural checks pin
+both the one-shot persistence and input-blocking behavior.
 
 ### CR-006 — Nonblocking PTY/SSH writes silently discard input
 
@@ -187,10 +188,12 @@ physical-keyboard-first target. `Index.ets:1508-1522` still exposes the keyboard
 toggle, and `Index.ets:3031-3103` mounts Esc, Tab, Ctrl-C, copy/paste, arrows, and
 page keys. Remove the toggle, state, builder, and accessory-key helper together.
 
-**2026-07-18 status — resolved in dev:** `accessoryVisible`,
-`buildAccessoryBar()`, `sendAccessoryKey()`, keyboard/help top-level icons, and
-`OnboardingStore.ets` are absent. The physical-keyboard-only decision is now
-covered by `check-harmony-native-workbench.mjs` and the updated IME check.
+**2026-08-01 status — resolved:** `accessoryVisible`, `buildAccessoryBar()`,
+`sendAccessoryKey()`, and keyboard/help top-level icons remain absent. A small
+`OnboardingStore.ets` now persists only the explicit first-launch wand-agent
+prompt; it does not restore any quick-key UI. The physical-keyboard-only
+decision remains covered by `check-harmony-native-workbench.mjs` and the
+updated IME check.
 
 ### CR-013 — The quality gate is not clean-clone safe
 

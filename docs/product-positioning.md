@@ -53,10 +53,11 @@ The primary path is a working VM terminal:
   frames and protocol control messages;
 - rendering goes through `libghostty-ohos` and `libghostty_vt.a`.
 
-The shell follows the approved 2026-07-18 Harmony Native Workbench direction:
-no onboarding page, no soft key row, no dashboard, and no terminal reflow
-animation. Help and diagnostics remain available from overflow rather than
-occupying permanent chrome.
+The shell follows the Harmony Native Workbench direction: no standalone
+onboarding page, no soft key row, no dashboard, and no terminal reflow
+animation. Decision 2026-08-01 adds one persisted first-launch wand-agent
+deploy/connect prompt over the already-mounted terminal; the same walkthrough
+remains available from overflow rather than occupying permanent chrome.
 
 ## Secondary Paths
 
