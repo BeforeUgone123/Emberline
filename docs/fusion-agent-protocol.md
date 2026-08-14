@@ -7,7 +7,7 @@ Engine Linux VM. The VM-side agent owns the Linux PTY and process lifecycle;
 the HarmonyOS app owns tabs, UI state, rendering, reconnection, profiles, and
 fallback transports.
 
-The default backend is the hardened `beforeugone520/wand-agent` fork (based on
+The default backend is the hardened `BeforeUgone123/wand-agent` fork (based on
 `ystyle/wand-agent` v0.2.3). Emberline keeps enough compatibility for the stock
 wire format, but new product behavior must target the hardened fork.
 

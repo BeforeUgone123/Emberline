@@ -723,7 +723,7 @@ the surface-alpha check above.
 
 ## 2026-07-03 Hardened wand-agent Fork
 
-The VM backend now has a hardened fork: `beforeugone520/wand-agent`
+The VM backend now has a hardened fork: `BeforeUgone123/wand-agent`
 (commit `2974ee3`, upstream `ystyle/wand-agent` v0.2.3). Fixes: frame-type
 routing (binary -> PTY, text -> control), single serialized WebSocket writer,
 Bearer auth + constant-time compare + Origin allowlist + default bind

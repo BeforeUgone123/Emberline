@@ -184,13 +184,13 @@ systemd 服务并立即启动。示例 token 与 Emberline 默认值一致,只�
 
 ```sh
 # pnpm(推荐)
-pnpm add -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
+pnpm add -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
 
 # npm
-npm install -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
+npm install -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm
 
 # curl
-curl -fsSL https://raw.githubusercontent.com/beforeugone520/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm
+curl -fsSL https://raw.githubusercontent.com/BeforeUgone123/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm
 ```
 
 安装器会把 agent 二进制复制到稳定目录,把 token 存入权限为 `0600` 的
@@ -216,9 +216,9 @@ pnpm/npm 全局包解耦。因此只更新全局包不会改变正在运行的�
 更新包:
 
 ```sh
-pnpm add -g github:beforeugone520/wand-agent
+pnpm add -g github:BeforeUgone123/wand-agent
 # 或
-npm install -g github:beforeugone520/wand-agent
+npm install -g github:BeforeUgone123/wand-agent
 ```
 
 再强制重编、验证、替换稳定二进制并重启:
@@ -240,7 +240,7 @@ WebSocket,并终止未放在 tmux 中的直连任务;更新前先结束这些任
 不使用一行安装器时,按 `go.mod` 声明的 Go 版本手动构建:
 
 ```sh
-git clone https://github.com/beforeugone520/wand-agent.git
+git clone https://github.com/BeforeUgone123/wand-agent.git
 cd wand-agent
 go build -buildvcs=false -o wand-agent .
 sudo install -m 755 wand-agent /usr/local/bin/
@@ -378,10 +378,10 @@ CR-013 修复测试夹具后再把这条命令作为 CI/发布门禁。
 
 本项目基于两个上游仓库的 fork,修改如下:
 
-### 1. `libghostty_ohos/` — fork [beforeugone520/libghostty-ohos](https://github.com/beforeugone520/libghostty-ohos)(基于 [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos))
+### 1. `libghostty_ohos/` — fork 自 [wiedymi/libghostty-ohos](https://github.com/wiedymi/libghostty-ohos)
 
-上游提供了 libghostty-vt 在 HarmonyOS 上的基础渲染 HAR;fork 仓库承载本项目
-的全部渲染层改动,并以内置形式随本仓库的 `libghostty_ohos/` 演进。相对上游
+上游提供了 libghostty-vt 在 HarmonyOS 上的基础渲染 HAR;本项目不再维护独立
+fork 仓库,全部渲染层改动以内置形式随本仓库的 `libghostty_ohos/` 演进。相对上游
 的大规模重写与扩展主要包括:
 
 - **渲染器**:脏行级重绘 + 持久离屏缓冲;视口滚动改 scroll-damage(离屏
@@ -400,7 +400,7 @@ CR-013 修复测试夹具后再把这条命令作为 CI/发布门禁。
 - **ETS 层**:TerminalController / TerminalSurface 重做(输出直连跨 so
   投递、后台标签轮询门控、滚动条 overlay、安全粘贴)。
 
-### 2. VM Agent — fork [beforeugone520/wand-agent](https://github.com/beforeugone520/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
+### 2. VM Agent — fork [BeforeUgone123/wand-agent](https://github.com/BeforeUgone123/wand-agent)(基于 [ystyle/wand-agent](https://github.com/ystyle/wand-agent) v0.2.3)
 
 推荐使用加固 fork,相对上游的修改:WebSocket frame routing、Bearer 鉴权、
 Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为、PTY 环境净化
@@ -417,7 +417,7 @@ Origin 检查、会话数限制、进程组清理、`exit` 事件与心跳行为
 
 | 组件 | 来源 | 引入方式 | 协议 |
 | --- | --- | --- | --- |
-| libghostty-ohos | fork `beforeugone520/libghostty-ohos`(上游 `wiedymi/libghostty-ohos`) | 内置于 `libghostty_ohos/` | MIT(`libghostty_ohos/LICENSE`) |
+| libghostty-ohos | fork 自 `wiedymi/libghostty-ohos` | 内置于 `libghostty_ohos/` | MIT(`libghostty_ohos/LICENSE`) |
 | libghostty-vt | `ghostty-org/ghostty` | 预编译静态库 `libghostty_ohos/prebuilt/` | MIT |
 | wand-agent | `ystyle/wand-agent` 及其 fork | VM 侧独立部署,不随应用分发 | MIT |
 | libssh2 | `libssh2/libssh2` `libssh2-1.11.1` | 脚本拉取到 `third_party/` | BSD-3-Clause |

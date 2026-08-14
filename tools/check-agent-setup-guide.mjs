@@ -42,13 +42,13 @@ assert.match(index, /Button\('打开连接设置'\)[\s\S]*?this\.dismissAgentGui
 
 // (4) The walkthrough itself stays complete: npm/pnpm/curl one-line setup,
 // Go auto-provisioning, systemd diagnostics, app-side connect, copyable commands.
-assert.match(index, /pnpm add -g github:beforeugone520\/wand-agent && wand-agent service install/, 'guide must include pnpm one-line setup');
-assert.match(index, /npm install -g github:beforeugone520\/wand-agent && wand-agent service install/, 'guide must include npm one-line setup');
-assert.match(index, /curl -fsSL https:\/\/raw\.githubusercontent\.com\/beforeugone520\/Emberline\/main\/tools\/install-wand-agent\.sh/, 'guide must include curl one-line setup');
+assert.match(index, /pnpm add -g github:BeforeUgone123\/wand-agent && wand-agent service install/, 'guide must include pnpm one-line setup');
+assert.match(index, /npm install -g github:BeforeUgone123\/wand-agent && wand-agent service install/, 'guide must include npm one-line setup');
+assert.match(index, /curl -fsSL https:\/\/raw\.githubusercontent\.com\/BeforeUgone123\/Emberline\/main\/tools\/install-wand-agent\.sh/, 'guide must include curl one-line setup');
 assert.match(index, /Go 缺失或版本过旧时会自动下载带 SHA-256 校验的工具链/u, 'guide must explain automatic verified Go provisioning');
 assert.match(index, /systemctl status wand-agent --no-pager/, 'guide must include a service status check');
 assert.match(index, /const AGENT_GUIDE_UPDATE_COMMAND: string =/, 'guide must keep the update recipe in one shared constant');
-assert.match(index, /pnpm add -g github:beforeugone520\/wand-agent/, 'update recipe must refresh the pnpm package');
+assert.match(index, /pnpm add -g github:BeforeUgone123\/wand-agent/, 'update recipe must refresh the pnpm package');
 assert.match(index, /wand-agent setup --force/, 'update recipe must rebuild from the refreshed source');
 assert.match(index, /wand-agent selftest/, 'update recipe must validate the refreshed package before deployment');
 assert.match(index, /\/usr\/local\/lib\/wand-agent\/wand-agent/, 'update recipe must replace the stable service binary');

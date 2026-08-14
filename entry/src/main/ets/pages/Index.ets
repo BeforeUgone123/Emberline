@@ -3213,9 +3213,9 @@ struct Index {
     this.buildHelpRow('第 1 步 · 进入虚拟机', '打开融合开发引擎的 Linux 虚拟机终端(或任何能进入虚拟机 shell 的方式),以下命令都在虚拟机里执行')
 
     this.buildHelpRow('第 2 步 · 一行安装并启动', '需要 Node.js 16 或以上。以下任选一条:Go 缺失或版本过旧时会自动下载带 SHA-256 校验的工具链,然后编译 Agent、注册 systemd 并立即启动:')
-    this.buildGuideCommand('pnpm add -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
-    this.buildGuideCommand('npm install -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
-    this.buildGuideCommand('curl -fsSL https://raw.githubusercontent.com/beforeugone520/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('pnpm add -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('npm install -g github:BeforeUgone123/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('curl -fsSL https://raw.githubusercontent.com/BeforeUgone123/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm')
     Text('省略 --host 会自动探测桥接地址;省略 --token 会生成随机 token。末尾加 --dry-run 可先预览,不写文件也不启动服务。')
       .fontSize(11)
       .fontColor(this.chrome.textSecondary)
@@ -3231,8 +3231,8 @@ struct Index {
     this.buildHelpRow('第 4 步 · 回到应用连接', '检查器「连接」页填入安装器输出的地址与 token(默认示例 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
 
     this.buildHelpRow('已有安装 · 更新 wand-agent', '初次安装可跳过。先任选一条更新全局包,再执行公共更新命令。服务使用的是与全局包分离的稳定二进制,所以只更新 pnpm/npm 包不会更新正在运行的 Agent。此方法保留现有 token、监听地址与 shell 配置。')
-    this.buildGuideCommand('pnpm add -g github:beforeugone520/wand-agent')
-    this.buildGuideCommand('npm install -g github:beforeugone520/wand-agent')
+    this.buildGuideCommand('pnpm add -g github:BeforeUgone123/wand-agent')
+    this.buildGuideCommand('npm install -g github:BeforeUgone123/wand-agent')
     this.buildGuideCommand(AGENT_GUIDE_UPDATE_COMMAND)
     Text('更新警告:重启会断开所有 Agent WebSocket,并终止未放在 tmux 中的直连任务。请先结束这些任务或把长期任务放入 tmux。')
       .fontSize(10.5)

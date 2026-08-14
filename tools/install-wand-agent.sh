@@ -5,7 +5,7 @@ set -eu
 # package CLI remains the single source of truth for Go selection, builds and
 # systemd registration.
 
-WAND_AGENT_REPOSITORY="${WAND_AGENT_REPOSITORY:-beforeugone520/wand-agent}"
+WAND_AGENT_REPOSITORY="${WAND_AGENT_REPOSITORY:-BeforeUgone123/wand-agent}"
 WAND_AGENT_REF="${WAND_AGENT_REF:-main}"
 
 fail() {
