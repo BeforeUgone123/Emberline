@@ -63,7 +63,7 @@ export const DEFAULT_THEME_NAME: string = 'Aizen_Dark';
 export const DEFAULT_TERMINAL_CONFIG: TerminalConfig = {
   fontSize: 14,
   fontFamily: 'FusionTerm Maple Mono',
-  scrollbackLines: 10000,
+  scrollbackLines: 50000,
   bgColor: 0xFF1A1A1A,
   fgColor: 0xFFD0D6F0,
   cursorStyle: 0,

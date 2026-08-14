@@ -21,7 +21,7 @@ assert.match(index, /@State private draftPort: string = String\(DEFAULT_FUSION_A
 assert.match(index, /@State private draftSshPort: string = '22';/);
 assert.match(index, /@State private draftAgentToken: string = DEFAULT_FUSION_AGENT_TOKEN;/);
 assert.match(index, /session\.agentDriver\.setStatusListener/);
-assert.match(index, /Button\('连接 Agent'\)/);
+assert.match(index, /Button\(this\.agentActionLabel\(\)\)/);
 assert.match(index, /Button\('SSH 备用'\)/);
 assert.match(index, /placeholder: '22'/);
 assert.match(index, /placeholder: '密码'/);

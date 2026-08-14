@@ -1,5 +1,13 @@
 # Harmony Advanced Terminal Implementation Plan
 
+> **Historical plan (2026-07-02). Do not execute as the current backlog.** It
+> predates the Fusion Agent-first product path, the Emberline name, multi-tab
+> implementation, dev/release worktree split, and the 2026-07-03 ban on a soft
+> quick-key row. Its SSH-first tasks, quick-key components, file map, signing
+> examples, and completion state are superseded by root `AGENTS.md`,
+> `docs/handoff.md`, `docs/code-review-2026-07-10.md`, and the 2026-07-18
+> Direction A package under `docs/frontend-brainstorm/`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the current FusionTerm scaffold into a buildable HarmonyOS terminal app that renders through `libghostty-ohos`, opens local PTY sessions when available, and connects to the Fusion Development Engine Linux VM through SSH remote PTY.

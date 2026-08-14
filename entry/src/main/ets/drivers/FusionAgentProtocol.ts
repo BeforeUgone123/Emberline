@@ -40,7 +40,7 @@ export interface FusionAgentMessage {
   code?: string;
   error?: string;
   message?: string;
-  // upload-relay: push a shared-folder file to a tailnet host via the agent.
+  // upload-relay: push a shared-folder file to a remote host via the agent.
   // relayId is numeric and deliberately distinct from the string-typed id
   // that the forked reply uses.
   relayId?: number;

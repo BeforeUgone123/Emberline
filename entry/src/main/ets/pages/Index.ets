@@ -1,7 +1,11 @@
 import { common, Want } from '@kit.AbilityKit';
+import { dragController } from '@kit.ArkUI';
+import { unifiedDataChannel } from '@kit.ArkData';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { fileIo as fs, fileShare, fileUri, picker } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
+import { util } from '@kit.ArkTS';
 import { DEFAULT_TERMINAL_CONFIG, TerminalSurface } from 'libghostty-ohos';
 import { buildAnsi256ColorDemo } from '../demo/Ansi256ColorDemo';
 import {
@@ -14,7 +18,7 @@ import {
 import { FusionTerminalDriver } from '../drivers/FusionTerminalDriver';
 import { createFusionVmProfile } from '../models/ConnectionProfile';
 import { TerminalSessionHandle } from '../model/TerminalSession';
-import { sessionRegistry } from '../model/SessionRegistry';
+import { WindowRegistration, sessionRegistry } from '../model/SessionRegistry';
 import { AppearanceSettings, AppearanceStore, DEFAULT_APPEARANCE } from '../settings/AppearanceStore';
 import { ConnectionSettings, ConnectionStore } from '../settings/ConnectionStore';
 import { OnboardingStore } from '../settings/OnboardingStore';
@@ -25,60 +29,42 @@ import {
   CURVE_SINE,
   DUR_AMBIENT,
   DUR_BREATHE_HALF,
-  DUR_EXTINGUISH_COOL,
-  DUR_EXTINGUISH_HOLD,
   DUR_FAST,
-  DUR_IGNITE_FLASH,
-  DUR_IGNITE_SETTLE,
   DUR_STANDARD,
   FRAME_60,
   SPRING_SETTLE
 } from '../theme/EmberMotion';
-import { hapticBoundary, hapticDisconnect, hapticIgnite } from '../common/EmberHaptics';
+import {
+  CHROME_TOKENS_KEY,
+  ChromeTokens,
+  DEFAULT_CHROME_TOKENS,
+  DEFAULT_SHARED_THEME_CONFIG,
+  SHARED_THEME_CONFIG_KEY,
+  SharedThemeConfig,
+  SYS_DARK_KEY,
+  deriveChromeTokens
+} from '../theme/ChromeTheme';
+import { hapticBoundary } from '../common/EmberHaptics';
 import { keepAlive } from '../common/KeepAliveManager';
 
-// Chrome palette tuned to match the desktop Ghostty profile
-// (near-black background, Catppuccin Mocha foreground tones).
-const COLOR_APP_BG: string = '#050507';
-const COLOR_BAR_BG: string = '#0C0F14';
-const COLOR_BAR_BORDER: string = '#1B222E';
-const COLOR_TEXT_PRIMARY: string = '#CDD6F4';
-const COLOR_TEXT_SECONDARY: string = '#8B95A7';
-const COLOR_ACCENT: string = '#1E6FFF';
-const COLOR_KEY_BG: string = '#161B24';
-const COLOR_KEY_TEXT: string = '#C4CEE0';
-const COLOR_PANEL_BG: string = '#10141B';
-const COLOR_PANEL_BORDER: string = '#273042';
-const COLOR_FIELD_BG: string = '#171D28';
-const COLOR_STATUS_ON: string = '#A6E3A1';
-const COLOR_STATUS_OFF: string = '#6C7086';
+// Chrome colors are theme-derived ChromeTokens (see theme/ChromeTheme.ets);
+// no fixed chrome palette exists any more.
 const MIN_TERMINAL_FONT_SIZE: number = 10;
 const MAX_TERMINAL_FONT_SIZE: number = 26;
 const MIN_BACKGROUND_OPACITY_PCT: number = 0;
 const MAX_BACKGROUND_BLUR: number = 60;
 const FOREGROUND_FOCUS_EVENT: string = 'fusionTermForeground';
 const BACKGROUND_EVENT: string = 'fusionTermBackground';
+const CHROME_MODE_EVENT: string = 'fusionTermChromeMode';
 // The tab strip doubles as the custom window chrome: EntryAbility hides the
 // system decor bar and reserves its height, so the strip must match it and
 // keep the top-right corner free for the floating system window buttons.
 const WINDOW_CHROME_HEIGHT: number = 48;
 const WINDOW_DECOR_BUTTON_RESERVE: number = 148;
-// Design tokens: near-black chrome layers plus a single accent. The accent
-// (ember copper) only ever appears as thin "filaments" and the primary
-// action button - never as a large fill; color belongs to the terminal.
-const COLOR_EMBER: string = '#D08F53';
-const COLOR_EMBER_GLOW: string = '#59D08F53';
-// Filament life-signs accents: the ignite over-bright bloom (a whiter gold that
-// overshoots working brightness for ~90ms) and the extinguish transition orange
-// the filament passes through on its way from ember to ash as it cools.
-const COLOR_EMBER_BLOOM: string = '#F1C79A';
-const COLOR_EMBER_COOL: string = '#C56B3A';
-const COLOR_ASH: string = '#3A424E';
-const COLOR_PANEL_2: string = '#111722';
-// Faint helper text (ghostty config keys, hints): kept muted but lifted to a
-// >= 4.5:1 contrast ratio against the near-black panels so it stays legible.
-const COLOR_TEXT_FAINT: string = '#8A94A6';
-const DRAWER_WIDTH: number = 400;
+const INSPECTOR_COMPACT_WIDTH: number = 352;
+const INSPECTOR_DEFAULT_WIDTH: number = 400;
+const INSPECTOR_BREAKPOINT: number = 900;
+const THEME_PREVIEW_BATCH_SIZE: number = 24;
 // Choreography-specific durations (ms) that are deliberately NOT part of the
 // shared EmberMotion token set: these are the asymmetric micro-timings the spec
 // calls out per moment, distinct from the folded 200/240 -> DUR_STANDARD family.
@@ -89,141 +75,214 @@ const DUR_READOUT_TICK_HALF: number = 60; // M26 font readout: half of the 120ms
 // M16 animated scroll-to-end: a value larger than any realistic tab-strip width;
 // the Scroller clamps a past-the-end xOffset back to the true content edge, so
 // this animates from the current offset to the end rather than a fixed target.
-const TAB_STRIP_END_OFFSET_VP: number = 100000;
-// Per-tab filament colors the user can pick in the tab editor; the first is
-// the default ember.
-const FILAMENT_PALETTE: string[] = [
-  '#D08F53', '#7FB4E8', '#9A8FE8', '#7FC98F', '#E8899A', '#E8C97F', '#7FD8D0', '#B0B8C8'
-];
-// Bundled terminal font families registered by the renderer; the custom slot
-// is filled by a user-imported ttf/otf.
+const TAB_STRIP_END_OFFSET_VP: number = 100000;// Bundled terminal font aliases shared by the native renderer and ArkUI picker;
+// the custom slot is filled by a user-imported ttf/otf.
 const FONT_FAMILY_MAPLE: string = 'FusionTerm Maple Mono';
 const FONT_FAMILY_JETBRAINS: string = 'FusionTerm JetBrains Mono';
 const FONT_FAMILY_CASCADIA: string = 'FusionTerm Cascadia Mono';
 const FONT_FAMILY_SARASA: string = 'FusionTerm Sarasa Fixed SC';
 const FONT_FAMILY_SYSTEM: string = 'PingFang SC';
 const FONT_FAMILY_CUSTOM: string = 'FusionTerm Custom';
-// In-track tab reorder geometry. Chips hug their title width (64-210vp), so the
-// page measures each chip via onAreaChange and stores the live width; the gap is
-// the tab strip Row's fixed spacing. The fallback width is only used for the one
-// frame before a freshly added chip has reported its measured width.
+// Chrome-style responsive tab geometry. Tabs share the visible strip equally,
+// grow only to the desktop-friendly cap, then stop shrinking at the touch-safe
+// minimum and let the existing horizontal Scroll handle overflow.
 const TAB_STRIP_GAP_VP: number = 4;
-const TAB_CHIP_FALLBACK_WIDTH_VP: number = 120;
+const TAB_CHIP_MIN_WIDTH_VP: number = 64;
+const TAB_CHIP_MAX_WIDTH_VP: number = 210;
+const TAB_NEW_BUTTON_WIDTH_VP: number = 40;
+const TAB_PICKUP_THRESHOLD_VP: number = 28;
+const TAB_HANDOFF_UDMF_TYPE: string = 'com.emberline.tab-handoff';
+const TORN_WINDOW_WIDTH_PX: number = 960;
+const TORN_WINDOW_HEIGHT_PX: number = 640;
+
+interface ReleasedSession {
+  handle: TerminalSessionHandle;
+  originIndex: number;
+  surfaceAlreadyDetached: boolean;
+}
 
 interface ThemePreview {
   bg: string;
   fg: string;
+  red: string;
   ansi: string[];
 }
 
-// A desktop-terminal style tab. Connection state is a 2px "filament" along
-// the bottom edge instead of a status dot: lit copper = connected, dim =
-// reconnecting, ash = dead. Width hugs the title. Double-tap opens the tab
-// editor (rename + filament color).
+// Theme selection and preview data are observed per row. Keeping these values
+// out of page-level @State prevents a theme click or one preview read from
+// invalidating the entire catalogue.
+@Observed
+class ThemeOptionState {
+  readonly name: string;
+  selected: boolean;
+  preview: ThemePreview | null = null;
+
+  constructor(name: string, selected: boolean) {
+    this.name = name;
+    this.selected = selected;
+  }
+}
+
+@Component
+struct ThemeOptionRow {
+  @StorageProp(CHROME_TOKENS_KEY) chrome: ChromeTokens = DEFAULT_CHROME_TOKENS;
+  @ObjectLink option: ThemeOptionState;
+  @Prop canFocus: boolean;
+  onSelect: (theme: string) => void = () => {};
+
+  private previewBackground(): string {
+    const preview: ThemePreview | null = this.option.preview;
+    return preview ? preview.bg : this.chrome.panelBg2;
+  }
+
+  private previewForeground(): string {
+    const preview: ThemePreview | null = this.option.preview;
+    return preview ? preview.fg : this.chrome.textSecondary;
+  }
+
+  private previewAnsi(): string[] {
+    const preview: ThemePreview | null = this.option.preview;
+    return preview ? preview.ansi : [];
+  }
+
+  build() {
+    Row({ space: 12 }) {
+      Stack() {
+        Text('Aa')
+          .fontSize(12)
+          .fontColor(this.previewForeground())
+      }
+      .width(52)
+      .height(32)
+      .borderRadius(7)
+      .backgroundColor(this.previewBackground())
+      .border({ width: 1, color: this.chrome.panelBorder })
+
+      Column({ space: 4 }) {
+        Text(this.option.name.split('_').join(' '))
+          .fontSize(12.5)
+          .fontColor(this.chrome.textPrimary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Row({ space: 3 }) {
+          ForEach(this.previewAnsi(),
+            (dotColor: string, idx: number) => {
+              Circle({ width: 7, height: 7 })
+                .fill(dotColor)
+            }, (dotColor: string, idx: number) => `${this.option.name}-${idx}`)
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Row()
+        .width(14)
+        .height(2)
+        .borderRadius(1)
+        .backgroundColor(this.option.selected ? this.chrome.textPrimary : '#00000000')
+        // Neutral selected underline fade (accent system retired).
+        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
+    }
+    .width('100%')
+    .padding({ left: 8, right: 10, top: 6, bottom: 6 })
+    .borderRadius(8)
+    .backgroundColor(this.option.selected ? this.chrome.panelBg2 : '#00000000')
+    // M07 selected-face: fast face settle ahead of the underline.
+    .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
+    .focusable(this.canFocus)
+    .hoverEffect(HoverEffect.Highlight)
+    .onClick(() => {
+      this.onSelect(this.option.name);
+    })
+  }
+}
+
+// A ghostty-macOS style tab: an equal-share slot in the strip whose active
+// face is a floating pill capsule over the theme-derived bar material.
+// Connection state is a small neutral dot (solid = connected, breathing =
+// connecting, hollow = disconnected, theme ANSI red = failed) -- the filament
+// accent system is retired, no fixed accent color anywhere.
 @Component
 struct TerminalTabChip {
+  @StorageProp(CHROME_TOKENS_KEY) chrome: ChromeTokens = DEFAULT_CHROME_TOKENS;
   // Deep-observed so any session field change re-renders the chip; the @Watch
-  // fires the life-signs keyframes. @Prop cannot be used for the epochs because
-  // ArkUI does not re-sync a @Prop from a nested @Observed member without a
-  // parent re-render, so the chip diffs the observed epochs itself instead.
+  // only gates the connecting-dot breathing loop now.
   @ObjectLink @Watch('onSessionSignal') session: TerminalSessionHandle;
   @Prop active: boolean;
+  @Prop @Watch('onAppBackgroundedChanged') appBackgrounded: boolean;
+  // The page computes one shared equal-split width from the live strip viewport
+  // and session count. Width changes are deliberately instantaneous relayouts.
+  @Prop chipWidth: number;
   // In-track reorder offset (vp). The page owns the drag state and hands each chip
   // its current horizontal offset as a plain value @Prop so a parent @State change
-  // always re-syncs it (a nested @Observed field would NOT re-sync a @Prop). For the
-  // chip being dragged this is the raw finger follow (written outside animateTo, so
-  // it is applied instantly with zero delay); for a displaced chip it is the ±(chip
-  // width + gap) let-position, changed inside an animateTo(SPRING_SETTLE) so it glides.
+  // always re-syncs it (a nested @Observed field would NOT re-sync a @Prop).
   @Prop translateX: number;
-  // True only for the chip currently under the finger: lift it above its neighbours
-  // (zIndex) and show the active face so "picked up" reads without a scale transform
-  // (CJK titles must never rasterize -- project filament/chrome rule).
+  // True only for the chip currently under the finger: lift it above neighbours.
   @Prop lifted: boolean;
+  // Live-window registry stamp of the owning window, for the move-to-window
+  // submenu (excludes this window from its own list).
+  @Prop windowStamp: number = 0;
   onSelect: () => void = () => {};
   onClose: () => void = () => {};
   onEdit: () => void = () => {};
-  // Report the chip's measured width (vp) so the page can turn a drag offset into a
-  // hover slot; chips hug their title width, so the page cannot assume a fixed size.
-  onChipWidth: (width: number) => void = () => {};
-  // In-track drag lifecycle up to the page, which owns the session list + offsets.
-  // The chip only forwards the horizontal PanGesture; the page decides the slot.
+  onSplitWindow: () => void = () => {};
+  onMoveToWindow: (stamp: number) => void = () => {};
   onReorderStart: () => void = () => {};
-  onReorderUpdate: (offsetX: number) => void = () => {};
+  onReorderUpdate: (offsetX: number, offsetY: number, pointerId: number) => void = () => {};
   onReorderEnd: () => void = () => {};
   onReorderCancel: () => void = () => {};
 
-  // Base filament opacity. 1.0 when connected/dead; the breathing loop drives it
-  // inside the 0.34-0.6 half-lit band while pending (§2.2). Bound after the
-  // base layer's .animation() so only the explicit animateTo drives it.
-  @State private breatheOpacity: number = 1;
+  // Connecting-state breathing: drives the dot opacity inside a calm band.
+  // Bound after the dot's .animation() scope so only the explicit animateTo
+  // loop moves it.
+  @State private dotOpacity: number = 1;
   private breathing: boolean = false;
-  // Bloom overlay: an independent 2px layer that plays the ignite flash, the
-  // extinguish cool-down and the M05 double-surge without ever touching the base
-  // filament or the terminal XComponent (§2.1). Idle at opacity 0.
-  @State private bloomOpacity: number = 0;
-  @State private bloomGlow: number = 4;
-  @State private bloomColor: string = COLOR_EMBER_BLOOM;
-  // Last-seen epoch snapshot for edge detection across session re-renders.
-  private lastIgnite: number = 0;
-  private lastExtinguish: number = 0;
-  private lastSparkFail: number = 0;
-  private lastAttention: number = 0;
+  @State private hovered: boolean = false;
   private lastPending: boolean = false;
 
-  private filament(): string {
-    if (this.session.connected || this.isPending()) {
-      return this.session.filamentColor.length > 0 ? this.session.filamentColor : COLOR_EMBER;
-    }
-    return COLOR_ASH;
-  }
-
-  // Half-lit filament while a first connect or a reconnect is in flight, so
-  // "connecting" is visually distinct from "dead" (which stays ash).
+  // "Connecting" (first connect or reconnect in flight) is visually distinct
+  // from "dead": the dot breathes instead of hollowing out.
   private isPending(): boolean {
     return !this.session.connected &&
       (this.session.statusLabel.includes('重连') || this.session.statusLabel.includes('正在连接'));
   }
 
+  // A connection that dropped with an error and is not retrying shows the
+  // theme's ANSI red -- the only non-fg color in the chrome.
+  private isFailed(): boolean {
+    return !this.session.connected && this.session.hadError && !this.isPending();
+  }
+
+  private dotColor(): string {
+    if (this.isFailed()) {
+      return this.chrome.dotFailed;
+    }
+    if (this.session.connected || this.isPending()) {
+      return this.chrome.dotOn;
+    }
+    return this.chrome.dotOff;
+  }
+
+  // Plain disconnect (no error, not retrying) renders as a hollow ring.
+  private isHollow(): boolean {
+    return !this.session.connected && !this.isPending() && !this.isFailed();
+  }
+
   // Unread lifts an inactive tab's title to the primary text color so a
-  // finished background task reads at a glance (M05).
+  // finished background task reads at a glance.
   private titleColor(): string {
     if (this.active || this.session.unread) {
-      return COLOR_TEXT_PRIMARY;
+      return this.chrome.textPrimary;
     }
-    return COLOR_TEXT_SECONDARY;
+    return this.chrome.textSecondary;
   }
 
-  // Steady-state base glow radius: unread steadies at 6, a live connection at 4,
-  // a dead/pending filament carries none (its own layers add heat).
-  private baseGlowRadius(): number {
-    if (this.session.unread) {
-      return 6;
-    }
-    if (this.session.connected) {
-      return 4;
-    }
-    return 0;
-  }
-
-  // Single reactive entry point: diff the observed epochs and the pending level
-  // to drive the life-signs. Runs on every session field change (title/cwd/...),
-  // so it stays cheap — five integer/bool compares and no allocation.
+  // Single reactive entry point: gate the breathing loop on the pending edge.
   private onSessionSignal(): void {
-    if (this.session.igniteEpoch !== this.lastIgnite) {
-      this.lastIgnite = this.session.igniteEpoch;
-      this.playIgnite();
-    }
-    if (this.session.extinguishEpoch !== this.lastExtinguish) {
-      this.lastExtinguish = this.session.extinguishEpoch;
-      this.playExtinguish();
-    }
-    if (this.session.sparkFailEpoch !== this.lastSparkFail) {
-      this.lastSparkFail = this.session.sparkFailEpoch;
-      this.playSparkFail();
-    }
-    if (this.session.attentionEpoch !== this.lastAttention) {
-      this.lastAttention = this.session.attentionEpoch;
-      this.playAttention();
+    if (this.appBackgrounded) {
+      this.stopBreathing();
+      this.lastPending = this.isPending();
+      return;
     }
     const pendingNow: boolean = this.isPending();
     if (pendingNow !== this.lastPending) {
@@ -236,108 +295,23 @@ struct TerminalTabChip {
     }
   }
 
-  // M01 点燃:bloom 猛闪超过工作亮度(90ms CURVE_SHARP)再弹簧回落(300ms
-  // SPRING_SETTLE,唯一允许极小 overshoot),base 层同帧独立 ash->ember 补间。
-  private playIgnite(): void {
-    if (this.session.igniteEpoch <= 0) {
+  private onAppBackgroundedChanged(): void {
+    if (this.appBackgrounded) {
+      this.stopBreathing();
       return;
     }
-    this.stopBreathing();
-    this.bloomColor = COLOR_EMBER_BLOOM;
-    hapticIgnite();
-    this.getUIContext().keyframeAnimateTo({ iterations: 1 }, [
-      {
-        duration: DUR_IGNITE_FLASH,
-        curve: CURVE_SHARP,
-        event: () => {
-          this.bloomOpacity = 0.85;
-          this.bloomGlow = 11;
-        }
-      },
-      {
-        duration: DUR_IGNITE_SETTLE,
-        curve: SPRING_SETTLE,
-        event: () => {
-          this.bloomOpacity = 0;
-          this.bloomGlow = 4;
-        }
-      }
-    ]);
+    this.lastPending = false;
+    this.onSessionSignal();
   }
 
-  // M03 熄灭:非对称。先 120ms hold 住余温(过渡橙 #C56B3A、无辉光),再 700ms
-  // 慢慢冷透到 0;base 层已在 DUR_STANDARD 内 crossfade 到 ash,合成读作「刚刚
-  // 还活着、现在慢慢凉了」。
-  private playExtinguish(): void {
-    if (this.session.extinguishEpoch <= 0) {
-      return;
-    }
-    this.stopBreathing();
-    this.bloomColor = COLOR_EMBER_COOL;
-    this.bloomGlow = 0;
-    hapticDisconnect();
-    this.getUIContext().keyframeAnimateTo({ iterations: 1 }, [
-      {
-        duration: DUR_EXTINGUISH_HOLD,
-        curve: Curve.Friction,
-        event: () => {
-          this.bloomOpacity = 0.7;
-        }
-      },
-      {
-        duration: DUR_EXTINGUISH_COOL,
-        curve: CURVE_SINE,
-        event: () => {
-          this.bloomOpacity = 0;
-        }
-      }
-    ]);
-  }
-
-  // M04 失败挣扎:打火机点不着。2-3 下无辉光顿挫闪烁(glow 全程 0)后落灰,与
-  // 呼吸的「平滑+有辉光+循环」刻意拉开,不看文字也能分「在连」与「连不上」。
-  private playSparkFail(): void {
-    if (this.session.sparkFailEpoch <= 0) {
-      return;
-    }
-    this.stopBreathing();
-    this.bloomColor = COLOR_EMBER;
-    this.bloomGlow = 0;
-    this.getUIContext().keyframeAnimateTo({ iterations: 1 }, [
-      { duration: 90, curve: Curve.EaseIn, event: () => { this.bloomOpacity = 0.5; } },
-      { duration: 90, curve: Curve.EaseIn, event: () => { this.bloomOpacity = 0.1; } },
-      { duration: 90, curve: Curve.EaseIn, event: () => { this.bloomOpacity = 0.45; } },
-      { duration: 90, curve: Curve.EaseIn, event: () => { this.bloomOpacity = 0.08; } },
-      { duration: 120, curve: Curve.EaseIn, event: () => { this.bloomOpacity = 0; } }
-    ]);
-  }
-
-  // M05 复燃:后台标签任务完成。已连接标签用「亮度双涌」涌两下即停(非循环),
-  // glow 稳定 6;未读的持续抬升由 titleColor()/baseGlowRadius() 承担。
-  private playAttention(): void {
-    if (this.session.attentionEpoch <= 0) {
-      return;
-    }
-    this.bloomColor = this.session.filamentColor.length > 0 ? this.session.filamentColor : COLOR_EMBER;
-    this.bloomGlow = 6;
-    this.getUIContext().keyframeAnimateTo({ iterations: 1 }, [
-      { duration: 350, curve: Curve.EaseInOut, event: () => { this.bloomOpacity = 0.9; } },
-      { duration: 350, curve: Curve.EaseInOut, event: () => { this.bloomOpacity = 0.25; } },
-      { duration: 350, curve: Curve.EaseInOut, event: () => { this.bloomOpacity = 0.9; } },
-      { duration: 350, curve: Curve.EaseInOut, event: () => { this.bloomOpacity = 0; } }
-    ]);
-  }
-
-  // M02 呼吸:半亮带极缓正弦循环,严格门控。锁死在 0.34<->0.6(永不到 1.0、永
-  // 不熄到 ash),整周期 2.6s,FRAME_60 省电,声明式属性动画走合成线程。
+  // Status-gated loop (the only permitted looping animation family): runs while
+  // connecting, stops on the connected/dead edge, never while backgrounded.
   private startBreathing(): void {
-    if (this.breathing) {
+    if (this.breathing || this.appBackgrounded) {
       return;
     }
     this.breathing = true;
-    // Establish the top of the band before the alternating loop so it oscillates
-    // 0.6<->0.34 and never reaches the connected 1.0.
-    this.breatheOpacity = 0.6;
+    this.dotOpacity = 0.9;
     this.getUIContext().animateTo(
       {
         duration: DUR_BREATHE_HALF,
@@ -347,12 +321,10 @@ struct TerminalTabChip {
         expectedFrameRateRange: FRAME_60
       },
       () => {
-        this.breatheOpacity = 0.34;
+        this.dotOpacity = 0.25;
       });
   }
 
-  // Leaving pending (success/fail/disconnect) — a single settle animateTo that
-  // implicitly cancels the infinite loop before the epoch keyframe takes over.
   private stopBreathing(): void {
     if (!this.breathing) {
       return;
@@ -361,121 +333,89 @@ struct TerminalTabChip {
     this.getUIContext().animateTo(
       { duration: DUR_STANDARD, curve: CURVE_DECEL },
       () => {
-        this.breatheOpacity = 1;
+        this.dotOpacity = 1;
       });
   }
 
   aboutToDisappear(): void {
-    // Never leave a filament breathing after the chip is gone.
     this.breathing = false;
   }
 
   build() {
-    Column() {
-      Row({ space: 6 }) {
-        Text(this.session.title)
-          .fontSize(12.5)
-          .fontColor(this.titleColor())
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .flexShrink(1)
-          // Hard cap: the chip sizes to content, so the Row has no fixed
-          // width and flexShrink never engages -- a long title would push
-          // the close button past maxWidth(210) and clip it. 210 - chip
-          // padding(18) - close button w/ margins(18) = 174, minus slack.
-          .constraintSize({ maxWidth: 170 })
-        Image($r('app.media.ic_close_faint'))
-          .width(12)
-          .height(12)
-          .margin({ left: 4, right: 2 })
-          // Keep the 12vp glyph but expand the touch target to 26x26 so the
-          // close affordance is comfortably tappable on a phone.
-          .responseRegion({ x: -7, y: -7, width: 26, height: 26 })
-          .onClick(() => {
-            this.onClose();
-          })
-      }
-      .layoutWeight(1)
-
-      // Two-layer filament: base carries the steady lit/half-lit/ash state and
-      // its glow; the bloom overlay plays the transient life-signs on top.
-      Stack() {
-        Row()
-          .height(2)
-          .width('100%')
-          .borderRadius(1)
-          .backgroundColor(this.filament())
-          .shadow(this.baseGlowRadius() > 0
-            ? { radius: this.baseGlowRadius(), color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 }
-            : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-          // Fade the filament color / glow between lit / ash instead of a hard
-          // cut as the connection state changes (§2.1 base layer).
-          .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
-          // Opacity sits after .animation() so only the explicit breathing /
-          // settle animateTo drives it — no implicit double-animation.
-          .opacity(this.breatheOpacity)
-
-        Row()
-          .height(2)
-          .width('100%')
-          .borderRadius(1)
-          .backgroundColor(this.bloomColor)
-          .shadow({ radius: this.bloomGlow, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 })
-          .opacity(this.bloomOpacity)
-          .hitTestBehavior(HitTestMode.None)
-      }
-      .height(2)
-      .width('100%')
+    Row({ space: 7 }) {
+      Row()
+        .width(6)
+        .height(6)
+        .borderRadius(3)
+        .backgroundColor(this.isHollow() ? '#00000000' : this.dotColor())
+        .border({ width: 1, color: this.isHollow() ? this.dotColor() : '#00000000' })
+        .flexShrink(0)
+        .opacity(this.dotOpacity)
+      Text(this.session.title)
+        .fontSize(12.5)
+        .fontColor(this.titleColor())
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .flexShrink(1)
+      Image($r('app.media.ic_close_faint'))
+        .width(12)
+        .height(12)
+        .accessibilityText('关闭标签')
+        .flexShrink(0)
+        // Keep the 12vp glyph but expand the touch target without changing
+        // the pill layout; hidden (but space-stable) unless usable.
+        .responseRegion({ x: -10, y: -10, width: 32, height: 32 })
+        .visibility(this.hovered || this.active ? Visibility.Visible : Visibility.Hidden)
+        .onClick(() => {
+          this.onClose();
+        })
     }
+    .justifyContent(FlexAlign.Center)
     .height(34)
-    .constraintSize({ minWidth: 64, maxWidth: 210 })
-    .padding({ left: 12, right: 6, top: 6 })
-    .borderRadius(8)
-    .backgroundColor(this.active ? '#151A22' : '#00000000')
+    .borderRadius(999)
+    .padding({ left: 14, right: 10 })
+    .backgroundColor(this.active
+      ? this.chrome.capBg
+      : (this.hovered ? this.chrome.hoverBg : '#00000000'))
     .border({
       width: 1,
-      color: this.active ? COLOR_BAR_BORDER : '#00000000'
+      color: this.active ? this.chrome.capBorder : '#00000000'
     })
-    // Lift the chip while it is dragged: a soft neutral shadow (never ember -- the
-    // accent stays on filament / primary button only) that fades in over DUR_FAST.
-    // Paired with the raised zIndex and the finger-follow translate below, "picked
-    // up" reads without a scale transform (CJK title must never rasterize).
+    .accessibilityText(`${this.active ? '当前标签, ' : ''}${this.session.title}, ${this.session.statusLabel}${this.session.unread ? ', 后台任务完成' : ''}`)
+    // The active capsule floats on a soft neutral shadow; while dragged the
+    // lift deepens. Never scale -- CJK titles must not rasterize.
     .shadow(this.lifted
       ? { radius: 12, color: '#66000000', offsetX: 0, offsetY: 3 }
-      : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-    // M07/M08 chrome hand-off: fade the active face + border rather than a hard
-    // cut. Fast (120) so the face settles a beat before the filament brightens.
+      : (this.active
+        ? { radius: 5, color: this.chrome.capShadowColor, offsetX: 0, offsetY: 1 }
+        : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 }))
+    .onHover((isHover: boolean) => {
+      this.hovered = isHover;
+    })
+    // Capsule face/border fade rather than a hard cut on tab switch.
     .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
-    // In-track reorder offset. Placed AFTER .animation() so the implicit FAST tween
-    // never captures it: the dragged chip's finger-follow is written directly (zero
-    // delay) while a displaced chip's let-position is driven by an explicit
-    // animateTo(SPRING_SETTLE) on the page -- both bypass the implicit animation.
+    // Keep the equal-split width OUTSIDE the implicit animation above:
+    // opening/closing tabs and free-window resize reflow once, not per frame.
+    .width(this.chipWidth)
+    // In-track reorder offset. Placed AFTER .animation() so the implicit tween
+    // never captures it (finger-follow must be zero-delay).
     .translate({ x: this.translateX })
     .zIndex(this.lifted ? 3 : 0)
-    .clip(true)
     .focusable(false)
     .onClick(() => {
       this.onSelect();
     })
-    // Report the live chip width so the page can turn a drag offset into a hover
-    // slot; chips hug their title width, so no fixed advance can be assumed.
-    .onAreaChange((_oldValue: Area, newValue: Area): void => {
-      const width: number = Number(newValue.width ?? 0);
-      if (Number.isFinite(width) && width > 0) {
-        this.onChipWidth(width);
-      }
-    })
-    // In-track reorder: a 1-finger horizontal PanGesture (grab on 8vp move). On the
-    // chip it naturally pre-empts the tab strip's horizontal Scroll, so dragging a
-    // chip reorders while dragging empty strip still scrolls. offsetX is cumulative
-    // from the gesture start, so it is the finger-follow value directly.
+    // One pan owns both axes: horizontal travel reorders in-track; a decisive
+    // vertical lift unloads the surface and hands the same live session to the
+    // system drag service.
     .gesture(
-      PanGesture({ fingers: 1, direction: PanDirection.Horizontal, distance: 8 })
+      PanGesture({ fingers: 1, direction: PanDirection.All, distance: 8 })
         .onActionStart((_event: GestureEvent): void => {
           this.onReorderStart();
         })
         .onActionUpdate((event: GestureEvent): void => {
-          this.onReorderUpdate(Number(event.offsetX ?? 0));
+          const pointerId: number = event.fingerList.length > 0 ? event.fingerList[0].id : 0;
+          this.onReorderUpdate(Number(event.offsetX ?? 0), Number(event.offsetY ?? 0), pointerId);
         })
         .onActionEnd((_event: GestureEvent): void => {
           this.onReorderEnd();
@@ -484,20 +424,33 @@ struct TerminalTabChip {
           this.onReorderCancel();
         })
     )
-    // Touch fallback for rename: a long-press opens the tab editor. The pan above
-    // wins as soon as the finger travels 8vp, so holding still (long-press) and
-    // dragging (reorder) never fire together.
+    // Touch pick-up: a long press lifts the chip into the same in-track drag
+    // the pan drives (press-and-hold to move, macOS style); the parallel pan
+    // takes over finger-follow once the finger travels. Releasing without
+    // moving settles the chip back in place. Both end paths are idempotent.
     .parallelGesture(
       LongPressGesture({ fingers: 1, repeat: false })
+        .onAction((_event: GestureEvent): void => {
+          this.onReorderStart();
+        })
+        .onActionEnd((_event: GestureEvent): void => {
+          this.onReorderEnd();
+        })
+        .onActionCancel((_event: GestureEvent): void => {
+          this.onReorderCancel();
+        })
+    )
+    // Touch rename: double-tap opens the tab editor (long-press now means
+    // "pick up", so the editor moved off it; right-click stays the 2-in-1
+    // primary path). The first tap's onClick activating the tab first is fine.
+    .parallelGesture(
+      TapGesture({ count: 2 })
         .onAction((_event: GestureEvent): void => {
           this.onEdit();
         })
     )
-    // Rename / close via the right-click context menu (2-in-1 primary path; the
-    // long-press above is the touch fallback). Mirrors the terminal surface menu.
     .bindContextMenu(this.buildTabContextMenu(), ResponseType.RightClick)
-    // M15 asymmetric add/remove: a new chip fades + slides in from the right
-    // (opacity + translateX, no scale so the CJK title never rasterizes);
+    // Asymmetric add/remove: a new pill fades + slides in from the right;
     // closing is quicker and plainer so remaining tabs settle without fuss.
     .transition(TransitionEffect.asymmetric(
       TransitionEffect.OPACITY
@@ -508,8 +461,8 @@ struct TerminalTabChip {
     ))
   }
 
-  // Right-click / long-press tab menu: rename and close, matching the plain
-  // TerminalSurface menu style (no icons, no accent -- desktop-terminal restraint).
+  // Right-click / long-press tab menu: rename and close, desktop-terminal
+  // restraint (no icons, no accent).
   @Builder
   private buildTabContextMenu() {
     Menu() {
@@ -517,6 +470,13 @@ struct TerminalTabChip {
         .onClick(() => {
           this.onEdit();
         })
+      MenuItem({ content: '拆分为新窗口' })
+        .onClick(() => {
+          this.onSplitWindow();
+        })
+      if (sessionRegistry.listWindows(this.windowStamp).length > 0) {
+        MenuItem({ content: '移动到窗口…', builder: (): void => { this.buildMoveToWindowMenu() } })
+      }
       MenuItem({ content: '关闭标签' })
         .onClick(() => {
           this.onClose();
@@ -524,57 +484,312 @@ struct TerminalTabChip {
     }
   }
 
+  // Live window list evaluated when the menu opens (multiton shared heap).
+  @Builder
+  private buildMoveToWindowMenu() {
+    Menu() {
+      ForEach(sessionRegistry.listWindows(this.windowStamp), (reg: WindowRegistration) => {
+        MenuItem({ content: `${reg.label} · ${reg.tabCount()} 标签` })
+          .onClick(() => {
+            this.onMoveToWindow(reg.stamp);
+          })
+      }, (reg: WindowRegistration) => String(reg.stamp))
+    }
+  }
+
 }
 
-// wand-agent deploy walkthrough (first-launch overlay + drawer help pane):
-// the systemd unit shown in step 4, kept as one constant so both render the
-// identical text.
+// Solo-tab title: the strip's single-tab mode. This MUST be its own component
+// with an @ObjectLink. The old page-level builder read this.sessions[0].title
+// directly, which gives ArkUI no deep observation of the @Observed handle --
+// title/status edges froze until an unrelated page @State happened to
+// re-render (device evidence 2026-07-28: driver logged connected=true while
+// the title stayed on 正在连接). Same family as the moved-tab stale title.
+@Component
+struct SoloTabTitle {
+  @StorageProp(CHROME_TOKENS_KEY) chrome: ChromeTokens = DEFAULT_CHROME_TOKENS;
+  @ObjectLink @Watch('onSessionSignal') session: TerminalSessionHandle;
+  @Prop @Watch('onAppBackgroundedChanged') appBackgrounded: boolean;
+  @Prop windowStamp: number = 0;
+  @Prop soloWidth: number;
+  onEdit: () => void = () => {};
+  onClose: () => void = () => {};
+  onMoveToWindow: (stamp: number) => void = () => {};
+  onLift: (pointerId: number) => void = () => {};
+
+  @State private dotOpacity: number = 1;
+  private breathing: boolean = false;
+  private lastPending: boolean = false;
+
+  private isPending(): boolean {
+    return !this.session.connected &&
+      (this.session.statusLabel.includes('重连') || this.session.statusLabel.includes('正在连接'));
+  }
+
+  private isFailed(): boolean {
+    return !this.session.connected && this.session.hadError && !this.isPending();
+  }
+
+  private dotColor(): string {
+    if (this.isFailed()) {
+      return this.chrome.dotFailed;
+    }
+    if (this.session.connected || this.isPending()) {
+      return this.chrome.dotOn;
+    }
+    return this.chrome.dotOff;
+  }
+
+  private isHollow(): boolean {
+    return !this.session.connected && !this.isPending() && !this.isFailed();
+  }
+
+  private onSessionSignal(): void {
+    if (this.appBackgrounded) {
+      this.stopBreathing();
+      this.lastPending = this.isPending();
+      return;
+    }
+    const pendingNow: boolean = this.isPending();
+    if (pendingNow !== this.lastPending) {
+      this.lastPending = pendingNow;
+      if (pendingNow) {
+        this.startBreathing();
+      } else {
+        this.stopBreathing();
+      }
+    }
+  }
+
+  private onAppBackgroundedChanged(): void {
+    if (this.appBackgrounded) {
+      this.stopBreathing();
+      return;
+    }
+    this.lastPending = false;
+    this.onSessionSignal();
+  }
+
+  private startBreathing(): void {
+    if (this.breathing || this.appBackgrounded) {
+      return;
+    }
+    this.breathing = true;
+    this.dotOpacity = 0.9;
+    this.getUIContext().animateTo(
+      {
+        duration: DUR_BREATHE_HALF,
+        curve: CURVE_SINE,
+        iterations: -1,
+        playMode: PlayMode.Alternate,
+        expectedFrameRateRange: FRAME_60
+      },
+      () => {
+        this.dotOpacity = 0.25;
+      });
+  }
+
+  private stopBreathing(): void {
+    if (!this.breathing) {
+      return;
+    }
+    this.breathing = false;
+    this.getUIContext().animateTo(
+      { duration: DUR_STANDARD, curve: CURVE_DECEL },
+      () => {
+        this.dotOpacity = 1;
+      });
+  }
+
+  aboutToDisappear(): void {
+    this.breathing = false;
+  }
+
+  build() {
+    Row({ space: 7 }) {
+      Row()
+        .width(6)
+        .height(6)
+        .borderRadius(3)
+        .backgroundColor(this.isHollow() ? '#00000000' : this.dotColor())
+        .border({ width: 1, color: this.isHollow() ? this.dotColor() : '#00000000' })
+        .flexShrink(0)
+        .opacity(this.dotOpacity)
+      Text(this.session.title)
+        .fontSize(12.5)
+        .fontColor(this.chrome.textSecondary)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .flexShrink(1)
+    }
+    .justifyContent(FlexAlign.Center)
+    .height(34)
+    .width(this.soloWidth)
+    .focusable(false)
+    .bindContextMenu(this.buildSoloTabContextMenu(), ResponseType.RightClick)
+    .gesture(
+      PanGesture({ fingers: 1, direction: PanDirection.Vertical, distance: TAB_PICKUP_THRESHOLD_VP })
+        .onActionStart((event: GestureEvent): void => {
+          const pointerId: number = event.fingerList.length > 0 ? event.fingerList[0].id : 0;
+          this.onLift(pointerId);
+        })
+    )
+    .parallelGesture(
+      TapGesture({ count: 2 })
+        .onAction((_event: GestureEvent): void => {
+          this.onEdit();
+        })
+    )
+  }
+
+  @Builder
+  private buildSoloTabContextMenu() {
+    Menu() {
+      MenuItem({ content: '标签设置' })
+        .onClick(() => {
+          this.onEdit();
+        })
+      if (sessionRegistry.listWindows(this.windowStamp).length > 0) {
+        MenuItem({ content: '移动到窗口…', builder: (): void => { this.buildSoloMoveMenu() } })
+      }
+      MenuItem({ content: '关闭标签' })
+        .onClick(() => {
+          this.onClose();
+        })
+    }
+  }
+
+  @Builder
+  private buildSoloMoveMenu() {
+    Menu() {
+      ForEach(sessionRegistry.listWindows(this.windowStamp), (reg: WindowRegistration) => {
+        MenuItem({ content: `${reg.label} · ${reg.tabCount()} 标签` })
+          .onClick(() => {
+            this.onMoveToWindow(reg.stamp);
+          })
+      }, (reg: WindowRegistration) => String(reg.stamp))
+    }
+  }
+
+}
+
+// wand-agent deploy walkthrough used by the explicit Help & Diagnostics panel.
+// Keep the systemd unit in one constant so the copyable command never drifts.
 const AGENT_GUIDE_SERVICE_UNIT: string =
   '[Unit]\n' +
   'Description=wand-agent WebSocket PTY for Emberline\n' +
   'After=network-online.target\n' +
   '\n' +
   '[Service]\n' +
-  'ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2 --token 你的token\n' +
+  'EnvironmentFile=/etc/wand-agent/wand-agent.env\n' +
+  'ExecStart=/usr/local/bin/wand-agent --host 172.16.100.2\n' +
   'Restart=always\n' +
   'RestartSec=2\n' +
   '\n' +
   '[Install]\n' +
   'WantedBy=multi-user.target';
 
+// `service install` copies the executable away from the global package, so an
+// update must rebuild, replace that stable copy, and explicitly restart the
+// already-active unit. Kept as one pasteable fail-closed recipe for onboarding
+// and the permanent Help surface.
+const AGENT_GUIDE_UPDATE_COMMAND: string =
+  'wand-agent setup --force &&\n' +
+  'wand-agent selftest &&\n' +
+  'sudo install -m 755 "$(wand-agent where)" /usr/local/lib/wand-agent/wand-agent &&\n' +
+  'sudo systemctl restart wand-agent &&\n' +
+  'sudo systemctl status wand-agent --no-pager';
+
+const CODEX_TASK_NOTIFICATION_CONFIG: string =
+  '[tui]\n' +
+  'notifications = ["agent-turn-complete"]\n' +
+  'notification_method = "osc9"\n' +
+  'notification_condition = "always"';
+const CODEX_TMUX_NOTIFICATION_SETUP_COMMAND: string =
+  "grep -qxF 'set -g allow-passthrough on' ~/.tmux.conf 2>/dev/null || " +
+  "printf '\\nset -g allow-passthrough on\\n' >> ~/.tmux.conf\n" +
+  'tmux source-file ~/.tmux.conf';
+const CODEX_TASK_NOTIFICATION_TEST_COMMAND: string =
+  "(sleep 5; if [ -n \"$TMUX\" ]; then " +
+  "printf '\\033Ptmux;\\033\\033]9;Emberline Codex notification test\\007\\033\\\\'; else " +
+  "printf '\\033]9;Emberline Codex notification test\\007'; fi) &";
+const TASK_NOTIFICATION_TEST_ID: number = 1000000;
+
+// The first window seeds the process-wide theme snapshot from persisted
+// settings. Later windows consume that snapshot instead of publishing whatever
+// stale values happened to be loaded from their own page lifecycle.
+let sharedThemeConfigReady: boolean = false;
+
 @Entry
 @Component
 struct Index {
+  // Theme-derived chrome tokens: replaced wholesale whenever the effective
+  // terminal theme changes so every chrome surface re-colors in one pass.
+  @StorageLink(CHROME_TOKENS_KEY) chrome: ChromeTokens = DEFAULT_CHROME_TOKENS;
+  // System light/dark from EntryAbility.onConfigurationUpdate; picks which
+  // of the two configured themes is in effect (ghostty light:/dark: model).
+  @StorageProp(SYS_DARK_KEY) @Watch('onSystemColorModeChanged') sysDark: boolean = true;
+  // Theme slots and mode are one process-wide value. A sibling applies the
+  // complete snapshot so a later system light/dark flip cannot resurrect its
+  // stale local slot selection.
+  @StorageProp(SHARED_THEME_CONFIG_KEY) @Watch('onSharedThemeConfigChanged')
+  sharedThemeConfig: SharedThemeConfig = DEFAULT_SHARED_THEME_CONFIG;
   @State private sessions: TerminalSessionHandle[] = [];
   @State private activeSessionId: number = 0;
-  private nextSessionId: number = 1;
   // Drives the horizontal tab strip so a newly added tab can be scrolled into
   // view past the right edge.
   private tabScroller: Scroller = new Scroller();
   private context: common.UIAbilityContext | null = null;
-  // In-track tab reorder state (application-level drag, no system drag pipeline).
+  // In-track horizontal reorder state; decisive vertical travel promotes the
+  // same gesture into the programmatic system drag pipeline.
   // draggingSessionId is the chip under the finger (-1 = idle); dragFromIndex its
   // original slot; dragTargetIndex the current hover slot (insertion index among the
-  // OTHER chips, 0..n-1); dragDx the raw finger follow (vp). tabWidths is the live
-  // per-chip measured width (vp) reported via onAreaChange -- a plain field, not
-  // @State, so measuring never triggers a re-render; it is read only during a drag.
+  // OTHER chips, 0..n-1); dragDx is the raw finger-follow translation in vp.
   @State private draggingSessionId: number = -1;
+  // This window's live registration stamp in the process-global registry.
+  private windowStamp: number = 0;
   @State private dragTargetIndex: number = -1;
   @State private dragDx: number = 0;
   private dragFromIndex: number = -1;
-  private tabWidths: Map<number, number> = new Map();
+  // True from finger-up until the settle animation's onFinish has committed the
+  // reorder. The pan and the long-press BOTH end on finger-up, so endTabDrag /
+  // cancelTabDrag can be entered twice for one gesture; draggingSessionId only
+  // clears inside that onFinish and therefore cannot guard the gap on its own.
+  private dragSettling: boolean = false;
+  private systemDragStarting: boolean = false;
+  @State private tabStripViewportWidth: number =
+    TAB_CHIP_MAX_WIDTH_VP + TAB_NEW_BUTTON_WIDTH_VP + TAB_STRIP_GAP_VP;
   @State private drawerOpen: boolean = false;
-  @State private drawerPane: string = 'appearance';
+  @State private drawerShown: boolean = false;
+  @State private drawerPane: string = 'terminal';
+  @State private workspaceWidth: number = 960;
+  @State private workbenchFocusZone: number = 0;
+  @State private connectionTipVisible: boolean = false;
+  @State private settingsTipVisible: boolean = false;
+  @State private moreTipVisible: boolean = false;
+  @State private newTabTipVisible: boolean = false;
+  @State private hoveredChromeAction: string = '';
+  @State private focusedChromeAction: string = '';
   @State private tabEditOpen: boolean = false;
   @State private agentGuideOpen: boolean = false;
+  @State private agentGuideMode: string = 'help';
+  @State private connectionAdvancedOpen: boolean = false;
+  @State private connectionErrorDetailsOpen: boolean = false;
   @State private tabEditDraft: string = '';
-  @State private editingFilament: string = '';
   @State private editingPasteMode: string = 'auto';
   @State private editingRelayTarget: string = '';
   @State private editingRelayDir: string = '';
   private editingSession: TerminalSessionHandle | null = null;
-  @State private themePreviews: Map<string, ThemePreview> = new Map();
   private themePreviewsLoading: boolean = false;
+  private themePreviewQueue: string[] = [];
+  private themePreviewGeneration: number = 0;
+  private chromeThemeGeneration: number = 0;
+  private themeOptionByName: Map<string, ThemeOptionState> = new Map();
+  private themePreviewDecoder: util.TextDecoder = util.TextDecoder.create('utf-8', {
+    fatal: false,
+    ignoreBOM: true
+  });
+  private fontPreviewsRegistered: boolean = false;
   @State private draftHost: string = DEFAULT_FUSION_AGENT_HOST;
   @State private draftPort: string = String(DEFAULT_FUSION_AGENT_PORT);
   @State private draftAgentToken: string = DEFAULT_FUSION_AGENT_TOKEN;
@@ -583,19 +798,27 @@ struct Index {
   @State private draftPassword: string = '';
   @State private fontSize: number = 13;
   @State private fontFamily: string = DEFAULT_APPEARANCE.fontFamily;
-  @State private themeName: string = 'Catppuccin_Mocha';
+  // Ghostty light/dark pairing: one theme per system color mode. The
+  // effective theme follows the live system mode (sysDark).
+  private darkThemeName: string = 'Catppuccin_Mocha';
+  private lightThemeName: string = 'Catppuccin_Latte';
+  // App-level appearance override: 'system' follows the OS color mode,
+  // 'dark' / 'light' pin the app to one slot regardless of the OS.
+  @State private colorModeOverride: string = 'system';
+  // Which slot the theme pane is editing ('dark' | 'light').
+  @State private themeEditSlot: string = 'dark';
   @State private themeFilter: string = '';
-  @State private themeList: string[] = [];
+  @State private themeOptions: ThemeOptionState[] = [];
+  @State private themeRenderLimit: number = THEME_PREVIEW_BATCH_SIZE;
   @State private cursorStyle: number = DEFAULT_APPEARANCE.cursorStyle;
   @State private cursorBlink: boolean = DEFAULT_APPEARANCE.cursorBlink;
-  @State private accessoryVisible: boolean = false;
   @State private customFontPath: string = '';
   @State private backgroundImagePath: string = '';
   @State private backgroundOpacity: number = DEFAULT_APPEARANCE.backgroundOpacity;
   @State private backgroundBlur: number = DEFAULT_APPEARANCE.backgroundBlur;
   @State private pasteDirUri: string = DEFAULT_APPEARANCE.pasteDirUri;
   @State private foregroundFocusEpoch: number = 0;
-  // Connection-pane 22x2 filament breathing (M09): reuses the §2.2 half-lit
+  // Connection-pane 22x2 status-bar breathing (M09): reuses the half-lit
   // loop while the active session is connecting, strictly gated so the infinite
   // animateTo only runs while the conn pane is actually on screen.
   @State private connBreatheOpacity: number = 1;
@@ -607,26 +830,43 @@ struct Index {
   // M26 font-size readout feedback: a one-shot vertical tick + ember color flash
   // on the readout Text only (the terminal reflow itself stays an instant cut).
   @State private fontReadoutTickY: number = 0;
-  @State private fontReadoutColor: string = COLOR_TEXT_PRIMARY;
+  @State private fontReadoutColor: string = DEFAULT_CHROME_TOKENS.textPrimary;
   private connectionSettingsLoaded: boolean = false;
   private appearanceStore: AppearanceStore = new AppearanceStore();
   private connectionStore: ConnectionStore = new ConnectionStore();
   private onboardingStore: OnboardingStore = new OnboardingStore();
+  private drawerTransitionEpoch: number = 0;
   private demoRendered: boolean = false;
-  private notifyPermissionRequested: boolean = false;
-  private appInBackground: boolean = false;
+  @State private taskNotificationEnabled: boolean = false;
+  @State private taskNotificationBusy: boolean = false;
+  @State private taskNotificationStatus: string = '正在检查系统通知';
+  @State private appInBackground: boolean = false;
   private foregroundFocusListener: () => void = (): void => {
     this.appInBackground = false;
+    if (this.context) {
+      keepAlive.noteAppForegrounded(this.context);
+    }
     this.foregroundFocusEpoch += 1;
+    this.syncConnPaneBreathing();
   };
   private backgroundListener: () => void = (): void => {
+    if (this.context) {
+      keepAlive.noteAppBackgrounded(this.context);
+    }
     this.appInBackground = true;
+    this.syncConnPaneBreathing();
   };
 
   aboutToAppear(): void {
     this.context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     this.context.eventHub.on(FOREGROUND_FOCUS_EVENT, this.foregroundFocusListener);
     this.context.eventHub.on(BACKGROUND_EVENT, this.backgroundListener);
+    void this.refreshTaskNotificationState();
+    // The source delivers only after its TerminalSurface has emitted the
+    // deterministic unbind event, so the target can adopt synchronously.
+    this.windowStamp = sessionRegistry.registerWindow('', (handle: TerminalSessionHandle): void => {
+      this.adoptSession(handle);
+    }, (): number => this.sessions.length);
     // A tab dragged out of another window arrives via a hand-off token parked in
     // the process-global SessionRegistry; adopt that live session instead of
     // spawning a blank tab. Fall back to a fresh tab on an ordinary launch.
@@ -637,9 +877,31 @@ struct Index {
     void this.loadOnboarding();
   }
 
+  private async loadOnboarding(): Promise<void> {
+    const context: common.UIAbilityContext | null = this.context;
+    if (!context) {
+      return;
+    }
+    try {
+      const shouldShow: boolean = await this.onboardingStore.claimAgentGuide(context);
+      if (!shouldShow) {
+        return;
+      }
+      this.workbenchFocusZone = 0;
+      this.agentGuideMode = 'onboarding';
+      this.agentGuideOpen = true;
+      this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
+    } catch (err) {
+      console.error('Failed to load onboarding state: ' + JSON.stringify(err));
+    }
+  }
+
   aboutToDisappear(): void {
+    sessionRegistry.unregisterWindow(this.windowStamp);
     this.context?.eventHub.off(FOREGROUND_FOCUS_EVENT, this.foregroundFocusListener);
     this.context?.eventHub.off(BACKGROUND_EVENT, this.backgroundListener);
+    this.drawerTransitionEpoch += 1;
+    this.cancelThemePreviewWork();
     for (const session of this.sessions) {
       // Window teardown: release any held keep-alive unit so a closed window
       // never leaks the process-global background-running ref count.
@@ -681,7 +943,6 @@ struct Index {
       session.statusLabel = this.formatStatusLabel(status.label, status.error);
       session.hadError = errText.length > 0;
       session.title = this.composeTabTitle(session, '');
-      this.applyFilamentTransition(session, wasConnected, hadError, session.hadError);
       this.syncConnPaneBreathing();
       this.syncSessionKeepAlive(session, wasConnected);
     });
@@ -695,7 +956,6 @@ struct Index {
       session.lastCwd = status.cwd || '';
       session.hadError = errText.length > 0;
       session.title = this.composeTabTitle(session, session.lastCwd);
-      this.applyFilamentTransition(session, wasConnected, hadError, session.hadError);
       this.syncConnPaneBreathing();
       this.syncSessionKeepAlive(session, wasConnected);
     });
@@ -711,19 +971,18 @@ struct Index {
   }
 
   private addSession(refocus: boolean = false): void {
-    const session = new TerminalSessionHandle(this.nextSessionId);
-    this.nextSessionId += 1;
+    const session = new TerminalSessionHandle();
     session.controller.setConfig({
       fontSize: this.fontSize,
       fontFamily: this.fontFamily,
-      scrollbackLines: 50000,
+      scrollbackLines: DEFAULT_TERMINAL_CONFIG.scrollbackLines,
       bgColor: DEFAULT_TERMINAL_CONFIG.bgColor,
       fgColor: DEFAULT_TERMINAL_CONFIG.fgColor,
       cursorStyle: this.cursorStyle,
       cursorBlink: this.cursorBlink,
-      bgOpacity: this.backgroundImagePath.length > 0 ? this.backgroundOpacity : 1
+      bgOpacity: this.terminalBackgroundOpacity()
     });
-    session.controller.setTheme(this.themeName);
+    session.controller.setTheme(this.effectiveThemeName());
     this.wireSessionListeners(session);
     this.sessions.push(session);
     this.activateSession(session.id, refocus);
@@ -755,12 +1014,6 @@ struct Index {
   // (that would destroySession / drop the WebSocket) -- softDetach + rebind keep
   // the PTY and remote shell alive across the move.
   private adoptSession(handle: TerminalSessionHandle, insertIndex: number = -1): void {
-    // Keep per-window tab numbering ahead of the adopted id so a later
-    // addSession cannot mint a colliding id (ids are per-window; surfaceSeq is
-    // process-global and stays unique on its own).
-    if (handle.id >= this.nextSessionId) {
-      this.nextSessionId = handle.id + 1;
-    }
     // A drop that lands mid-strip inserts at that index; a hand-off token launch
     // (no drop target position) appends. Only append scrolls the strip to the end
     // so a mid-strip insert does not jump the view away from the drop point.
@@ -771,6 +1024,18 @@ struct Index {
       this.sessions.splice(Math.max(0, insertIndex), 0, handle);
     }
     this.wireSessionListeners(handle);
+    // The releasing window dropped this session's keep-alive unit, and the
+    // status replay that wireSessionListeners just triggered carries NO
+    // false->true edge (the session never stopped being connected), so
+    // syncSessionKeepAlive cannot re-request it. Claim one directly for a
+    // session that arrives already live, or the process-global ref count
+    // silently loses a unit until the next reconnect -- and a moved tab that
+    // is the only live session would lose background protection entirely
+    // (frozen socket + swallowed task-finished notification).
+    if (handle.connected && !handle.keepAliveHeld && this.context) {
+      handle.keepAliveHeld = true;
+      keepAlive.noteSessionActive(this.context);
+    }
     if (this.context) {
       handle.driver.rebind(handle.controller, this.context);
     }
@@ -834,18 +1099,26 @@ struct Index {
   // WebSocket keep running for the window that picks the session back up. The
   // drivers softDetach (listeners off, transports alive) and the Index-level
   // listeners are unhooked so the parked handle carries no stale closures.
-  // Returns the removed handle (or null if the id was unknown) for the caller to
-  // park in the SessionRegistry.
-  //
-  // RETAINED (currently no caller): the cross-window tab merge / tear-off entry
-  // points were removed with the system drag pipeline, but this window-release side
-  // of the hand-off stays wired for when cross-window sessions are re-enabled.
-  private releaseSessionForHandoff(id: number): TerminalSessionHandle | null {
+  // The continuation is tied to TerminalController.unbindNative(), never a
+  // guessed frame delay. Native drivers have already soft-detached their normal
+  // attachment listener, so the old surface cannot stop a newly adopted session.
+  private releaseSessionForHandoff(id: number,
+    afterSurfaceDetached: (released: ReleasedSession) => void): ReleasedSession | null {
     const index = this.sessions.findIndex((session: TerminalSessionHandle) => session.id === id);
     if (index < 0) {
       return null;
     }
     const session = this.sessions[index];
+    const released: ReleasedSession = {
+      handle: session,
+      originIndex: index,
+      surfaceAlreadyDetached: !session.controller.isAttached()
+    };
+    if (!released.surfaceAlreadyDetached) {
+      session.controller.setHandoffDetachListener((): void => {
+        afterSurfaceDetached(released);
+      });
+    }
     session.controller.setTitleListener(null);
     session.controller.setNotificationListener(null);
     session.controller.setAttachmentListener(null);
@@ -865,7 +1138,14 @@ struct Index {
       const fallback = this.sessions[Math.min(index, this.sessions.length - 1)];
       this.activateSession(fallback.id, true);
     }
-    return session;
+    return released;
+  }
+
+  private continueReleasedSession(released: ReleasedSession,
+    afterSurfaceDetached: (released: ReleasedSession) => void): void {
+    if (released.surfaceAlreadyDetached) {
+      afterSurfaceDetached(released);
+    }
   }
 
   // Move a tab already in THIS window to a new position. Remove then insert; a
@@ -883,14 +1163,25 @@ struct Index {
     this.sessions.splice(dest, 0, moved);
   }
 
-  // ── In-track tab reorder (Chrome / ghostty style: the chip follows the finger
-  // inside the strip, neighbours make room, a spring lands it in the target slot).
-  // No system drag, no floating snapshot -- the chip never leaves the strip. ─────
+  // ── In-track horizontal reorder plus vertical lift into system drag. ──────────
 
-  // A chip's horizontal advance = its measured width + the strip gap. Falls back to
-  // a nominal width only for the one frame before onAreaChange has reported a chip.
-  private tabAdvance(id: number): number {
-    return (this.tabWidths.get(id) ?? TAB_CHIP_FALLBACK_WIDTH_VP) + TAB_STRIP_GAP_VP;
+  // Chrome-style width: every tab gets an equal share of the visible strip after
+  // reserving the new-tab button and the Row gaps. Tabs grow to 210vp, shrink with
+  // added sessions/window resize, then hold at 64vp while the strip scrolls.
+  private tabChipWidth(): number {
+    const count: number = this.sessions.length;
+    if (count <= 0) {
+      return TAB_CHIP_MAX_WIDTH_VP;
+    }
+    const reservedWidth: number = TAB_NEW_BUTTON_WIDTH_VP + count * TAB_STRIP_GAP_VP;
+    const sharedWidth: number = Math.max(0, this.tabStripViewportWidth - reservedWidth) / count;
+    // ghostty/Safari equal split: tabs always share the whole strip; only a
+    // floor guards pathological tab counts.
+    return Math.max(TAB_CHIP_MIN_WIDTH_VP, sharedWidth);
+  }
+
+  private tabAdvance(): number {
+    return this.tabChipWidth() + TAB_STRIP_GAP_VP;
   }
 
   // The horizontal offset for the chip at array index `i` during a drag. The dragged
@@ -907,7 +1198,7 @@ struct Index {
     }
     const from: number = this.dragFromIndex;
     const insertAt: number = this.dragTargetIndex;
-    const adv: number = this.tabAdvance(this.draggingSessionId);
+    const adv: number = this.tabAdvance();
     // Others-space index of chip i (the array with the dragged chip removed).
     const j: number = i > from ? i - 1 : i;
     // Originally right of the dragged chip, now left of it -> slide left to fill.
@@ -922,14 +1213,15 @@ struct Index {
   }
 
   // Which slot the dragged chip currently hovers, as an insertion index among the
-  // OTHER chips (0..n-1). Robust to variable chip widths: count how many other
-  // chips' centres sit left of the dragged chip's live centre.
+  // OTHER chips (0..n-1). Count how many peers' centres sit left of the dragged
+  // chip's live centre; all peers use the same responsive advance.
   private computeDragTargetIndex(): number {
     const from: number = this.dragFromIndex;
     const n: number = this.sessions.length;
     if (from < 0 || from >= n) {
       return Math.max(0, from);
     }
+    const advance: number = this.tabAdvance();
     let left: number = 0;
     let draggedLeft: number = 0;
     const lefts: number[] = [];
@@ -938,15 +1230,15 @@ struct Index {
       if (k === from) {
         draggedLeft = left;
       }
-      left += this.tabAdvance(this.sessions[k].id);
+      left += advance;
     }
-    const draggedCentre: number = draggedLeft + this.dragDx + this.tabAdvance(this.draggingSessionId) / 2;
+    const draggedCentre: number = draggedLeft + this.dragDx + advance / 2;
     let target: number = 0;
     for (let k = 0; k < n; k++) {
       if (k === from) {
         continue;
       }
-      const centreK: number = lefts[k] + this.tabAdvance(this.sessions[k].id) / 2;
+      const centreK: number = lefts[k] + advance / 2;
       if (centreK < draggedCentre) {
         target += 1;
       }
@@ -962,9 +1254,10 @@ struct Index {
     const from: number = this.dragFromIndex;
     const insertAt: number = this.dragTargetIndex;
     const n: number = this.sessions.length;
+    const advance: number = this.tabAdvance();
     let originalLeft: number = 0;
     for (let k = 0; k < from && k < n; k++) {
-      originalLeft += this.tabAdvance(this.sessions[k].id);
+      originalLeft += advance;
     }
     let finalLeft: number = 0;
     let count: number = 0;
@@ -972,7 +1265,7 @@ struct Index {
       if (k === from) {
         continue;
       }
-      finalLeft += this.tabAdvance(this.sessions[k].id);
+      finalLeft += advance;
       count += 1;
     }
     return finalLeft - originalLeft;
@@ -983,6 +1276,7 @@ struct Index {
     this.dragFromIndex = -1;
     this.dragTargetIndex = -1;
     this.dragDx = 0;
+    this.dragSettling = false;
   }
 
   // Drag begin: pick up the chip. Initial target == its own slot so nothing shifts.
@@ -995,13 +1289,19 @@ struct Index {
     this.draggingSessionId = sessionId;
     this.dragDx = 0;
     this.dragTargetIndex = from;
+    this.dragSettling = false;
   }
 
   // Drag move: the cumulative offset is written straight to dragDx (finger follow,
   // zero delay). When the hover slot changes, animate the neighbours' let-position
   // with a spring and give one light tick so the reorder is felt as well as seen.
-  private updateTabDrag(offsetX: number): void {
+  private updateTabDrag(offsetX: number, offsetY: number, pointerId: number): void {
     if (this.draggingSessionId < 0) {
+      return;
+    }
+    if (Math.abs(offsetY) >= TAB_PICKUP_THRESHOLD_VP && Math.abs(offsetY) > Math.abs(offsetX)) {
+      const sessionId: number = this.draggingSessionId;
+      this.pickUpSessionForSystemDrag(sessionId, pointerId);
       return;
     }
     this.dragDx = offsetX;
@@ -1023,6 +1323,15 @@ struct Index {
   // chips are already at their final pixels when the translates drop to 0 -- no
   // flash. The reset runs OUTSIDE animateTo so it applies instantly, not as a tween.
   private endTabDrag(): void {
+    if (this.systemDragStarting) {
+      return;
+    }
+    // Already settling: the other gesture of the parallel pair got here first
+    // and its onFinish owns the reorder. Return WITHOUT resetting -- a reset
+    // here would clear the very guard that keeps the reorder single.
+    if (this.dragSettling) {
+      return;
+    }
     if (this.draggingSessionId < 0) {
       this.resetTabDragState();
       return;
@@ -1036,6 +1345,7 @@ struct Index {
     this.dragFromIndex = from;
     const insertAt: number = this.dragTargetIndex;
     const finalTranslate: number = this.dragFinalTranslate();
+    this.dragSettling = true;
     this.getUIContext().animateTo(
       {
         duration: DUR_STANDARD,
@@ -1055,10 +1365,17 @@ struct Index {
 
   // Drag cancel (gesture interrupted): spring back to the original slot and clear.
   private cancelTabDrag(): void {
+    if (this.systemDragStarting) {
+      return;
+    }
+    if (this.dragSettling) {
+      return;
+    }
     if (this.draggingSessionId < 0) {
       this.resetTabDragState();
       return;
     }
+    this.dragSettling = true;
     const from: number = this.dragFromIndex;
     this.getUIContext().animateTo(
       {
@@ -1084,21 +1401,6 @@ struct Index {
     }
     if (refocus) {
       this.focusActiveTerminalSoon();
-    }
-  }
-
-  // Turn raw connection-status edges into the filament's life-signs epochs
-  // (§2). Ignite on connect, extinguish on a clean disconnect, spark-fail only
-  // on the rising edge of an error so a backoff retry storm never re-fires the
-  // struggle keyframe on every identical callback.
-  private applyFilamentTransition(session: TerminalSessionHandle,
-                                  wasConnected: boolean, hadError: boolean, hasError: boolean): void {
-    if (!wasConnected && session.connected) {
-      session.igniteEpoch += 1;
-    } else if (wasConnected && !session.connected) {
-      session.extinguishEpoch += 1;
-    } else if (!session.connected && hasError && !hadError) {
-      session.sparkFailEpoch += 1;
     }
   }
 
@@ -1144,12 +1446,30 @@ struct Index {
     return this.sessions.length > 0 && this.isSessionPending(this.activeSession());
   }
 
-  // M09: start/stop the conn-pane filament breathing. Gated on the pane being
+  private activeConnFailed(): boolean {
+    if (this.sessions.length === 0) {
+      return false;
+    }
+    const session: TerminalSessionHandle = this.activeSession();
+    return !session.connected && !this.isSessionPending(session) && session.hadError;
+  }
+
+  private agentActionLabel(): string {
+    if (this.activeConnPending()) {
+      return '连接中…';
+    }
+    if (this.activeConnFailed()) {
+      return '重试 Agent';
+    }
+    return this.activeConnLit() ? '重新连接 Agent' : '连接 Agent';
+  }
+
+  // M09: start/stop the conn-pane status breathing. Gated on the pane being
   // visible AND the active session connecting; stopped on connect / fail /
   // disconnect / drawer close / pane switch so no loop survives off screen.
   private syncConnPaneBreathing(): void {
     const shouldBreathe: boolean =
-      this.drawerOpen && this.drawerPane === 'conn' && this.activeConnPending();
+      this.drawerShown && this.drawerPane === 'conn' && !this.appInBackground && this.activeConnPending();
     if (shouldBreathe && !this.connBreathing) {
       this.connBreathing = true;
       this.connBreatheOpacity = 0.6;
@@ -1175,18 +1495,39 @@ struct Index {
   }
 
   private terminalInputActive(): boolean {
-    return this.sessions.length > 0 && !this.drawerOpen && !this.tabEditOpen;
+    return this.sessions.length > 0 &&
+      !this.drawerOpen &&
+      !this.tabEditOpen &&
+      !this.agentGuideOpen &&
+      !this.appInBackground;
+  }
+
+  private inspectorWidth(): number {
+    if (this.workspaceWidth < INSPECTOR_COMPACT_WIDTH) {
+      return this.workspaceWidth;
+    }
+    return this.workspaceWidth < INSPECTOR_BREAKPOINT
+      ? INSPECTOR_COMPACT_WIDTH
+      : INSPECTOR_DEFAULT_WIDTH;
+  }
+
+  private dialogWidth(preferredWidth: number): number {
+    return Math.min(preferredWidth, Math.max(0, this.workspaceWidth - 32));
   }
 
   private openDrawer(pane: string): void {
+    this.drawerTransitionEpoch += 1;
     this.drawerPane = pane;
     this.drawerOpen = true;
+    this.drawerShown = true;
     // Opening the drawer reveals the target pane at full opacity: the drawer
     // slide itself carries the entrance, so reset the crossfade scalar in case a
     // prior in-drawer pane switch was interrupted mid-animation.
     this.paneT = 1;
-    if (pane === 'theme') {
+    if (pane === 'appearance') {
       this.prepareThemePane();
+    } else if (pane === 'terminal') {
+      this.registerBundledFontPreviews();
     }
     this.syncConnPaneBreathing();
   }
@@ -1199,14 +1540,25 @@ struct Index {
     if (this.drawerPane === pane) {
       return;
     }
+    if (this.drawerPane === 'appearance') {
+      this.cancelThemePreviewWork();
+    }
+    const epoch: number = this.drawerTransitionEpoch + 1;
+    this.drawerTransitionEpoch = epoch;
     this.getUIContext().animateTo(
       {
         duration: DUR_PANE_OUT,
         curve: CURVE_ACCEL,
         onFinish: () => {
+          if (this.drawerTransitionEpoch !== epoch || !this.drawerShown) {
+            this.paneT = 1;
+            return;
+          }
           this.drawerPane = pane;
-          if (pane === 'theme') {
+          if (pane === 'appearance') {
             this.prepareThemePane();
+          } else if (pane === 'terminal') {
+            this.registerBundledFontPreviews();
           }
           this.syncConnPaneBreathing();
           this.getUIContext().animateTo(
@@ -1222,15 +1574,30 @@ struct Index {
   }
 
   private closeDrawer(): void {
-    this.drawerOpen = false;
+    if (!this.drawerOpen || !this.drawerShown) {
+      return;
+    }
+    this.cancelThemePreviewWork();
+    this.drawerShown = false;
     this.syncConnPaneBreathing();
-    this.focusActiveTerminalSoon();
+    const epoch: number = this.drawerTransitionEpoch + 1;
+    this.drawerTransitionEpoch = epoch;
+    setTimeout(() => {
+      if (this.drawerTransitionEpoch !== epoch || this.drawerShown) {
+        return;
+      }
+      this.drawerOpen = false;
+      // The inspector shell stays mounted for its slide transition, but its
+      // heaviest pane must not survive invisibly beside the live terminal.
+      this.drawerPane = 'terminal';
+      this.paneT = 1;
+      this.focusActiveTerminalSoon();
+    }, DUR_STANDARD);
   }
 
   private openTabEditor(session: TerminalSessionHandle): void {
     this.editingSession = session;
     this.tabEditDraft = session.customName.length > 0 ? session.customName : session.title;
-    this.editingFilament = session.filamentColor;
     this.editingPasteMode = session.pasteMode;
     this.editingRelayTarget = session.relayTarget;
     this.editingRelayDir = session.relayDir;
@@ -1257,64 +1624,161 @@ struct Index {
     }
   }
 
-  private pickFilament(color: string): void {
-    const session = this.editingSession;
-    if (session) {
-      session.filamentColor = color === COLOR_EMBER ? '' : color;
-      this.editingFilament = session.filamentColor;
-    }
-  }
-
-  // BEL / OSC 9 from a background tab means "task finished, look at me"
-  // (claude code and codex both ring on completion). The visible tab shows
-  // its own output, so it never notifies.
+  // BEL / OSC 9 from a background tab means "task finished, look at me".
+  // Codex emits OSC 9 after the documented TUI notification config is enabled;
+  // foreground work gets an in-app toast, while background work also re-kindles
+  // its tab. Every accepted event still reaches the system-notification path so
+  // paired-device forwarding is not defeated merely because the app has focus.
   private handleTerminalNotification(session: TerminalSessionHandle, text: string): void {
-    // Notify unless the user is actually looking at this tab: a background
-    // tab always qualifies, and the ACTIVE tab qualifies too while the whole
-    // app is hidden (agent finished after the user switched away).
-    if (session.id === this.activeSessionId && !this.appInBackground) {
-      return;
-    }
     const now = Date.now();
     if (now - session.lastNotifyMs < 5000) {
       return;
     }
     session.lastNotifyMs = now;
-    // M05: the answer lives on the tab itself — mark it unread (title lifts,
-    // glow steadies) and bump attentionEpoch so the chip plays the re-kindle
-    // double-surge, on top of the system notification.
-    session.attentionEpoch += 1;
-    session.unread = true;
+    const terminalVisible = session.id === this.activeSessionId && !this.appInBackground;
+    if (terminalVisible) {
+      const summary = text.trim().length > 0 ? text.trim().slice(0, 80) : '终端任务完成';
+      this.getUIContext().getPromptAction().showToast({
+        message: `任务完成 · ${summary}`,
+        duration: 1800
+      });
+    } else {
+      // A background answer lives on the tab itself: mark it unread so the
+      // title lifts to the primary text color until activated.
+      session.unread = true;
+    }
     void this.publishTerminalNotification(session, text);
+  }
+
+  private taskNotificationActionLabel(): string {
+    if (this.taskNotificationBusy) {
+      return '处理中…';
+    }
+    return this.taskNotificationEnabled ? '发送测试提醒' : '启用并测试';
+  }
+
+  private async refreshTaskNotificationState(): Promise<void> {
+    try {
+      const enabled = await notificationManager.isNotificationEnabled();
+      this.taskNotificationEnabled = enabled;
+      this.taskNotificationStatus = enabled ? '系统通知已启用' : '系统通知未启用';
+    } catch (err) {
+      this.taskNotificationEnabled = false;
+      this.taskNotificationStatus = '无法读取系统通知状态';
+      console.error('Failed to read terminal notification state: ' + JSON.stringify(err));
+    }
+  }
+
+  private taskNotificationErrorStatus(prefix: string, error: BusinessError): string {
+    if (error.code === 1600004) {
+      return '系统通知授权已被拒绝,请在系统设置中重新开启';
+    }
+    if (error.code === 1600005) {
+      return '任务提醒通知渠道已关闭,请在系统设置中重新开启';
+    }
+    if (error.code === 1600009) {
+      return '通知发送过于频繁,请稍后重试';
+    }
+    return `${prefix} (${error.code}: ${error.message})`;
+  }
+
+  private async enableAndTestTaskNotification(): Promise<void> {
+    if (this.taskNotificationBusy) {
+      return;
+    }
+    this.taskNotificationBusy = true;
+    try {
+      let enabled = await notificationManager.isNotificationEnabled();
+      if (!enabled) {
+        const context = this.context;
+        if (!context) {
+          this.taskNotificationStatus = '当前窗口无法申请系统通知';
+          this.getUIContext().getPromptAction().showToast({
+            message: this.taskNotificationStatus,
+            duration: 2400
+          });
+          return;
+        }
+        await notificationManager.requestEnableNotification(context);
+        enabled = await notificationManager.isNotificationEnabled();
+      }
+      this.taskNotificationEnabled = enabled;
+      if (!enabled) {
+        this.taskNotificationStatus = '系统通知未启用';
+        this.getUIContext().getPromptAction().showToast({
+          message: this.taskNotificationStatus,
+          duration: 2400
+        });
+        return;
+      }
+      await this.publishTaskNotification(
+        TASK_NOTIFICATION_TEST_ID,
+        'Emberline · Codex',
+        '任务完成提醒已就绪'
+      );
+      const activeCount = await notificationManager.getActiveNotificationCount();
+      this.taskNotificationStatus = `系统已接收测试通知 · 通知栏 ${activeCount} 条`;
+      this.getUIContext().getPromptAction().showToast({
+        message: '测试通知已提交到系统',
+        duration: 1800
+      });
+    } catch (err) {
+      const error = err as BusinessError;
+      this.taskNotificationStatus = this.taskNotificationErrorStatus(
+        '启用或测试系统通知失败',
+        error
+      );
+      this.getUIContext().getPromptAction().showToast({
+        message: this.taskNotificationStatus,
+        duration: 2400
+      });
+      console.error(
+        `Failed to enable or test terminal notifications: ${error.code}: ${error.message}`
+      );
+    } finally {
+      this.taskNotificationBusy = false;
+    }
   }
 
   private async publishTerminalNotification(session: TerminalSessionHandle, text: string): Promise<void> {
     try {
       const enabled = await notificationManager.isNotificationEnabled();
+      this.taskNotificationEnabled = enabled;
       if (!enabled) {
-        if (this.notifyPermissionRequested || !this.context) {
-          return;
-        }
-        this.notifyPermissionRequested = true;
-        await notificationManager.requestEnableNotification(this.context);
+        this.taskNotificationStatus = '系统通知未启用';
+        return;
       }
-      const request: notificationManager.NotificationRequest = {
-        id: session.id,
-        content: {
-          notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-          normal: {
-            title: session.title.length > 0 ? session.title : 'Emberline',
-            text: text.length > 0 ? text : '任务完成,终端在等你'
-          }
-        }
-      };
-      await notificationManager.publish(request);
+      this.taskNotificationStatus = '系统通知已启用';
+      await this.publishTaskNotification(
+        session.surfaceSeq,
+        session.title.length > 0 ? session.title : 'Emberline',
+        text.length > 0 ? text : '任务完成,终端在等你'
+      );
     } catch (err) {
-      console.error('Failed to publish terminal notification: ' + JSON.stringify(err));
+      const error = err as BusinessError;
+      this.taskNotificationStatus = this.taskNotificationErrorStatus('系统通知发布失败', error);
+      console.error(`Failed to publish terminal notification: ${error.code}: ${error.message}`);
     }
   }
 
+  private async publishTaskNotification(id: number, title: string, text: string): Promise<void> {
+    await notificationManager.addSlot(notificationManager.SlotType.SERVICE_INFORMATION);
+    const request: notificationManager.NotificationRequest = {
+      id,
+      notificationSlotType: notificationManager.SlotType.SERVICE_INFORMATION,
+      content: {
+        notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+        normal: {
+          title,
+          text
+        }
+      }
+    };
+    await notificationManager.publish(request);
+  }
+
   private focusActiveTerminalSoon(): void {
+    this.workbenchFocusZone = 0;
     const sessionId = this.activeSessionId;
     this.requestTerminalFocusAt(sessionId, 80);
     // Retry once after the tab switch has fully rendered: the first attempt
@@ -1335,6 +1799,53 @@ struct Index {
       }
       session.controller.setImeActive(true);
     }, delayMs);
+  }
+
+  private requestWorkbenchFocusSoon(componentId: string): void {
+    setTimeout(() => {
+      try {
+        focusControl.requestFocus(componentId);
+      } catch (err) {
+        console.error('Failed to move workbench focus: ' + JSON.stringify(err));
+      }
+    }, 40);
+  }
+
+  // Window-level ArkUI shortcuts run before the native XComponent key event.
+  // Keep F6 for desktop keyboards and Ctrl+Alt+. for compact keyboards without
+  // a function row; neither steals Tab/Shift+Tab from terminal programs.
+  private cycleWorkbenchFocus(): void {
+    if (this.tabEditOpen || this.agentGuideOpen) {
+      return;
+    }
+    if (this.workbenchFocusZone === 0) {
+      this.workbenchFocusZone = 1;
+      this.requestWorkbenchFocusSoon('workbenchConnectionAction');
+      return;
+    }
+    if (this.workbenchFocusZone === 1) {
+      if (!this.drawerOpen) {
+        this.openDrawer('terminal');
+      }
+      this.workbenchFocusZone = 2;
+      this.requestWorkbenchFocusSoon(`workbenchInspector-${this.drawerPane}`);
+      return;
+    }
+    this.closeDrawer();
+  }
+
+  private workbenchOverlayOpen(): boolean {
+    return this.drawerOpen || this.tabEditOpen || this.agentGuideOpen;
+  }
+
+  private closeTopmostOverlay(): void {
+    if (this.agentGuideOpen) {
+      this.dismissAgentGuide();
+    } else if (this.tabEditOpen) {
+      this.commitTabEditor();
+    } else if (this.drawerOpen) {
+      this.closeDrawer();
+    }
   }
 
   // Desktop-terminal tab title: cwd basename when connected, transport name
@@ -1385,9 +1896,6 @@ struct Index {
       Column() {
         this.buildTabBar();
         this.buildTerminalLayer();
-        if (this.accessoryVisible) {
-          this.buildAccessoryBar();
-        }
       }
       .width('100%')
       .height('100%')
@@ -1405,10 +1913,33 @@ struct Index {
         this.buildAgentGuideScrim();
         this.buildAgentGuidePanel();
       }
+
+      Button('')
+        .width(1)
+        .height(1)
+        .visibility(Visibility.Hidden)
+        .enabled(this.workbenchOverlayOpen())
+        .focusable(false)
+        .hitTestBehavior(HitTestMode.None)
+        .keyboardShortcut(FunctionKey.ESC, [], () => {
+          this.closeTopmostOverlay();
+        })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(COLOR_APP_BG)
+    .backgroundColor(this.chrome.appBg)
+    .onAreaChange((_oldValue: Area, newValue: Area): void => {
+      const width: number = Number(newValue.width ?? 0);
+      if (Number.isFinite(width) && width > 0) {
+        this.workspaceWidth = width;
+      }
+    })
+    .keyboardShortcut(FunctionKey.F6, [], () => {
+      this.cycleWorkbenchFocus();
+    })
+    .keyboardShortcut('.', [ModifierKey.CTRL, ModifierKey.ALT], () => {
+      this.cycleWorkbenchFocus();
+    })
   }
 
   @Builder
@@ -1422,10 +1953,13 @@ struct Index {
             surfaceColor: this.surfaceBackdropColor(),
             active: session.id === this.activeSessionId &&
               !this.drawerOpen &&
-              !this.tabEditOpen,
+              !this.tabEditOpen &&
+              !this.agentGuideOpen &&
+              !this.appInBackground,
             // Polling / scrollbar follow raw tab visibility: a translucent
             // drawer must not throttle the terminal still showing behind it.
-            visible: session.id === this.activeSessionId,
+            visible: session.id === this.activeSessionId && !this.appInBackground,
+            appBackgrounded: this.appInBackground,
             foregroundFocusEpoch: this.foregroundFocusEpoch,
             onImagePasted: (localPath: string): void => {
               this.handleImagePasted(session, localPath);
@@ -1447,16 +1981,39 @@ struct Index {
     Row({ space: 8 }) {
       Scroll(this.tabScroller) {
         Row({ space: TAB_STRIP_GAP_VP }) {
+          if (this.sessions.length === 1) {
+            SoloTabTitle({
+              session: this.sessions[0],
+              appBackgrounded: this.appInBackground,
+              windowStamp: this.windowStamp,
+              soloWidth: this.tabChipWidth(),
+              onEdit: (): void => {
+                this.openTabEditor(this.sessions[0]);
+              },
+              onClose: (): void => {
+                this.closeSession(this.sessions[0].id);
+              },
+              onMoveToWindow: (stamp: number): void => {
+                this.moveSessionToWindow(this.sessions[0].id, stamp);
+              },
+              onLift: (pointerId: number): void => {
+                this.pickUpSessionForSystemDrag(this.sessions[0].id, pointerId);
+              }
+            })
+          } else {
           ForEach(this.sessions, (session: TerminalSessionHandle, index: number) => {
             TerminalTabChip({
               session: session,
               active: session.id === this.activeSessionId,
+              appBackgrounded: this.appInBackground,
+              chipWidth: this.tabChipWidth(),
               // In-track drag: current horizontal offset for this chip (finger follow
               // for the dragged chip, let-position for a displaced one) and whether it
               // is the lifted chip. tabShiftFor re-reads the page drag @State, so both
               // re-sync as plain-value @Props on every parent re-render.
               translateX: this.tabShiftFor(index),
               lifted: this.draggingSessionId === session.id,
+              windowStamp: this.windowStamp,
               onSelect: (): void => {
                 this.activateSession(session.id, true);
               },
@@ -1466,14 +2023,17 @@ struct Index {
               onEdit: (): void => {
                 this.openTabEditor(session);
               },
-              onChipWidth: (width: number): void => {
-                this.tabWidths.set(session.id, width);
+              onSplitWindow: (): void => {
+                this.splitSessionToNewWindow(session.id);
+              },
+              onMoveToWindow: (stamp: number): void => {
+                this.moveSessionToWindow(session.id, stamp);
               },
               onReorderStart: (): void => {
                 this.beginTabDrag(session.id);
               },
-              onReorderUpdate: (offsetX: number): void => {
-                this.updateTabDrag(offsetX);
+              onReorderUpdate: (offsetX: number, offsetY: number, pointerId: number): void => {
+                this.updateTabDrag(offsetX, offsetY, pointerId);
               },
               onReorderEnd: (): void => {
                 this.endTabDrag();
@@ -1483,19 +2043,35 @@ struct Index {
               }
             })
           }, (session: TerminalSessionHandle) => `tab-${session.id}`)
+          }
 
           Button() {
             Image($r('app.media.ic_plus'))
               .width(16)
               .height(16)
           }
-          .height(30)
-          .width(34)
+          .height(40)
+          .width(TAB_NEW_BUTTON_WIDTH_VP)
           .padding(0)
           .backgroundColor('#00000000')
           .borderRadius(8)
+          .accessibilityText('新建标签页')
           .focusable(false)
+          .hoverEffect(HoverEffect.Highlight)
+          .onHover((isHover: boolean) => {
+            this.newTabTipVisible = isHover;
+          })
+          .bindPopup(this.newTabTipVisible, {
+            message: '新建标签页',
+            placement: Placement.Bottom,
+            enableArrow: false,
+            mask: false,
+            targetSpace: 4,
+            popupColor: this.chrome.panelBg2,
+            radius: 6
+          })
           .onClick(() => {
+            this.newTabTipVisible = false;
             this.addSession(true);
           })
         }
@@ -1503,81 +2079,190 @@ struct Index {
       .scrollable(ScrollDirection.Horizontal)
       .scrollBar(BarState.Off)
       .align(Alignment.Start)
+      .onAreaChange((_oldValue: Area, newValue: Area): void => {
+        const width: number = Number(newValue.width ?? 0);
+        if (Number.isFinite(width) && width > 0) {
+          this.tabStripViewportWidth = width;
+        }
+      })
+      .allowDrop([TAB_HANDOFF_UDMF_TYPE])
+      .onDrop((event: DragEvent): void => {
+        this.handleTabStripDrop(event);
+      })
       .layoutWeight(1)
 
       Button() {
-        Image(this.accessoryVisible ? $r('app.media.ic_keyboard_ember') : $r('app.media.ic_keyboard'))
+        Image($r('app.media.ic_link'))
           .width(17)
           .height(17)
       }
-      .height(30)
-      .width(34)
+      .height(40)
+      .width(40)
       .padding(0)
-      .backgroundColor('#00000000')
+      .backgroundColor((this.drawerShown && this.drawerPane === 'conn') ||
+        this.hoveredChromeAction === 'conn' || this.focusedChromeAction === 'conn'
+        ? this.chrome.panelBg2 : '#00000000')
       .borderRadius(8)
-      .focusable(false)
+      .id('workbenchConnectionAction')
+      .accessibilityText('连接')
+      .focusable(this.workbenchFocusZone > 0)
+      .hoverEffect(HoverEffect.None)
+      .onFocus(() => {
+        this.workbenchFocusZone = 1;
+        this.focusedChromeAction = 'conn';
+      })
+      .onBlur(() => {
+        if (this.focusedChromeAction === 'conn') {
+          this.focusedChromeAction = '';
+        }
+      })
+      .onHover((isHover: boolean) => {
+        this.hoveredChromeAction = isHover ? 'conn' : '';
+        this.connectionTipVisible = isHover;
+      })
+      .bindPopup(this.connectionTipVisible, {
+        message: '连接',
+        placement: Placement.Bottom,
+        enableArrow: false,
+        mask: false,
+        targetSpace: 4,
+        popupColor: this.chrome.panelBg2,
+        radius: 6
+      })
       .onClick(() => {
-        this.accessoryVisible = !this.accessoryVisible;
-        this.focusActiveTerminalSoon();
+        this.connectionTipVisible = false;
+        this.workbenchFocusZone = 1;
+        if (this.drawerShown && this.drawerPane === 'conn') {
+          this.closeDrawer();
+        } else {
+          this.openDrawer('conn');
+        }
       })
 
       Button() {
-        Image(this.drawerOpen && this.drawerPane === 'conn' ? $r('app.media.ic_link_ember') : $r('app.media.ic_link'))
+        Image($r('app.media.ic_gear'))
           .width(17)
           .height(17)
       }
-      .height(30)
-      .width(34)
+      .height(40)
+      .width(40)
       .padding(0)
-      .backgroundColor('#00000000')
+      .backgroundColor((this.drawerShown && this.drawerPane !== 'conn') ||
+        this.hoveredChromeAction === 'settings' || this.focusedChromeAction === 'settings'
+        ? this.chrome.panelBg2 : '#00000000')
       .borderRadius(8)
-      .focusable(false)
+      .id('workbenchSettingsAction')
+      .accessibilityText('设置')
+      .focusable(this.workbenchFocusZone > 0)
+      .hoverEffect(HoverEffect.None)
+      .onFocus(() => {
+        this.workbenchFocusZone = 1;
+        this.focusedChromeAction = 'settings';
+      })
+      .onBlur(() => {
+        if (this.focusedChromeAction === 'settings') {
+          this.focusedChromeAction = '';
+        }
+      })
+      .onHover((isHover: boolean) => {
+        this.hoveredChromeAction = isHover ? 'settings' : '';
+        this.settingsTipVisible = isHover;
+      })
+      .bindPopup(this.settingsTipVisible, {
+        message: '设置',
+        placement: Placement.Bottom,
+        enableArrow: false,
+        mask: false,
+        targetSpace: 4,
+        popupColor: this.chrome.panelBg2,
+        radius: 6
+      })
       .onClick(() => {
-        this.openDrawer('conn');
+        this.settingsTipVisible = false;
+        this.workbenchFocusZone = 1;
+        if (this.drawerShown && this.drawerPane !== 'conn') {
+          this.closeDrawer();
+        } else {
+          this.openDrawer('terminal');
+        }
       })
 
       Button() {
-        Image(this.drawerOpen && this.drawerPane !== 'conn' && this.drawerPane !== 'help'
-          ? $r('app.media.ic_gear_ember') : $r('app.media.ic_gear'))
+        Image($r('app.media.ic_more'))
           .width(17)
           .height(17)
       }
-      .height(30)
-      .width(34)
+      .height(40)
+      .width(40)
       .padding(0)
-      .backgroundColor('#00000000')
+      .backgroundColor(this.hoveredChromeAction === 'more' || this.focusedChromeAction === 'more'
+        ? this.chrome.panelBg2 : '#00000000')
       .borderRadius(8)
-      .focusable(false)
-      .onClick(() => {
-        this.openDrawer('appearance');
+      .id('workbenchMoreAction')
+      .accessibilityText('更多')
+      .focusable(this.workbenchFocusZone > 0)
+      .hoverEffect(HoverEffect.None)
+      .onFocus(() => {
+        this.workbenchFocusZone = 1;
+        this.focusedChromeAction = 'more';
       })
-
-      Button() {
-        Image(this.drawerOpen && this.drawerPane === 'help' ? $r('app.media.ic_help_ember') : $r('app.media.ic_help'))
-          .width(17)
-          .height(17)
-      }
-      .height(30)
-      .width(34)
-      .padding(0)
-      .backgroundColor('#00000000')
-      .borderRadius(8)
-      .focusable(false)
-      .onClick(() => {
-        this.openDrawer('help');
+      .onBlur(() => {
+        if (this.focusedChromeAction === 'more') {
+          this.focusedChromeAction = '';
+        }
       })
+      .onHover((isHover: boolean) => {
+        this.hoveredChromeAction = isHover ? 'more' : '';
+        this.moreTipVisible = isHover;
+      })
+      .bindPopup(this.moreTipVisible, {
+        message: '更多',
+        placement: Placement.Bottom,
+        enableArrow: false,
+        mask: false,
+        targetSpace: 4,
+        popupColor: this.chrome.panelBg2,
+        radius: 6
+      })
+      .onClick(() => {
+        this.moreTipVisible = false;
+      })
+      .bindMenu(this.buildWorkspaceMenu())
     }
     .height(WINDOW_CHROME_HEIGHT)
     .width('100%')
     .padding({ left: 8, right: WINDOW_DECOR_BUTTON_RESERVE })
-    .backgroundColor('#080B10')
-    .border({ width: { bottom: 1 }, color: '#121821' })
+    .backgroundColor(this.chrome.barBg)
   }
 
-  // Kept mounted so the tint can cross-fade in step with the 240ms drawer
-  // slide instead of snapping on/off. Closed, the dark layer is fully
-  // transparent to touches (HitTestMode.None) so the terminal underneath stays
-  // interactive; the drawer body owns the tap-outside-to-close logic.
+  @Builder
+  private buildWorkspaceMenu() {
+    Menu() {
+      MenuItem({ content: '新建窗口' })
+        .onClick(() => {
+          this.openNewWindow();
+        })
+      MenuItem({ content: '帮助与诊断' })
+        .onClick(() => {
+          this.workbenchFocusZone = 0;
+          this.agentGuideMode = 'help';
+          this.agentGuideOpen = true;
+          void this.refreshTaskNotificationState();
+          this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
+        })
+      MenuItem({ content: '关于 Emberline' })
+        .onClick(() => {
+          this.workbenchFocusZone = 0;
+          this.agentGuideMode = 'help';
+          this.agentGuideOpen = true;
+          void this.refreshTaskNotificationState();
+          this.requestWorkbenchFocusSoon('workbenchHelpCloseAction');
+        })
+    }
+  }
+
+  // Kept mounted as a transparent outside-click target. The terminal remains
+  // visually undimmed; input is blocked explicitly while the inspector is open.
   @Builder
   private buildDrawerScrim() {
     Column() {
@@ -1588,9 +2273,7 @@ struct Index {
       Column()
         .width('100%')
         .layoutWeight(1)
-        .backgroundColor('#80020305')
-        .opacity(this.drawerOpen ? 1 : 0)
-        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
+        .backgroundColor('#00000000')
         .hitTestBehavior(this.drawerOpen ? HitTestMode.Default : HitTestMode.None)
         .onClick(() => {
           this.closeDrawer();
@@ -1601,11 +2284,9 @@ struct Index {
     .hitTestBehavior(HitTestMode.Transparent)
   }
 
-  // Right-hand settings drawer: appearance / font / theme / connection.
-  // Kept mounted so the slide animation plays both ways; when closed it is
-  // translated off-screen and the transparent hit-test lets touches through.
-  // A non-interactive spacer keeps the window-chrome row (tabs + system
-  // window buttons) usable while the drawer is open.
+  // Right-hand inspector. It overlays rather than resizes the terminal, and
+  // exposes only the three workbench destinations: terminal, appearance and
+  // connection. The width changes only at the 900vp responsive breakpoint.
   @Builder
   private buildDrawer() {
     Column() {
@@ -1613,79 +2294,71 @@ struct Index {
         .width('100%')
         .height(WINDOW_CHROME_HEIGHT)
         .hitTestBehavior(HitTestMode.None)
-    Row() {
       Row() {
-        Column({ space: 2 }) {
-          this.buildDrawerNavItem('外观', 'appearance')
-          this.buildDrawerNavItem('字体', 'font')
-          this.buildDrawerNavItem('主题', 'theme')
-          this.buildDrawerNavItem('连接', 'conn')
-          this.buildDrawerNavItem('帮助', 'help')
-        }
-        .width(92)
-        .height('100%')
-        .padding({ top: 18, left: 8, right: 8 })
-        .border({ width: { right: 1 }, color: COLOR_PANEL_BORDER })
-
-        // M10 crossfade container: only the pane content fades + slides on a
-        // nav switch (the nav rail stays put). opacity + translateX, never
-        // scale, so CJK labels never rasterize.
         Column() {
-          if (this.drawerPane === 'theme') {
-            this.buildThemePane()
-          } else {
-            Scroll() {
-              Column() {
-                if (this.drawerPane === 'appearance') {
-                  this.buildAppearancePane()
-                } else if (this.drawerPane === 'font') {
-                  this.buildFontPane()
-                } else if (this.drawerPane === 'help') {
-                  this.buildHelpPane()
-                } else {
-                  this.buildConnPane()
-                }
-              }
-              .width('100%')
-              .padding({ left: 20, right: 20, top: 4, bottom: 24 })
-              .alignItems(HorizontalAlign.Start)
+          Column() {
+            Row({ space: 4 }) {
+              this.buildDrawerNavItem('终端', 'terminal')
+              this.buildDrawerNavItem('外观', 'appearance')
+              this.buildDrawerNavItem('连接', 'conn')
             }
-            .scrollBar(BarState.Off)
-            .align(Alignment.Top)
+            .width('100%')
+            .height(48)
+            .padding({ left: 10, right: 10, top: 6, bottom: 4 })
+            .border({ width: { bottom: 1 }, color: this.chrome.panelBorder })
+
+            // Only the content changes; the terminal behind it never reflows.
+            Column() {
+              if (this.drawerPane === 'appearance') {
+                this.buildThemePane()
+              } else {
+                Scroll() {
+                  Column() {
+                    if (this.drawerPane === 'terminal') {
+                      this.buildTerminalPane()
+                    } else {
+                      this.buildConnPane()
+                    }
+                  }
+                  .width('100%')
+                  .padding({ left: 18, right: 18, top: 4, bottom: 24 })
+                  .alignItems(HorizontalAlign.Start)
+                }
+                .scrollBar(BarState.Off)
+                .align(Alignment.Top)
+                .layoutWeight(1)
+                .width('100%')
+                .height('100%')
+              }
+            }
             .layoutWeight(1)
             .width('100%')
-            .height('100%')
+            .opacity(this.paneT)
+            .translate({ x: (1 - this.paneT) * 10 })
           }
+          .height('100%')
+          .enabled(this.drawerShown)
+          .width('100%')
+          .backgroundColor(this.chrome.panelBg)
+          .border({ width: { left: 1 }, color: this.chrome.panelBorder })
+          .opacity(this.drawerShown ? 1 : 0)
+          .translate({ x: this.drawerShown ? 0 : this.inspectorWidth() })
+          .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
+          .onClick(() => {})
         }
-        .layoutWeight(1)
         .height('100%')
-        .opacity(this.paneT)
-        .translate({ x: (1 - this.paneT) * 10 })
+        .width(this.inspectorWidth())
+        .hitTestBehavior(this.drawerOpen ? HitTestMode.Default : HitTestMode.None)
       }
-      .width(DRAWER_WIDTH)
-      .height('100%')
-      .backgroundColor(COLOR_PANEL_BG)
-      .border({ width: { left: 1 }, color: COLOR_PANEL_BORDER })
-      .translate({ x: this.drawerOpen ? 0 : DRAWER_WIDTH })
-      .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
-      // Swallow taps on non-interactive panel areas so they never bubble to
-      // the close-on-outside-tap handler below.
-      .onClick(() => {})
-    }
-    .width('100%')
-    .layoutWeight(1)
-    .justifyContent(FlexAlign.End)
-    // Open: block the layers underneath. The terminal XComponent receives raw
-    // touch/axis callbacks whenever HitTestMode.Transparent keeps it in the
-    // hit-test chain, so drawer taps and scrolls were leaking into the
-    // terminal. Closed: stay transparent so the always-mounted (translated
-    // off-screen) drawer never eats terminal input.
-    .hitTestBehavior(this.drawerOpen ? HitTestMode.Default : HitTestMode.Transparent)
-    .onClick(() => {
-      if (this.drawerOpen) {
-        this.closeDrawer();
-      }
-    })
+      .width('100%')
+      .layoutWeight(1)
+      .justifyContent(FlexAlign.End)
+      .hitTestBehavior(this.drawerOpen ? HitTestMode.Default : HitTestMode.Transparent)
+      .onClick(() => {
+        if (this.drawerOpen) {
+          this.closeDrawer();
+        }
+      })
     }
     .width('100%')
     .height('100%')
@@ -1694,31 +2367,35 @@ struct Index {
 
   @Builder
   private buildDrawerNavItem(label: string, pane: string) {
-    Row({ space: 8 }) {
-      Row()
-        .width(2)
-        .height(16)
-        .borderRadius(1)
-        .backgroundColor(this.drawerPane === pane ? COLOR_EMBER : '#00000000')
-        .shadow(this.drawerPane === pane
-          ? { radius: 4, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 }
-          : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-        // M06 selected-filament: fade the copper + glow instead of a hard jump.
-        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
+    Column({ space: 5 }) {
       Text(label)
         .fontSize(12.5)
-        .fontColor(this.drawerPane === pane ? COLOR_TEXT_PRIMARY : COLOR_TEXT_SECONDARY)
+        .fontColor(this.drawerPane === pane ? this.chrome.textPrimary : this.chrome.textSecondary)
+      Row()
+        .width(24)
+        .height(2)
+        .borderRadius(1)
+        .backgroundColor(this.drawerPane === pane ? this.chrome.textPrimary : '#00000000')
+        // Neutral selected underline fade (accent system retired).
+        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
     }
-    .width('100%')
-    .height(36)
-    .padding({ left: 8 })
-    .borderRadius(8)
-    .backgroundColor(this.drawerPane === pane ? COLOR_PANEL_2 : '#00000000')
-    // M07 selected-face: settles fast (120) so the face lands a beat before the
-    // filament brightens — "面先稳、灯丝后亮".
+    .height(40)
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+    .borderRadius(6)
+    .backgroundColor(this.drawerPane === pane ? this.chrome.panelBg2 : '#00000000')
+    // M07 selected-face: settles fast (120) so the face lands a beat before
+    // the selected underline fades in.
     .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
     .clip(true)
+    .id(`workbenchInspector-${pane}`)
+    .focusable(this.workbenchFocusZone === 2)
+    .onFocus(() => {
+      this.workbenchFocusZone = 2;
+    })
+    .hoverEffect(HoverEffect.Highlight)
     .onClick(() => {
+      this.workbenchFocusZone = 2;
       this.switchDrawerPane(pane);
     })
   }
@@ -1728,13 +2405,12 @@ struct Index {
     Row() {
       Text(title)
         .fontSize(11)
-        .fontColor(COLOR_TEXT_SECONDARY)
-        .letterSpacing(1)
+        .fontColor(this.chrome.textSecondary)
     }
     .width('100%')
     .padding({ bottom: 8 })
     .margin({ top: 16 })
-    .border({ width: { bottom: 1 }, color: COLOR_PANEL_BORDER })
+    .border({ width: { bottom: 1 }, color: this.chrome.panelBorder })
   }
 
   // Setting-row label: plain name on top, the matching ghostty config key
@@ -1745,29 +2421,29 @@ struct Index {
     Column({ space: 2 }) {
       Text(name)
         .fontSize(13)
-        .fontColor(COLOR_TEXT_PRIMARY)
+        .fontColor(this.chrome.textPrimary)
       Text('= ' + key)
         .fontSize(10.5)
-        .fontColor(COLOR_TEXT_FAINT)
+        .fontColor(this.chrome.textFaint)
     }
     .alignItems(HorizontalAlign.Start)
     .layoutWeight(1)
   }
 
   @Builder
-  private buildAppearancePane() {
+  private buildTerminalPane() {
     this.buildGroupTitle('光标')
     Row() {
       this.buildRowLabel('光标样式', 'cursor-style')
       Row({ space: 2 }) {
         ForEach([2, 0, 1] as number[], (style: number) => {
           Button(style === 2 ? '竖线' : style === 0 ? '方块' : '下划线')
-            .height(28)
+            .height(36)
             .fontSize(11.5)
             .backgroundColor(this.cursorStyle === style ? '#1A212C' : '#00000000')
-            .fontColor(this.cursorStyle === style ? COLOR_TEXT_PRIMARY : COLOR_TEXT_SECONDARY)
+            .fontColor(this.cursorStyle === style ? this.chrome.textPrimary : this.chrome.textSecondary)
             .borderRadius(6)
-            .focusable(false)
+            .focusable(this.drawerShown)
             .onClick(() => {
               this.cursorStyle = style;
               this.applyCursorConfig();
@@ -1775,9 +2451,9 @@ struct Index {
         }, (style: number) => `cursor-${style}`)
       }
       .padding(2)
-      .backgroundColor(COLOR_PANEL_2)
+      .backgroundColor(this.chrome.panelBg2)
       .borderRadius(8)
-      .border({ width: 1, color: COLOR_PANEL_BORDER })
+      .border({ width: 1, color: this.chrome.panelBorder })
     }
     .width('100%')
     .padding({ top: 8, bottom: 8 })
@@ -1785,7 +2461,7 @@ struct Index {
     Row() {
       this.buildRowLabel('光标闪烁', 'cursor-style-blink')
       Toggle({ type: ToggleType.Switch, isOn: this.cursorBlink })
-        .selectedColor(COLOR_EMBER)
+        .selectedColor(this.chrome.textPrimary)
         .onChange((isOn: boolean) => {
           this.cursorBlink = isOn;
           this.applyCursorConfig();
@@ -1794,30 +2470,35 @@ struct Index {
     .width('100%')
     .padding({ top: 8, bottom: 8 })
 
+    this.buildFontPane()
+  }
+
+  @Builder
+  private buildAppearancePane() {
     this.buildGroupTitle('背景')
     Row({ space: 10 }) {
       this.buildRowLabel('背景图片', 'background-image')
       if (this.backgroundImagePath.length > 0) {
         Button('清除')
-          .height(30)
+          .height(36)
           .fontSize(11.5)
-          .backgroundColor(COLOR_PANEL_2)
-          .fontColor(COLOR_KEY_TEXT)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
           .borderRadius(8)
-          .border({ width: 1, color: COLOR_PANEL_BORDER })
-          .focusable(false)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.drawerShown)
           .onClick(() => {
             this.clearBackgroundImage();
           })
       }
       Button('选择…')
-        .height(30)
+        .height(36)
         .fontSize(11.5)
-        .backgroundColor(COLOR_PANEL_2)
-        .fontColor(COLOR_KEY_TEXT)
+        .backgroundColor(this.chrome.panelBg2)
+        .fontColor(this.chrome.textPrimary)
         .borderRadius(8)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
-        .focusable(false)
+        .border({ width: 1, color: this.chrome.panelBorder })
+        .focusable(this.drawerShown)
         .onClick(() => {
           void this.pickBackgroundImage();
         })
@@ -1835,7 +2516,7 @@ struct Index {
           step: 1
         })
           .width(150)
-          .selectedColor(COLOR_EMBER)
+          .selectedColor(this.chrome.textPrimary)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.backgroundOpacity = value / 100;
             this.applyBackgroundConfig();
@@ -1847,6 +2528,9 @@ struct Index {
       .width('100%')
       .padding({ top: 8, bottom: 8 })
 
+    }
+
+    if (this.backgroundImagePath.length > 0) {
       Row() {
         this.buildRowLabel(`亚克力模糊 ${Math.round(this.backgroundBlur)}`, 'background-blur')
         Slider({
@@ -1856,7 +2540,7 @@ struct Index {
           step: 2
         })
           .width(150)
-          .selectedColor(COLOR_EMBER)
+          .selectedColor(this.chrome.textPrimary)
           .onChange((value: number, mode: SliderChangeMode) => {
             this.backgroundBlur = value;
             if (mode === SliderChangeMode.End) {
@@ -1868,30 +2552,40 @@ struct Index {
       .padding({ top: 8, bottom: 8 })
     }
 
+  }
+
+  @Builder
+  private buildImagePasteSettings() {
     this.buildGroupTitle('图片粘贴')
-    Row({ space: 10 }) {
+    Row() {
       this.buildRowLabel(this.pasteDirLabel(), 'linux-share-folder')
+    }
+    .width('100%')
+    .padding({ top: 8 })
+    Row({ space: 8 }) {
       if (this.pasteDirUri.length > 0) {
         Button('恢复默认')
-          .height(30)
+          .height(36)
+          .layoutWeight(1)
           .fontSize(11.5)
-          .backgroundColor(COLOR_PANEL_2)
-          .fontColor(COLOR_KEY_TEXT)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
           .borderRadius(8)
-          .border({ width: 1, color: COLOR_PANEL_BORDER })
-          .focusable(false)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.drawerShown)
           .onClick(() => {
             this.clearPasteDirectory();
           })
       }
       Button('选择共享文件夹…')
-        .height(30)
+        .height(36)
+        .layoutWeight(2)
         .fontSize(11.5)
-        .backgroundColor(COLOR_PANEL_2)
-        .fontColor(COLOR_KEY_TEXT)
+        .backgroundColor(this.chrome.panelBg2)
+        .fontColor(this.chrome.textPrimary)
         .borderRadius(8)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
-        .focusable(false)
+        .border({ width: 1, color: this.chrome.panelBorder })
+        .focusable(this.drawerShown)
         .onClick(() => {
           void this.pickPasteDirectory();
         })
@@ -1900,7 +2594,7 @@ struct Index {
     .padding({ top: 8, bottom: 8 })
     Text('选择与 Linux 模拟机共享的目录(share 下的一级文件夹)。粘贴的截图会存入该文件夹,远端会话直接粘贴 /mnt/linux_share/<文件夹> 路径,无需上传')
       .fontSize(10.5)
-      .fontColor(COLOR_TEXT_FAINT)
+      .fontColor(this.chrome.textFaint)
       .lineHeight(15)
       .margin({ top: 2 })
   }
@@ -1912,14 +2606,14 @@ struct Index {
       this.buildRowLabel('终端字号', 'font-size')
       Row({ space: 2 }) {
         Button('−')
-          .width(28)
-          .height(28)
+          .width(36)
+          .height(36)
           .padding(0)
           .fontSize(14)
           .backgroundColor('#00000000')
-          .fontColor(COLOR_TEXT_SECONDARY)
+          .fontColor(this.chrome.textSecondary)
           .borderRadius(6)
-          .focusable(false)
+          .focusable(this.drawerShown)
           .onClick(() => {
             this.applyFontSize(this.fontSize - 1, true);
           })
@@ -1929,26 +2623,26 @@ struct Index {
           // (keyframeAnimateTo), so they flash ember and nudge up-and-back on a
           // size change. No .animation() here — the imperative tick owns them.
           .fontColor(this.fontReadoutColor)
-          .width(30)
+          .width(36)
           .textAlign(TextAlign.Center)
           .translate({ y: this.fontReadoutTickY })
         Button('+')
-          .width(28)
-          .height(28)
+          .width(36)
+          .height(36)
           .padding(0)
           .fontSize(14)
           .backgroundColor('#00000000')
-          .fontColor(COLOR_TEXT_SECONDARY)
+          .fontColor(this.chrome.textSecondary)
           .borderRadius(6)
-          .focusable(false)
+          .focusable(this.drawerShown)
           .onClick(() => {
             this.applyFontSize(this.fontSize + 1, true);
           })
       }
       .padding(2)
-      .backgroundColor(COLOR_PANEL_2)
+      .backgroundColor(this.chrome.panelBg2)
       .borderRadius(8)
-      .border({ width: 1, color: COLOR_PANEL_BORDER })
+      .border({ width: 1, color: this.chrome.panelBorder })
     }
     .width('100%')
     .padding({ top: 8, bottom: 8 })
@@ -1979,25 +2673,25 @@ struct Index {
       this.buildRowLabel('导入自定义字体', 'ttf / otf')
       if (this.customFontPath.length > 0) {
         Button('重置')
-          .height(30)
+          .height(36)
           .fontSize(11.5)
-          .backgroundColor(COLOR_PANEL_2)
-          .fontColor(COLOR_KEY_TEXT)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
           .borderRadius(8)
-          .border({ width: 1, color: COLOR_PANEL_BORDER })
-          .focusable(false)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.drawerShown)
           .onClick(() => {
             this.clearCustomFont();
           })
       }
       Button('选择文件…')
-        .height(30)
+        .height(36)
         .fontSize(11.5)
-        .backgroundColor(COLOR_PANEL_2)
-        .fontColor(COLOR_KEY_TEXT)
+        .backgroundColor(this.chrome.panelBg2)
+        .fontColor(this.chrome.textPrimary)
         .borderRadius(8)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
-        .focusable(false)
+        .border({ width: 1, color: this.chrome.panelBorder })
+        .focusable(this.drawerShown)
         .onClick(() => {
           void this.pickCustomFont();
         })
@@ -2006,85 +2700,138 @@ struct Index {
     .margin({ top: 14 })
   }
 
+  // App appearance mode: follow the OS, or pin dark/light manually.
+  @Builder
+  private buildColorModeButton(label: string, mode: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.colorModeOverride === mode ? this.chrome.textPrimary : this.chrome.textSecondary)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .padding({ top: 6, bottom: 6 })
+      .borderRadius(6)
+      .backgroundColor(this.colorModeOverride === mode ? this.chrome.panelBg2 : '#00000000')
+      .border({
+        width: 1,
+        color: this.colorModeOverride === mode ? this.chrome.panelBorder : '#00000000'
+      })
+      .onClick(() => {
+        this.applyColorModeOverride(mode);
+      })
+  }
+
+  // Ghostty theme = light:...,dark:... — the pane edits one slot at a time and
+  // shows that slot's theme as selected in the catalogue below.
+  @Builder
+  private buildThemeSlotButton(label: string, slot: string) {
+    Column({ space: 3 }) {
+      Text(label)
+        .fontSize(12)
+        .fontColor(this.themeEditSlot === slot ? this.chrome.textPrimary : this.chrome.textSecondary)
+      Text(slot === 'dark' ? this.darkThemeName : this.lightThemeName)
+        .fontSize(9.5)
+        .fontColor(this.chrome.textFaint)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .alignItems(HorizontalAlign.Center)
+    .layoutWeight(1)
+    .padding({ top: 6, bottom: 6 })
+    .borderRadius(6)
+    .backgroundColor(this.themeEditSlot === slot ? this.chrome.panelBg2 : '#00000000')
+    .border({
+      width: 1,
+      color: this.themeEditSlot === slot ? this.chrome.panelBorder : '#00000000'
+    })
+    .onClick(() => {
+      if (this.themeEditSlot !== slot) {
+        this.themeEditSlot = slot;
+        this.syncThemeOptionSelection();
+      }
+    })
+  }
+
   @Builder
   private buildThemePane() {
-    Column({ space: 10 }) {
-      TextInput({ text: this.themeFilter, placeholder: '搜索主题…' })
-        .height(36)
-        .fontSize(12.5)
-        .fontColor(COLOR_TEXT_PRIMARY)
-        .backgroundColor(COLOR_PANEL_2)
-        .borderRadius(8)
-        .onChange((value: string) => {
-          this.themeFilter = value;
-        })
-
-      List({ space: 2 }) {
-        ForEach(this.filteredThemes(), (theme: string) => {
-          ListItem() {
-            this.buildThemeRow(theme)
-          }
-        }, (theme: string) => theme)
+    List({ space: 2 }) {
+      ListItem() {
+        Column() {
+          this.buildAppearancePane()
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .padding({ left: 14, right: 14 })
       }
-      .width('100%')
-      .layoutWeight(1)
-      .scrollBar(BarState.Auto)
+
+      ListItem() {
+        Column() {
+          this.buildGroupTitle('主题')
+          Row({ space: 2 }) {
+            this.buildColorModeButton('跟随系统', 'system')
+            this.buildColorModeButton('深色', 'dark')
+            this.buildColorModeButton('浅色', 'light')
+          }
+          .width('100%')
+          .margin({ bottom: 6 })
+          Row({ space: 2 }) {
+            this.buildThemeSlotButton('深色模式', 'dark')
+            this.buildThemeSlotButton('浅色模式', 'light')
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
+          TextInput({ text: this.themeFilter, placeholder: '搜索主题…' })
+            .height(36)
+            .fontSize(12.5)
+            .fontColor(this.chrome.textPrimary)
+            .backgroundColor(this.chrome.panelBg2)
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.themeFilter = value;
+              this.themeRenderLimit = THEME_PREVIEW_BATCH_SIZE;
+              void this.loadThemePreviews(
+                this.renderedThemeOptions().map((option: ThemeOptionState) => option.name));
+            })
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .padding({ left: 14, right: 14, bottom: 8 })
+      }
+
+      ForEach(this.renderedThemeOptions(), (option: ThemeOptionState) => {
+        ListItem() {
+          ThemeOptionRow({
+            option: option,
+            canFocus: this.drawerShown,
+            onSelect: (theme: string) => {
+              this.applyTheme(theme);
+            }
+          })
+        }
+        .padding({ left: 14, right: 14 })
+      }, (option: ThemeOptionState) => option.name)
     }
     .layoutWeight(1)
     .width('100%')
     .height('100%')
-    .padding({ left: 14, right: 14, top: 14, bottom: 14 })
-  }
-
-  @Builder
-  private buildThemeRow(theme: string) {
-    Row({ space: 12 }) {
-      Stack() {
-        Text('Aa')
-          .fontSize(12)
-          .fontColor(this.themePreviewFg(theme))
+    .padding({ top: 4, bottom: 14 })
+    .scrollBar(BarState.Auto)
+    .onScrollIndex((_start: number, end: number, _center: number) => {
+      const options: ThemeOptionState[] = this.filteredThemeOptions();
+      const renderedCount: number = Math.min(options.length, this.themeRenderLimit);
+      const nextThemeIndex: number = Math.max(0, end - 1);
+      void this.loadThemePreviews(
+        options.slice(nextThemeIndex, nextThemeIndex + THEME_PREVIEW_BATCH_SIZE)
+          .map((option: ThemeOptionState) => option.name));
+      if (nextThemeIndex + 8 >= renderedCount && renderedCount < options.length) {
+        const nextLimit: number = Math.min(
+          options.length,
+          renderedCount + THEME_PREVIEW_BATCH_SIZE
+        );
+        this.themeRenderLimit = nextLimit;
+        void this.loadThemePreviews(
+          options.slice(renderedCount, nextLimit)
+            .map((option: ThemeOptionState) => option.name));
       }
-      .width(52)
-      .height(32)
-      .borderRadius(7)
-      .backgroundColor(this.themePreviewBg(theme))
-      .border({ width: 1, color: '#14FFFFFF' })
-
-      Column({ space: 4 }) {
-        Text(theme.split('_').join(' '))
-          .fontSize(12.5)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Row({ space: 3 }) {
-          ForEach(this.themePreviewAnsi(theme), (dotColor: string, idx: number) => {
-            Circle({ width: 7, height: 7 })
-              .fill(dotColor)
-          }, (dotColor: string, idx: number) => `${theme}-${idx}`)
-        }
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-
-      Row()
-        .width(14)
-        .height(2)
-        .borderRadius(1)
-        .backgroundColor(theme === this.themeName ? COLOR_EMBER : '#00000000')
-        .shadow(theme === this.themeName
-          ? { radius: 6, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 }
-          : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-        // M06 selected-filament: fade the copper + glow.
-        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
-    }
-    .width('100%')
-    .padding({ left: 8, right: 10, top: 6, bottom: 6 })
-    .borderRadius(9)
-    .backgroundColor(theme === this.themeName ? COLOR_PANEL_2 : '#00000000')
-    // M07 selected-face: fast face settle ahead of the filament.
-    .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
-    .onClick(() => {
-      this.applyTheme(theme);
     })
   }
 
@@ -2093,82 +2840,96 @@ struct Index {
     Text(DEFAULT_FUSION_ENGINE_VM_LABEL)
       .fontSize(15)
       .fontWeight(FontWeight.Medium)
-      .fontColor(COLOR_TEXT_PRIMARY)
+      .fontColor(this.chrome.textPrimary)
       .margin({ top: 16 })
       .maxLines(1)
       .textOverflow({ overflow: TextOverflow.Ellipsis })
 
-    Row({ space: 8 }) {
-      Row()
-        .width(22)
-        .height(2)
-        .borderRadius(1)
-        .backgroundColor(this.activeConnLit() ? COLOR_EMBER : COLOR_ASH)
-        .shadow(this.activeConnLit()
-          ? { radius: 6, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 }
-          : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-        // M06 selected-filament: fade the copper + glow between states.
-        .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
-        // M09 connecting-breath: after .animation() so only the gated loop drives it.
-        .opacity(this.activeConnPending() ? this.connBreatheOpacity : 1)
-      Text(this.activeConnStatusText())
-        .fontSize(11.5)
-        .fontColor(COLOR_TEXT_SECONDARY)
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        Row()
+          .width(22)
+          .height(2)
+          .borderRadius(1)
+          .backgroundColor(this.activeConnLit() ? this.chrome.dotOn : this.chrome.dotOff)
+          // Neutral status bar fade between states.
+          .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
+          // M09 connecting-breath: after .animation() so only the gated loop drives it.
+          .opacity(this.activeConnPending() ? this.connBreatheOpacity : 1)
+        Text(this.activeConnStatusText())
+          .fontSize(11.5)
+          .fontColor(this.chrome.textSecondary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      Text(`ws://${this.draftHost}:${this.draftPort}${DEFAULT_FUSION_AGENT_PATH}`)
+        .fontSize(10.5)
+        .fontColor(this.chrome.textFaint)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .layoutWeight(1)
+        .width('100%')
     }
     .width('100%')
     .padding(10)
-    .backgroundColor(COLOR_PANEL_2)
+    .backgroundColor(this.chrome.panelBg2)
     .borderRadius(8)
     .margin({ top: 16, bottom: 6 })
 
-    Text('主机')
-      .fontSize(11.5)
-      .fontColor(COLOR_TEXT_SECONDARY)
-      .margin({ top: 8, bottom: 4 })
-    TextInput({ text: this.draftHost, placeholder: '172.16.100.2' })
-      .height(40)
-      .fontSize(13)
-      .fontColor(COLOR_TEXT_PRIMARY)
-      .backgroundColor(COLOR_PANEL_2)
-      .borderRadius(8)
-      .onChange((value: string) => {
-        this.draftHost = value;
-      })
+    if (this.activeConnFailed()) {
+      Button(this.connectionErrorDetailsOpen ? '收起详细信息' : '详细信息')
+        .height(36)
+        .width('100%')
+        .fontSize(12)
+        .backgroundColor('#00000000')
+        .fontColor(this.chrome.textSecondary)
+        .borderRadius(6)
+        .focusable(this.drawerShown)
+        .onClick(() => {
+          this.connectionErrorDetailsOpen = !this.connectionErrorDetailsOpen;
+        })
+      if (this.connectionErrorDetailsOpen) {
+        Text(this.activeSession().statusLabel)
+          .fontSize(10.5)
+          .fontColor(this.chrome.textFaint)
+          .lineHeight(15)
+          .width('100%')
+          .padding({ top: 4, bottom: 4 })
+      }
+    }
 
+    this.buildGroupTitle('Fusion Agent')
     Row({ space: 10 }) {
       Column({ space: 4 }) {
-        Text('Agent 端口')
+        Text('主机')
           .fontSize(11.5)
-          .fontColor(COLOR_TEXT_SECONDARY)
-        TextInput({ text: this.draftPort, placeholder: '端口' })
+          .fontColor(this.chrome.textSecondary)
+        TextInput({ text: this.draftHost, placeholder: '172.16.100.2' })
           .height(40)
           .fontSize(13)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .backgroundColor(COLOR_PANEL_2)
+          .fontColor(this.chrome.textPrimary)
+          .backgroundColor(this.chrome.panelBg2)
+          .borderRadius(8)
+          .onChange((value: string) => {
+            this.draftHost = value;
+          })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(2)
+      Column({ space: 4 }) {
+        Text('端口')
+          .fontSize(11.5)
+          .fontColor(this.chrome.textSecondary)
+        TextInput({ text: this.draftPort, placeholder: '8765' })
+          .height(40)
+          .fontSize(13)
+          .fontColor(this.chrome.textPrimary)
+          .backgroundColor(this.chrome.panelBg2)
           .borderRadius(8)
           .type(InputType.Number)
           .onChange((value: string) => {
             this.draftPort = value;
-          })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      Column({ space: 4 }) {
-        Text('SSH 端口')
-          .fontSize(11.5)
-          .fontColor(COLOR_TEXT_SECONDARY)
-        TextInput({ text: this.draftSshPort, placeholder: '22' })
-          .height(40)
-          .fontSize(13)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .backgroundColor(COLOR_PANEL_2)
-          .borderRadius(8)
-          .type(InputType.Number)
-          .onChange((value: string) => {
-            this.draftSshPort = value;
           })
       }
       .alignItems(HorizontalAlign.Start)
@@ -2179,117 +2940,150 @@ struct Index {
 
     Text('访问令牌')
       .fontSize(11.5)
-      .fontColor(COLOR_TEXT_SECONDARY)
+      .fontColor(this.chrome.textSecondary)
       .margin({ top: 10, bottom: 4 })
     TextInput({ text: this.draftAgentToken, placeholder: '令牌' })
       .height(40)
       .fontSize(13)
-      .fontColor(COLOR_TEXT_PRIMARY)
-      .backgroundColor(COLOR_PANEL_2)
+      .fontColor(this.chrome.textPrimary)
+      .backgroundColor(this.chrome.panelBg2)
       .borderRadius(8)
       .type(InputType.Password)
       .onChange((value: string) => {
         this.draftAgentToken = value;
       })
 
-    Row({ space: 10 }) {
-      Column({ space: 4 }) {
-        Text('SSH 用户')
-          .fontSize(11.5)
-          .fontColor(COLOR_TEXT_SECONDARY)
-        TextInput({ text: this.draftUser, placeholder: '用户名' })
-          .height(40)
-          .fontSize(13)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .backgroundColor(COLOR_PANEL_2)
-          .borderRadius(8)
-          .onChange((value: string) => {
-            this.draftUser = value;
-          })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      Column({ space: 4 }) {
-        Text('SSH 密码(不保存)')
-          .fontSize(11.5)
-          .fontColor(COLOR_TEXT_SECONDARY)
-        TextInput({ text: this.draftPassword, placeholder: '密码' })
-          .height(40)
-          .fontSize(13)
-          .fontColor(COLOR_TEXT_PRIMARY)
-          .backgroundColor(COLOR_PANEL_2)
-          .borderRadius(8)
-          .type(InputType.Password)
-          .onChange((value: string) => {
-            this.draftPassword = value;
-          })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-    }
-    .width('100%')
-    .margin({ top: 10 })
+    Button(this.agentActionLabel())
+      .height(40)
+      .width('100%')
+      .fontSize(13)
+      .fontWeight(FontWeight.Medium)
+      .backgroundColor(this.chrome.primaryBtnBg)
+      .fontColor(this.chrome.primaryBtnText)
+      .borderRadius(8)
+      .enabled(!this.activeConnPending())
+      .stateStyles({
+        pressed: {
+          .opacity(0.82)
+        }
+      })
+      .focusable(this.drawerShown)
+      .onClick(() => {
+        this.connectionErrorDetailsOpen = false;
+        this.connectFusionAgent();
+      })
+      .margin({ top: 16 })
 
-    Row({ space: 8 }) {
-      Button('连接 Agent')
+    Button(this.connectionAdvancedOpen ? '收起高级选项' : '高级选项')
+      .height(36)
+      .width('100%')
+      .fontSize(12)
+      .backgroundColor('#00000000')
+      .fontColor(this.chrome.textSecondary)
+      .borderRadius(6)
+      .focusable(this.drawerShown)
+      .onClick(() => {
+        this.connectionAdvancedOpen = !this.connectionAdvancedOpen;
+      })
+      .margin({ top: 8 })
+
+    if (this.connectionAdvancedOpen) {
+      this.buildGroupTitle('SSH 与本地')
+      Row({ space: 10 }) {
+        Column({ space: 4 }) {
+          Text('SSH 端口')
+            .fontSize(11.5)
+            .fontColor(this.chrome.textSecondary)
+          TextInput({ text: this.draftSshPort, placeholder: '22' })
+            .height(40)
+            .fontSize(13)
+            .fontColor(this.chrome.textPrimary)
+            .backgroundColor(this.chrome.panelBg2)
+            .borderRadius(8)
+            .type(InputType.Number)
+            .onChange((value: string) => {
+              this.draftSshPort = value;
+            })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        Column({ space: 4 }) {
+          Text('SSH 用户')
+            .fontSize(11.5)
+            .fontColor(this.chrome.textSecondary)
+          TextInput({ text: this.draftUser, placeholder: '用户名' })
+            .height(40)
+            .fontSize(13)
+            .fontColor(this.chrome.textPrimary)
+            .backgroundColor(this.chrome.panelBg2)
+            .borderRadius(8)
+            .onChange((value: string) => {
+              this.draftUser = value;
+            })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+      }
+      .width('100%')
+
+      Text('SSH 密码(不保存)')
+        .fontSize(11.5)
+        .fontColor(this.chrome.textSecondary)
+        .margin({ top: 10, bottom: 4 })
+      TextInput({ text: this.draftPassword, placeholder: '密码' })
         .height(40)
-        .layoutWeight(2)
         .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .backgroundColor(COLOR_EMBER)
-        .fontColor('#1A0F05')
-        .borderRadius(9)
-        // M27: the sole ember action button sinks slightly on press,
-        // reinforcing "copper = executable". Opacity only, never scale.
-        .stateStyles({
-          pressed: {
-            .opacity(0.82)
-          }
+        .fontColor(this.chrome.textPrimary)
+        .backgroundColor(this.chrome.panelBg2)
+        .borderRadius(8)
+        .type(InputType.Password)
+        .onChange((value: string) => {
+          this.draftPassword = value;
         })
-        .focusable(false)
-        .onClick(() => {
-          this.connectFusionAgent();
-        })
-      Button('SSH 备用')
-        .height(40)
-        .layoutWeight(1)
-        .fontSize(12)
-        .backgroundColor(COLOR_PANEL_2)
-        .fontColor(COLOR_KEY_TEXT)
-        .borderRadius(9)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
-        .focusable(false)
-        .onClick(() => {
-          this.connectFusionVm();
-        })
-      Button('本地')
-        .height(40)
-        .layoutWeight(1)
-        .fontSize(12)
-        .backgroundColor(COLOR_PANEL_2)
-        .fontColor(COLOR_KEY_TEXT)
-        .borderRadius(9)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
-        .focusable(false)
-        .onClick(() => {
-          this.drawerOpen = false;
-          this.startLocalSession();
-          this.focusActiveTerminalSoon();
-        })
+
+      Row({ space: 8 }) {
+        Button('SSH 备用')
+          .height(40)
+          .layoutWeight(1)
+          .fontSize(12)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
+          .borderRadius(8)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.drawerShown)
+          .onClick(() => {
+            this.connectFusionVm();
+          })
+        Button('本地 shell')
+          .height(40)
+          .layoutWeight(1)
+          .fontSize(12)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
+          .borderRadius(8)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.drawerShown)
+          .onClick(() => {
+            this.closeDrawer();
+            this.startLocalSession();
+          })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+
+      this.buildImagePasteSettings()
     }
-    .width('100%')
-    .margin({ top: 18 })
   }
 
   @Builder
   private buildKbd(label: string) {
     Text(label)
       .fontSize(10.5)
-      .fontColor(COLOR_TEXT_PRIMARY)
+      .fontColor(this.chrome.textPrimary)
       .padding({ left: 6, right: 6, top: 3, bottom: 3 })
-      .backgroundColor(COLOR_PANEL_2)
+      .backgroundColor(this.chrome.panelBg2)
       .borderRadius(5)
-      .border({ width: 1, color: COLOR_PANEL_BORDER })
+      .border({ width: 1, color: this.chrome.panelBorder })
   }
 
   @Builder
@@ -2302,7 +3096,7 @@ struct Index {
       }
       Text(desc)
         .fontSize(12)
-        .fontColor(COLOR_TEXT_SECONDARY)
+        .fontColor(this.chrome.textSecondary)
         .layoutWeight(1)
         .textAlign(TextAlign.End)
     }
@@ -2315,10 +3109,10 @@ struct Index {
     Column({ space: 3 }) {
       Text(action)
         .fontSize(12.5)
-        .fontColor(COLOR_TEXT_PRIMARY)
+        .fontColor(this.chrome.textPrimary)
       Text(detail)
         .fontSize(11)
-        .fontColor(COLOR_TEXT_SECONDARY)
+        .fontColor(this.chrome.textSecondary)
         .lineHeight(16)
     }
     .alignItems(HorizontalAlign.Start)
@@ -2328,6 +3122,9 @@ struct Index {
 
   @Builder
   private buildHelpPane() {
+    this.buildGroupTitle('Emberline')
+    this.buildHelpRow('HarmonyOS 开发终端', 'Fusion Agent 是首选连接;SSH 与本地 shell 保留为高级备用路径')
+
     this.buildGroupTitle('键盘快捷键')
     this.buildShortcutRow('Ctrl Shift C', '复制选中内容')
     this.buildShortcutRow('Ctrl Insert', '复制选中内容')
@@ -2335,19 +3132,20 @@ struct Index {
     this.buildShortcutRow('Shift Insert', '粘贴')
     Text('Ctrl+C 保持终端中断语义,不会被复制占用')
       .fontSize(10.5)
-      .fontColor(COLOR_TEXT_FAINT)
+      .fontColor(this.chrome.textFaint)
       .margin({ top: 4 })
 
     this.buildGroupTitle('标签页')
-    this.buildHelpRow('右键标签', '标签设置:重命名、灯丝颜色、图片粘贴视角;触屏长按同效')
-    this.buildHelpRow('底部灯丝', '亮 = 已连接;半亮 = 正在连接或重连;灰 = 已断开')
+    this.buildHelpRow('右键标签', '标签设置:重命名、图片粘贴视角;触屏双击同效')
+    this.buildHelpRow('拖动排序', '横向拖动标签即可排序;触屏长按拿起同效')
+    this.buildHelpRow('多窗口', '右键标签「拆分为新窗口/移动到窗口…」跨窗口搬移会话;唯一标签移走后原窗口自动关闭')
+    this.buildHelpRow('状态圆点', '实心 = 已连接;呼吸 = 正在连接或重连;空心 = 已断开;红 = 连接失败')
     this.buildHelpRow('关闭标签', '只断开本地连接,不会打断远端 tmux 或正在运行的程序')
 
     this.buildGroupTitle('触屏手势')
     this.buildHelpRow('单指滑动', '滚动回看,带惯性;轻点呼出键盘或打开链接')
     this.buildHelpRow('长按拖动', '选择文字;选中后右键菜单里复制')
     this.buildHelpRow('鼠标模式(tmux / vim)', '轻点 = 点击;长按后拖 = 拖拽,可以拖动 tmux 分栏;滑动 = 滚轮')
-    this.buildHelpRow('辅助键条', '顶栏键盘图标呼出 Esc / Tab / ^C 中断 / 复制 / 粘贴 / 方向键,一键直达')
 
     this.buildGroupTitle('连接')
     this.buildHelpRow('自动连接', '启动或新建标签时自动连上次保存的 Agent;手动选择传输后该标签不再自动连')
@@ -2355,58 +3153,97 @@ struct Index {
     this.buildHelpRow('远程复制', '远端程序可通过 OSC 52(如 tmux set-clipboard)直接写入系统剪贴板')
     this.buildHelpRow('图片粘贴视角', '在会话里手动 ssh 到别的机器后,右键标签把粘贴视角切到「上传」或「中继」,路径才对目标机器有效')
 
+    this.buildGroupTitle('Codex 任务提醒')
+    this.buildHelpRow('系统通知', this.taskNotificationStatus)
+    Button(this.taskNotificationActionLabel())
+      .width(120)
+      .height(40)
+      .fontSize(12)
+      .fontWeight(FontWeight.Medium)
+      .backgroundColor(this.taskNotificationEnabled ? this.chrome.panelBg2 : this.chrome.primaryBtnBg)
+      .fontColor(this.taskNotificationEnabled ? this.chrome.textPrimary : this.chrome.primaryBtnText)
+      .borderRadius(8)
+      .border({
+        width: this.taskNotificationEnabled ? 1 : 0,
+        color: this.taskNotificationEnabled ? this.chrome.panelBorder : '#00000000'
+      })
+      .stateStyles({
+        pressed: {
+          .opacity(0.82)
+        }
+      })
+      .enabled(!this.taskNotificationBusy)
+      .focusable(this.agentGuideOpen)
+      .onClick(() => {
+        void this.enableAndTestTaskNotification();
+      })
+    this.buildHelpRow('Codex CLI', '在虚拟机的 ~/.codex/config.toml 中启用完成事件的 OSC 9 通道。若已有 [tui] 段,只合并下面三项,不要重复表头。保存配置后先退出当前 Codex,再从 shell 恢复会话,让新进程读取通知设置。')
+    this.buildGuideCommand('mkdir -p ~/.codex && ${EDITOR:-vi} ~/.codex/config.toml')
+    this.buildGuideCommand(CODEX_TASK_NOTIFICATION_CONFIG)
+    this.buildGuideCommand('codex resume --last')
+    this.buildHelpRow('tmux', '在 tmux 内运行 Codex 时必须允许 passthrough,否则 tmux 会吞掉完成事件。下面的命令会幂等写入 ~/.tmux.conf 并立即重新加载。')
+    this.buildGuideCommand(CODEX_TMUX_NOTIFICATION_SETUP_COMMAND)
+    this.buildHelpRow('链路自检', '运行下面的延迟命令,并在 5 秒内切到其他标签或把应用退到后台;它会验证终端输出到 Emberline 系统通知的整条 OSC 9 链路')
+    this.buildGuideCommand(CODEX_TASK_NOTIFICATION_TEST_COMMAND)
+    this.buildHelpRow('手表同步', 'Emberline 发布的是 HarmonyOS 系统通知;已配对手表能否收到由系统跨设备通知设置和设备支持决定')
+
+    this.buildGroupTitle('诊断')
+    this.buildHelpRow('当前会话', this.activeConnStatusText())
+    this.buildHelpRow('Agent 端点', `ws://${this.draftHost}:${this.draftPort}${DEFAULT_FUSION_AGENT_PATH}`)
+
     this.buildGroupTitle('部署 wand-agent(Agent 会话)')
     this.buildAgentGuideContent()
 
     this.buildGroupTitle('主题与字体')
     this.buildHelpRow('ghostty 键名', '设置项下方的灰色小字是对应的 ghostty 配置键,便于对照 ghostty 文档')
-    this.buildHelpRow('自定义字体', '字体页可导入 ttf / otf 文件,导入后自动切换到「自定义」')
+    this.buildHelpRow('自定义字体', '检查器「终端」可导入 ttf / otf 文件,导入后自动切换到「自定义」')
   }
 
-  // Shared by the first-launch overlay and the drawer help pane so the
-  // walkthrough never forks: the full "install + run wand-agent in the Fusion
-  // VM" tutorial (source or prebuilt install, trial run, systemd unit,
-  // app-side connect). Commands are long-press copyable.
+  // Shared deploy walkthrough used by the one-shot first-launch prompt and the
+  // permanent Help & Diagnostics surface.
   @Builder
   private buildAgentGuideContent() {
     Text('Agent 会话面向融合开发引擎的 Linux 虚拟机:虚拟机里常驻一个 wand-agent,应用经 WebSocket 直连它的伪终端。SSH 与本地 shell 无需以下步骤。长按命令可复制。')
       .fontSize(11)
-      .fontColor(COLOR_TEXT_SECONDARY)
+      .fontColor(this.chrome.textSecondary)
       .lineHeight(16)
       .width('100%')
       .padding({ top: 4, bottom: 4 })
 
     this.buildHelpRow('第 1 步 · 进入虚拟机', '打开融合开发引擎的 Linux 虚拟机终端(或任何能进入虚拟机 shell 的方式),以下命令都在虚拟机里执行')
 
-    this.buildHelpRow('第 2 步 · 安装 wand-agent', '方式一,源码构建(需要 Go 1.21 及以上):')
-    this.buildGuideCommand('git clone https://github.com/beforeugone520/wand-agent.git\ncd wand-agent\ngo build -o wand-agent .\ninstall -m 755 wand-agent /usr/local/bin/')
-    Text('方式二,预构建二进制:把 wand-agent 经共享目录拷进虚拟机,再执行:')
+    this.buildHelpRow('第 2 步 · 一行安装并启动', '需要 Node.js 16 或以上。以下任选一条:Go 缺失或版本过旧时会自动下载带 SHA-256 校验的工具链,然后编译 Agent、注册 systemd 并立即启动:')
+    this.buildGuideCommand('pnpm add -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('npm install -g github:beforeugone520/wand-agent && wand-agent service install --host 172.16.100.2 --token harmonyterm')
+    this.buildGuideCommand('curl -fsSL https://raw.githubusercontent.com/beforeugone520/Emberline/main/tools/install-wand-agent.sh | sh -s -- --host 172.16.100.2 --token harmonyterm')
+    Text('省略 --host 会自动探测桥接地址;省略 --token 会生成随机 token。末尾加 --dry-run 可先预览,不写文件也不启动服务。')
       .fontSize(11)
-      .fontColor(COLOR_TEXT_SECONDARY)
+      .fontColor(this.chrome.textSecondary)
       .lineHeight(16)
       .padding({ top: 2 })
-    this.buildGuideCommand('install -m 755 wand-agent /usr/local/bin/')
 
-    this.buildHelpRow('第 3 步 · 试运行', '--host 填虚拟机桥接网卡地址(融合引擎通常是 172.16.100.2),--token 是鉴权令牌,应用侧需填一致:')
-    this.buildGuideCommand('wand-agent --host 172.16.100.2 --token 你的token')
-    Text('默认监听 8765 端口、路径 /ws。前台跑通即可先做第 5 步连一次。')
-      .fontSize(10.5)
-      .fontColor(COLOR_TEXT_FAINT)
-      .lineHeight(15)
+    this.buildHelpRow('第 3 步 · 检查服务', '安装器会输出 Emberline 要填的端点和 token;token 保存在 0600 EnvironmentFile,不会出现在 ps 命令行中:')
+    this.buildGuideCommand('sudo systemctl status wand-agent --no-pager\nsudo journalctl -u wand-agent -f')
 
-    this.buildHelpRow('第 4 步 · 开机常驻(推荐)', '把 agent 改为 systemd 服务,先写入 /etc/systemd/system/wand-agent.service:')
+    this.buildHelpRow('手动 systemd 模板(备用)', '一行安装器已自动完成以下配置,只在需要手工排查时使用:')
     this.buildGuideCommand(AGENT_GUIDE_SERVICE_UNIT)
-    Text('然后启用:')
-      .fontSize(11)
-      .fontColor(COLOR_TEXT_SECONDARY)
-      .padding({ top: 2 })
-    this.buildGuideCommand('systemctl daemon-reload && systemctl enable --now wand-agent')
 
-    this.buildHelpRow('第 5 步 · 回到应用连接', '侧栏「连接」页填入地址与 token(默认 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
+    this.buildHelpRow('第 4 步 · 回到应用连接', '检查器「连接」页填入安装器输出的地址与 token(默认示例 ws://172.16.100.2:8765/ws),点「连接 Agent」;应用会记住端点,之后启动与新建标签都会自动连接')
+
+    this.buildHelpRow('已有安装 · 更新 wand-agent', '初次安装可跳过。先任选一条更新全局包,再执行公共更新命令。服务使用的是与全局包分离的稳定二进制,所以只更新 pnpm/npm 包不会更新正在运行的 Agent。此方法保留现有 token、监听地址与 shell 配置。')
+    this.buildGuideCommand('pnpm add -g github:beforeugone520/wand-agent')
+    this.buildGuideCommand('npm install -g github:beforeugone520/wand-agent')
+    this.buildGuideCommand(AGENT_GUIDE_UPDATE_COMMAND)
+    Text('更新警告:重启会断开所有 Agent WebSocket,并终止未放在 tmux 中的直连任务。请先结束这些任务或把长期任务放入 tmux。')
+      .fontSize(10.5)
+      .fontColor(this.chrome.textFaint)
+      .lineHeight(15)
+      .width('100%')
+      .padding({ top: 2, bottom: 4 })
 
     Text('安全提示:token 鉴权面向可信的虚拟机桥接网络;若把 agent 暴露到桥接网络之外,请更换强随机 token 并用防火墙限制来源。')
       .fontSize(10.5)
-      .fontColor(COLOR_TEXT_FAINT)
+      .fontColor(this.chrome.textFaint)
       .lineHeight(15)
       .width('100%')
       .padding({ top: 4 })
@@ -2416,14 +3253,14 @@ struct Index {
   private buildGuideCommand(cmd: string) {
     Text(cmd)
       .fontSize(10.5)
-      .fontColor(COLOR_KEY_TEXT)
+      .fontColor(this.chrome.textPrimary)
       .lineHeight(16)
       .copyOption(CopyOptions.LocalDevice)
       .width('100%')
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-      .backgroundColor(COLOR_PANEL_2)
+      .backgroundColor(this.chrome.panelBg2)
       .borderRadius(8)
-      .border({ width: 1, color: COLOR_PANEL_BORDER })
+      .border({ width: 1, color: this.chrome.panelBorder })
       .margin({ top: 2, bottom: 4 })
   }
 
@@ -2432,8 +3269,7 @@ struct Index {
     Column()
       .width('100%')
       .height('100%')
-      .backgroundColor('#80020305')
-      .transition(TransitionEffect.OPACITY.animation({ duration: DUR_STANDARD, curve: CURVE_DECEL }))
+      .backgroundColor('#00000000')
       .onClick(() => {
         this.dismissAgentGuide();
       })
@@ -2442,15 +3278,19 @@ struct Index {
   @Builder
   private buildAgentGuidePanel() {
     Column({ space: 12 }) {
-      Text('快速开始:连接融合引擎虚拟机')
+      Text(this.agentGuideMode === 'onboarding' ? '连接融合开发引擎' : '帮助与诊断')
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT_PRIMARY)
+        .fontColor(this.chrome.textPrimary)
         .width('100%')
 
       Scroll() {
         Column() {
-          this.buildAgentGuideContent()
+          if (this.agentGuideMode === 'onboarding') {
+            this.buildAgentGuideContent()
+          } else {
+            this.buildHelpPane()
+          }
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
@@ -2460,36 +3300,69 @@ struct Index {
       .layoutWeight(1)
       .width('100%')
 
-      Row({ space: 8 }) {
-        Text('之后可在 侧栏 → 帮助 里随时查看')
+      if (this.agentGuideMode === 'onboarding') {
+        Text('以后可从顶栏更多菜单重新打开')
           .fontSize(10.5)
-          .fontColor(COLOR_TEXT_FAINT)
+          .fontColor(this.chrome.textFaint)
+          .width('100%')
+      }
+
+      Row({ space: 8 }) {
+        if (this.agentGuideMode !== 'onboarding') {
+          Text('顶栏更多菜单可随时重新打开')
+            .fontSize(10.5)
+            .fontColor(this.chrome.textFaint)
+        }
         Blank()
-        Button('开始使用')
-          .height(34)
+        if (this.agentGuideMode === 'onboarding') {
+          Button('打开连接设置')
+            .height(40)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .backgroundColor(this.chrome.primaryBtnBg)
+            .fontColor(this.chrome.primaryBtnText)
+            .borderRadius(8)
+            .stateStyles({
+              pressed: {
+                .opacity(0.82)
+              }
+            })
+            .focusable(this.agentGuideOpen)
+            .onClick(() => {
+              this.dismissAgentGuide();
+              this.openDrawer('conn');
+            })
+        }
+        Button('关闭')
+          .height(40)
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
-          .backgroundColor(COLOR_EMBER)
-          .fontColor('#1A0F05')
+          .backgroundColor(this.agentGuideMode === 'onboarding' ? this.chrome.panelBg2 : this.chrome.primaryBtnBg)
+          .fontColor(this.agentGuideMode === 'onboarding' ? this.chrome.textPrimary : this.chrome.primaryBtnText)
           .borderRadius(8)
+          .border({
+            width: this.agentGuideMode === 'onboarding' ? 1 : 0,
+            color: this.agentGuideMode === 'onboarding' ? this.chrome.panelBorder : '#00000000'
+          })
           .stateStyles({
             pressed: {
               .opacity(0.82)
             }
           })
-          .focusable(false)
+          .id('workbenchHelpCloseAction')
+          .focusable(this.agentGuideOpen)
           .onClick(() => {
             this.dismissAgentGuide();
           })
       }
       .width('100%')
     }
-    .width(480)
+    .width(this.dialogWidth(480))
     .height('78%')
     .padding(18)
-    .backgroundColor(COLOR_PANEL_BG)
-    .borderRadius(14)
-    .border({ width: 1, color: COLOR_PANEL_BORDER })
+    .backgroundColor(this.chrome.panelBg)
+    .borderRadius(8)
+    .border({ width: 1, color: this.chrome.panelBorder })
     .shadow({ radius: 28, color: '#B3000000', offsetX: 0, offsetY: 12 })
     .transition(TransitionEffect.asymmetric(
       TransitionEffect.OPACITY
@@ -2500,28 +3373,9 @@ struct Index {
     ))
   }
 
-  // First launch only: pop the deploy guide once. The flag lives in its own
-  // tiny preferences store so clearing connection/appearance settings never
-  // re-triggers onboarding.
-  private async loadOnboarding(): Promise<void> {
-    if (!this.context) {
-      return;
-    }
-    try {
-      const seen = await this.onboardingStore.load(this.context);
-      if (!seen) {
-        this.agentGuideOpen = true;
-      }
-    } catch (err) {
-      console.error('Failed to load onboarding state: ' + JSON.stringify(err));
-    }
-  }
-
   private dismissAgentGuide(): void {
     this.agentGuideOpen = false;
-    this.onboardingStore.markSeen().catch((err: Object) => {
-      console.error('Failed to persist onboarding state: ' + JSON.stringify(err));
-    });
+    this.focusActiveTerminalSoon();
   }
 
   @Builder
@@ -2529,8 +3383,7 @@ struct Index {
     Column()
       .width('100%')
       .height('100%')
-      .backgroundColor('#80020305')
-      .transition(TransitionEffect.OPACITY.animation({ duration: DUR_STANDARD, curve: CURVE_DECEL }))
+      .backgroundColor('#00000000')
       .onClick(() => {
         this.commitTabEditor();
       })
@@ -2539,14 +3392,14 @@ struct Index {
   @Builder
   private buildPasteModeButton(label: string, mode: string) {
     Button(label)
-      .height(28)
+      .height(36)
       .layoutWeight(1)
       .padding(0)
       .fontSize(11.5)
       .backgroundColor(this.editingPasteMode === mode ? '#1A212C' : '#00000000')
-      .fontColor(this.editingPasteMode === mode ? COLOR_TEXT_PRIMARY : COLOR_TEXT_SECONDARY)
+      .fontColor(this.editingPasteMode === mode ? this.chrome.textPrimary : this.chrome.textSecondary)
       .borderRadius(6)
-      .focusable(false)
+      .focusable(this.tabEditOpen)
       .onClick(() => {
         this.editingPasteMode = mode;
         if (this.editingSession) {
@@ -2555,53 +3408,30 @@ struct Index {
       })
   }
 
-  // Tab editor (right-click a tab -> 标签设置): rename, filament color, paste mode.
+  // Tab editor (right-click a tab -> 标签设置): rename and paste mode.
   @Builder
   private buildTabEditor() {
     Column({ space: 14 }) {
       Text('标签设置')
         .fontSize(15)
         .fontWeight(FontWeight.Medium)
-        .fontColor(COLOR_TEXT_PRIMARY)
+        .fontColor(this.chrome.textPrimary)
         .width('100%')
 
       TextInput({ text: this.tabEditDraft, placeholder: '标签名称' })
         .height(40)
         .fontSize(13)
-        .fontColor(COLOR_TEXT_PRIMARY)
-        .backgroundColor(COLOR_PANEL_2)
+        .fontColor(this.chrome.textPrimary)
+        .backgroundColor(this.chrome.panelBg2)
         .borderRadius(8)
         .onChange((value: string) => {
           this.tabEditDraft = value;
         })
 
-      Row() {
-        ForEach(FILAMENT_PALETTE, (filament: string) => {
-          Column()
-            .width(22)
-            .height(22)
-            .borderRadius(11)
-            .backgroundColor(filament)
-            .border({
-              width: 2,
-              color: this.filamentSelected(filament) ? '#FFFFFF' : '#00000000'
-            })
-            // M19: the selection ring eases on/off instead of a hard cut. Only
-            // the border color is state-driven here, so the fast micro-feedback
-            // animation touches nothing that would relayout.
-            .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
-            .onClick(() => {
-              this.pickFilament(filament);
-            })
-        }, (filament: string) => filament)
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceBetween)
-
       Column({ space: 6 }) {
         Text('图片粘贴视角')
           .fontSize(11.5)
-          .fontColor(COLOR_TEXT_SECONDARY)
+          .fontColor(this.chrome.textSecondary)
           .width('100%')
         Row({ space: 2 }) {
           this.buildPasteModeButton('自动', 'auto')
@@ -2612,19 +3442,19 @@ struct Index {
         }
         .width('100%')
         .padding(2)
-        .backgroundColor(COLOR_PANEL_2)
+        .backgroundColor(this.chrome.panelBg2)
         .borderRadius(8)
-        .border({ width: 1, color: COLOR_PANEL_BORDER })
+        .border({ width: 1, color: this.chrome.panelBorder })
 
         // Relay settings only exist while the relay perspective is selected:
-        // the wand-agent scp-pushes the staged image to this tailnet host, so
+        // the wand-agent scp-pushes the staged image to this remote host, so
         // a shell ssh'd into that machine can read the pasted path directly.
         if (this.editingPasteMode === 'relay') {
           TextInput({ text: this.editingRelayTarget, placeholder: '目标机(host 或 user@host)' })
             .height(36)
             .fontSize(12)
-            .fontColor(COLOR_TEXT_PRIMARY)
-            .backgroundColor(COLOR_PANEL_2)
+            .fontColor(this.chrome.textPrimary)
+            .backgroundColor(this.chrome.panelBg2)
             .borderRadius(8)
             .onChange((value: string) => {
               this.editingRelayTarget = value;
@@ -2635,8 +3465,8 @@ struct Index {
           TextInput({ text: this.editingRelayDir, placeholder: '远端目录(默认 /tmp/emberline-paste)' })
             .height(36)
             .fontSize(12)
-            .fontColor(COLOR_TEXT_PRIMARY)
-            .backgroundColor(COLOR_PANEL_2)
+            .fontColor(this.chrome.textPrimary)
+            .backgroundColor(this.chrome.panelBg2)
             .borderRadius(8)
             .onChange((value: string) => {
               this.editingRelayDir = value;
@@ -2644,9 +3474,9 @@ struct Index {
                 this.editingSession.relayDir = value;
               }
             })
-          Text('经 Agent 所在虚拟机 scp 转发;需要虚拟机可免交互 ssh 到目标机(Tailscale ACL 或已装密钥)')
+          Text('经 Agent 所在虚拟机 scp 转发;需要虚拟机已配置到目标机的免交互 SSH 凭据')
             .fontSize(10.5)
-            .fontColor(COLOR_TEXT_SECONDARY)
+            .fontColor(this.chrome.textSecondary)
             .width('100%')
         }
       }
@@ -2655,23 +3485,23 @@ struct Index {
 
       Row({ space: 8 }) {
         Button('恢复自动命名')
-          .height(34)
+          .height(40)
           .fontSize(12)
-          .backgroundColor(COLOR_PANEL_2)
-          .fontColor(COLOR_KEY_TEXT)
+          .backgroundColor(this.chrome.panelBg2)
+          .fontColor(this.chrome.textPrimary)
           .borderRadius(8)
-          .border({ width: 1, color: COLOR_PANEL_BORDER })
-          .focusable(false)
+          .border({ width: 1, color: this.chrome.panelBorder })
+          .focusable(this.tabEditOpen)
           .onClick(() => {
             this.resetTabName();
           })
         Blank()
         Button('完成')
-          .height(34)
+          .height(40)
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
-          .backgroundColor(COLOR_EMBER)
-          .fontColor('#1A0F05')
+          .backgroundColor(this.chrome.primaryBtnBg)
+          .fontColor(this.chrome.primaryBtnText)
           .borderRadius(8)
           // M27: same ember-button press feedback as the connect action.
           .stateStyles({
@@ -2679,18 +3509,18 @@ struct Index {
               .opacity(0.82)
             }
           })
-          .focusable(false)
+          .focusable(this.tabEditOpen)
           .onClick(() => {
             this.commitTabEditor();
           })
       }
       .width('100%')
     }
-    .width(320)
+    .width(this.dialogWidth(320))
     .padding(18)
-    .backgroundColor(COLOR_PANEL_BG)
-    .borderRadius(14)
-    .border({ width: 1, color: COLOR_PANEL_BORDER })
+    .backgroundColor(this.chrome.panelBg)
+    .borderRadius(8)
+    .border({ width: 1, color: this.chrome.panelBorder })
     .shadow({ radius: 28, color: '#B3000000', offsetX: 0, offsetY: 12 })
     // M18 asymmetric: entrance keeps the fade + short rise (opacity + translateY
     // 12 -> 0, no scale so the CJK label never rasterizes); exit is a quicker,
@@ -2709,7 +3539,7 @@ struct Index {
   private buildFieldLabel(label: string) {
     Text(label)
       .fontSize(11)
-      .fontColor(COLOR_TEXT_SECONDARY)
+      .fontColor(this.chrome.textSecondary)
       .width('100%')
       .textAlign(TextAlign.Start)
   }
@@ -2754,8 +3584,7 @@ struct Index {
       this.draftUser,
       this.draftPassword
     );
-    this.drawerOpen = false;
-    this.focusActiveTerminalSoon();
+    this.closeDrawer();
     this.persistConnection();
     session.agentDriver.disconnect();
     this.ensureDriverAttached(session);
@@ -2765,8 +3594,7 @@ struct Index {
 
   private connectFusionAgent(): void {
     const session = this.activeSession();
-    this.drawerOpen = false;
-    this.focusActiveTerminalSoon();
+    this.closeDrawer();
     this.markManualConnection(session);
     this.connectFusionAgentForSession(session, true);
   }
@@ -2969,7 +3797,7 @@ struct Index {
   }
 
   // 'relay' paste mode: the image is staged in the shared folder (VM-visible),
-  // then wand-agent scp-relays it to the configured tailnet host and the
+  // then wand-agent scp-relays it to the configured remote host and the
   // REMOTE path is pasted - for shells that ssh'd from the agent session into
   // another machine. Needs the agent channel alive; every failure degrades to
   // pasting a path that at least exists somewhere, plus an explanatory line.
@@ -3027,97 +3855,38 @@ struct Index {
     }
   }
 
-  @Builder
-  private buildAccessoryBar() {
-    Row({ space: 6 }) {
-      Scroll() {
-        Row({ space: 6 }) {
-          Button('Esc')
-            .height(32).fontSize(12).borderRadius(8)
-            .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-            .focusable(false)
-            .onClick(() => {
-              this.activeSession().controller.write('\u001b');
-              this.focusActiveTerminalSoon();
-            })
-          Button('Tab')
-            .height(32).fontSize(12).borderRadius(8)
-            .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-            .focusable(false)
-            .onClick(() => {
-              this.activeSession().controller.write('\t');
-              this.focusActiveTerminalSoon();
-            })
-          Button('^C')
-            .height(32).fontSize(12).borderRadius(8)
-            .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-            .focusable(false)
-            .onClick(() => {
-              this.activeSession().controller.write('\u0003');
-              this.focusActiveTerminalSoon();
-            })
-          Button('复制')
-            .height(32).fontSize(12).borderRadius(8)
-            .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-            .focusable(false)
-            .onClick(() => {
-              this.activeSession().controller.requestCopy();
-              this.focusActiveTerminalSoon();
-            })
-          Button('粘贴')
-            .height(32).fontSize(12).borderRadius(8)
-            .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-            .focusable(false)
-            .onClick(() => {
-              this.activeSession().controller.requestPaste();
-              this.focusActiveTerminalSoon();
-            })
-          ForEach(['←', '↑', '↓', '→', 'PgUp', 'PgDn'] as string[], (key: string) => {
-            Button(key)
-              .height(32).fontSize(12).borderRadius(8)
-              .backgroundColor(COLOR_KEY_BG).fontColor(COLOR_KEY_TEXT)
-              .focusable(false)
-              .onClick(() => {
-                this.sendAccessoryKey(key);
-                this.focusActiveTerminalSoon();
-              })
-          }, (key: string) => `acc-${key}`)
-        }
-      }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .align(Alignment.Start)
-      .layoutWeight(1)
-    }
-    .height(44)
-    .width('100%')
-    .padding({ left: 8, right: 8 })
-    .backgroundColor(COLOR_BAR_BG)
-    .border({ width: { top: 1 }, color: COLOR_BAR_BORDER })
-    // M13: the terminal still reflows exactly once (the `if` mount is kept), but
-    // the key bar itself fades up from below instead of hard-inserting. opacity +
-    // translateY only — no height animation, which would relayout the terminal.
-    .transition(TransitionEffect.OPACITY
-      .combine(TransitionEffect.translate({ y: 12 }))
-      .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL }))
-  }
-
-
-  private filteredThemes(): string[] {
+  private filteredThemeOptions(): ThemeOptionState[] {
     const filter = this.themeFilter.trim().toLowerCase();
     if (filter.length === 0) {
-      return this.themeList;
+      return this.themeOptions;
     }
-    return this.themeList.filter((theme: string) => theme.toLowerCase().includes(filter));
+    return this.themeOptions.filter((option: ThemeOptionState) =>
+      option.name.toLowerCase().includes(filter));
+  }
+
+  private renderedThemeOptions(): ThemeOptionState[] {
+    return this.filteredThemeOptions().slice(0, this.themeRenderLimit);
   }
 
   private prepareThemePane(): void {
-    const list = this.activeSession().controller.getThemeList();
-    if (list.length > 0) {
-      this.themeList = list;
+    if (this.themeOptions.length === 0) {
+      const names: string[] = this.activeSession().controller.getThemeList();
+      if (names.length > 0) {
+        const options: ThemeOptionState[] = names.map((name: string) =>
+          new ThemeOptionState(name, name === this.editedThemeName()));
+        this.themeOptionByName.clear();
+        for (const option of options) {
+          this.themeOptionByName.set(option.name, option);
+        }
+        this.themeOptions = options;
+      }
+    } else {
+      this.syncThemeOptionSelection();
     }
     this.themeFilter = '';
-    void this.loadThemePreviews();
+    this.themeRenderLimit = THEME_PREVIEW_BATCH_SIZE;
+    void this.loadThemePreviews(
+      this.renderedThemeOptions().map((option: ThemeOptionState) => option.name));
   }
 
   private activeConnLit(): boolean {
@@ -3135,56 +3904,72 @@ struct Index {
     return session.statusLabel.length > 0 ? session.statusLabel : '未连接';
   }
 
-  private filamentSelected(filament: string): boolean {
-    const current = this.editingFilament.length > 0 ? this.editingFilament : COLOR_EMBER;
-    return current === filament;
+  private cancelThemePreviewWork(): void {
+    this.themePreviewGeneration += 1;
+    this.themePreviewQueue = [];
   }
 
-  private themePreviewBg(theme: string): string {
-    const preview = this.themePreviews.get(theme);
-    return preview ? preview.bg : COLOR_PANEL_2;
-  }
-
-  private themePreviewFg(theme: string): string {
-    const preview = this.themePreviews.get(theme);
-    return preview ? preview.fg : COLOR_TEXT_SECONDARY;
-  }
-
-  private themePreviewAnsi(theme: string): string[] {
-    const preview = this.themePreviews.get(theme);
-    return preview ? preview.ansi : [];
-  }
-
-  // Parses every bundled ghostty theme once (background / foreground /
-  // palette 0-7) so the list can show real swatches; results are cached for
-  // the app lifetime and the list degrades to plain rows on any failure.
-  private async loadThemePreviews(): Promise<void> {
-    if (this.themePreviewsLoading || this.themePreviews.size > 0 || !this.context) {
+  // Load only the visible/search-leading preview batch. New requests are queued
+  // behind the active batch so rapid search input never starts parallel raw-file
+  // reads or forces the whole bundled theme catalogue into memory at once. The
+  // generation check drops an in-flight batch as soon as the pane closes.
+  private async loadThemePreviews(themes: string[]): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    for (const theme of themes) {
+      const option = this.themeOptionByName.get(theme);
+      if (option && !option.preview && !this.themePreviewQueue.includes(theme)) {
+        this.themePreviewQueue.push(theme);
+      }
+    }
+    if (this.themePreviewsLoading) {
       return;
     }
     this.themePreviewsLoading = true;
+    const generation: number = this.themePreviewGeneration;
     const resourceMgr = this.context.resourceManager;
-    const next: Map<string, ThemePreview> = new Map();
-    for (const theme of this.themeList) {
-      try {
-        const raw = await resourceMgr.getRawFileContent(`themes/${theme}`);
-        const preview = this.parseThemePreview(raw);
-        if (preview) {
-          next.set(theme, preview);
+    while (this.themePreviewQueue.length > 0 && generation === this.themePreviewGeneration) {
+      const batch: string[] = this.themePreviewQueue.splice(0, THEME_PREVIEW_BATCH_SIZE);
+      const loaded: Map<string, ThemePreview> = new Map<string, ThemePreview>();
+      for (const theme of batch) {
+        if (generation !== this.themePreviewGeneration) {
+          break;
         }
-      } catch (_err) {
-        // Theme without a readable file simply renders without a swatch.
+        try {
+          const raw = await resourceMgr.getRawFileContent(`themes/${theme}`);
+          if (generation !== this.themePreviewGeneration) {
+            break;
+          }
+          const preview = this.parseThemePreview(raw);
+          if (preview) {
+            loaded.set(theme, preview);
+          }
+        } catch (_err) {
+          // Theme without a readable file simply renders without a swatch.
+        }
       }
+      if (generation !== this.themePreviewGeneration) {
+        break;
+      }
+      loaded.forEach((preview: ThemePreview, theme: string) => {
+        const option = this.themeOptionByName.get(theme);
+        if (option) {
+          option.preview = preview;
+        }
+      });
     }
-    this.themePreviews = next;
     this.themePreviewsLoading = false;
+    // A close/reopen can enqueue the new pane's first batch while the cancelled
+    // worker is still unwinding. Hand that queue to a worker with the new epoch.
+    if (this.themePreviewQueue.length > 0 &&
+      this.drawerShown && this.drawerPane === 'appearance') {
+      void this.loadThemePreviews([]);
+    }
   }
 
   private parseThemePreview(raw: Uint8Array): ThemePreview | null {
-    let text = '';
-    for (let i = 0; i < raw.length; i += 1) {
-      text += String.fromCharCode(raw[i]);
-    }
+    const text: string = this.themePreviewDecoder.decodeToString(raw);
     const slots: string[] = ['', '', '', '', '', '', '', ''];
     let bg = '';
     let fg = '';
@@ -3218,7 +4003,7 @@ struct Index {
         dots.push(slot);
       }
     }
-    const preview: ThemePreview = { bg: bg, fg: fg, ansi: dots };
+    const preview: ThemePreview = { bg: bg, fg: fg, red: slots[1], ansi: dots };
     return preview;
   }
 
@@ -3230,10 +4015,150 @@ struct Index {
     return '';
   }
 
-  private applyTheme(theme: string): void {
-    this.themeName = theme;
+  private syncThemeOptionSelection(): void {
+    for (const option of this.themeOptions) {
+      const selected: boolean = option.name === this.editedThemeName();
+      if (option.selected !== selected) {
+        option.selected = selected;
+      }
+    }
+  }
+
+  private resolvedDark(): boolean {
+    if (this.colorModeOverride === 'dark') {
+      return true;
+    }
+    if (this.colorModeOverride === 'light') {
+      return false;
+    }
+    return this.sysDark;
+  }
+
+  private effectiveThemeName(): string {
+    return this.resolvedDark() ? this.darkThemeName : this.lightThemeName;
+  }
+
+  private editedThemeName(): string {
+    return this.themeEditSlot === 'light' ? this.lightThemeName : this.darkThemeName;
+  }
+
+  // System light/dark flipped (EntryAbility.onConfigurationUpdate): swap to the
+  // paired theme and re-derive every chrome token in one pass.
+  private onSystemColorModeChanged(): void {
+    // A manual override pins the appearance; OS flips are ignored until the
+    // user returns to 跟随系统.
+    if (this.colorModeOverride !== 'system') {
+      return;
+    }
+    this.themeEditSlot = this.sysDark ? 'dark' : 'light';
+    this.applyEffectiveTheme();
+    this.syncThemeOptionSelection();
+  }
+
+  private applyColorModeOverride(mode: string): void {
+    if (this.colorModeOverride === mode) {
+      return;
+    }
+    this.colorModeOverride = mode;
+    this.themeEditSlot = this.resolvedDark() ? 'dark' : 'light';
+    this.applyEffectiveTheme();
+    this.syncThemeOptionSelection();
+    this.persistAppearance();
+  }
+
+  private applyEffectiveTheme(): void {
+    const theme: string = this.effectiveThemeName();
     for (const session of this.sessions) {
       session.controller.setTheme(theme);
+    }
+    this.publishSharedThemeConfig();
+    void this.recomputeChromeTokens(theme);
+  }
+
+  private publishSharedThemeConfig(): void {
+    const config: SharedThemeConfig = {
+      darkThemeName: this.darkThemeName,
+      lightThemeName: this.lightThemeName,
+      colorModeOverride: this.colorModeOverride
+    };
+    sharedThemeConfigReady = true;
+    AppStorage.setOrCreate(SHARED_THEME_CONFIG_KEY, config);
+  }
+
+  // A sibling window owns the change, but every window must replace all three
+  // fields before resolving its active slot. Otherwise a later OS mode flip can
+  // resurrect an old slot and publish it back over the user's latest choice.
+  private onSharedThemeConfigChanged(): void {
+    if (!sharedThemeConfigReady || this.sharedThemeConfig.darkThemeName.length === 0 ||
+      this.sharedThemeConfig.lightThemeName.length === 0) {
+      return;
+    }
+    const mode: string = this.sharedThemeConfig.colorModeOverride;
+    if (mode !== 'system' && mode !== 'dark' && mode !== 'light') {
+      return;
+    }
+    const changed: boolean = this.darkThemeName !== this.sharedThemeConfig.darkThemeName ||
+      this.lightThemeName !== this.sharedThemeConfig.lightThemeName ||
+      this.colorModeOverride !== mode;
+    if (!changed) {
+      return;
+    }
+    this.darkThemeName = this.sharedThemeConfig.darkThemeName;
+    this.lightThemeName = this.sharedThemeConfig.lightThemeName;
+    this.colorModeOverride = mode;
+    this.themeEditSlot = this.resolvedDark() ? 'dark' : 'light';
+    this.syncThemeOptionSelection();
+    const theme: string = this.effectiveThemeName();
+    for (const session of this.sessions) {
+      session.controller.setTheme(theme);
+    }
+    void this.recomputeChromeTokens(theme);
+  }
+
+  // Re-derive the adaptive chrome from the effective theme's bg/fg/red. The
+  // token object is replaced wholesale so every @StorageProp consumer
+  // re-colors; the system decor buttons restyle through the ability event.
+  private async recomputeChromeTokens(themeName: string = this.effectiveThemeName()): Promise<void> {
+    if (!this.context) {
+      return;
+    }
+    const generation: number = ++this.chromeThemeGeneration;
+    let next = DEFAULT_CHROME_TOKENS;
+    try {
+      const raw = await this.context.resourceManager.getRawFileContent(
+        `themes/${themeName}`);
+      const preview = this.parseThemePreview(raw);
+      if (preview) {
+        next = deriveChromeTokens(preview.bg, preview.fg, preview.red);
+      }
+    } catch (err) {
+      console.error('Failed to derive chrome tokens: ' + JSON.stringify(err));
+    }
+    if (generation !== this.chromeThemeGeneration || themeName !== this.effectiveThemeName()) {
+      return;
+    }
+    this.chrome = next;
+    this.context.eventHub.emit(CHROME_MODE_EVENT, next.isLight);
+  }
+
+  private applyTheme(theme: string): void {
+    if (theme === this.editedThemeName()) {
+      return;
+    }
+    if (this.themeEditSlot === 'light') {
+      this.lightThemeName = theme;
+    } else {
+      this.darkThemeName = theme;
+    }
+    this.syncThemeOptionSelection();
+    const editingLight: boolean = this.themeEditSlot === 'light';
+    if (editingLight !== this.resolvedDark()) {
+      // The edited slot is the one currently on screen: apply it live.
+      this.applyEffectiveTheme();
+    } else {
+      // Inactive-slot edits are still process-wide state even though they do not
+      // recolour the current terminal until the resolved mode changes.
+      this.publishSharedThemeConfig();
     }
     this.persistAppearance();
   }
@@ -3269,8 +4194,8 @@ struct Index {
     }
   }
 
-  // M26: one-shot readout feedback — a small vertical tick up and back plus an
-  // ember color flash, over 120ms total. translateY + color only, never scale
+  // M26: one-shot readout feedback — a small vertical tick up and back over
+  // 120ms total. translateY only, never scale
   // (CJK-safe), and it is imperative so it never leaves a residual animation.
   private playFontReadoutTick(): void {
     this.getUIContext().keyframeAnimateTo({ iterations: 1 }, [
@@ -3279,7 +4204,6 @@ struct Index {
         curve: CURVE_SHARP,
         event: () => {
           this.fontReadoutTickY = -3;
-          this.fontReadoutColor = COLOR_EMBER;
         }
       },
       {
@@ -3287,10 +4211,54 @@ struct Index {
         curve: CURVE_DECEL,
         event: () => {
           this.fontReadoutTickY = 0;
-          this.fontReadoutColor = COLOR_TEXT_PRIMARY;
         }
       }
     ]);
+  }
+
+  private registerBundledFontPreviews(): void {
+    if (this.fontPreviewsRegistered) {
+      return;
+    }
+    try {
+      const fontManager = this.getUIContext().getFont();
+      fontManager.registerFont({
+        familyName: FONT_FAMILY_MAPLE,
+        familySrc: $rawfile('fonts/MapleMonoNormal-NF-CN-Regular.ttf')
+      });
+      fontManager.registerFont({
+        familyName: FONT_FAMILY_JETBRAINS,
+        familySrc: $rawfile('fonts/JetBrainsMono-Regular.ttf')
+      });
+      fontManager.registerFont({
+        familyName: FONT_FAMILY_CASCADIA,
+        familySrc: $rawfile('fonts/CascadiaMono.ttf')
+      });
+      fontManager.registerFont({
+        familyName: FONT_FAMILY_SARASA,
+        familySrc: $rawfile('fonts/SarasaFixedSC-Regular.ttf')
+      });
+      this.fontPreviewsRegistered = true;
+    } catch (err) {
+      console.error('Failed to register bundled ArkUI font previews: ' + JSON.stringify(err));
+    }
+  }
+
+  private registerCustomFontPreview(): void {
+    if (this.customFontPath.length === 0) {
+      return;
+    }
+    try {
+      if (!fs.accessSync(this.customFontPath)) {
+        return;
+      }
+      this.getUIContext().getFont().registerFont({
+        familyName: FONT_FAMILY_CUSTOM,
+        familySrc: this.customFontPath
+      });
+    } catch (err) {
+      console.error('Failed to register custom ArkUI font preview: ' + JSON.stringify(err));
+    }
   }
 
   @Builder
@@ -3298,34 +4266,36 @@ struct Index {
     Column({ space: 4 }) {
       Text('ls -al → 终端 0Oo')
         .fontSize(13.5)
-        .fontColor(COLOR_TEXT_PRIMARY)
-        // Preview the sample in its own family so the picker is WYSIWYG; the
-        // custom slot uses the family name registered by the renderer.
+        .fontColor(this.chrome.textPrimary)
+        // Preview the sample in the ArkUI alias registered for this font; the
+        // custom slot receives the same treatment after import.
         .fontFamily(family)
         .maxLines(1)
       Text(label)
         .fontSize(11)
-        .fontColor(this.fontFamily === family ? COLOR_EMBER : COLOR_TEXT_SECONDARY)
+        .fontColor(this.fontFamily === family ? this.chrome.textPrimary : this.chrome.textSecondary)
       Row()
         .width('100%')
         .height(2)
         .borderRadius(1)
-        .backgroundColor(this.fontFamily === family ? COLOR_EMBER : '#00000000')
-        .shadow(this.fontFamily === family
-          ? { radius: 6, color: COLOR_EMBER_GLOW, offsetX: 0, offsetY: 0 }
-          : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
-        // M06 selected-filament: fade the copper + glow.
+        .backgroundColor(this.fontFamily === family ? this.chrome.textPrimary : '#00000000')
+        // Neutral selected underline fade (accent system retired).
         .animation({ duration: DUR_STANDARD, curve: CURVE_DECEL })
     }
     .alignItems(HorizontalAlign.Start)
     .padding({ left: 12, right: 12, top: 10, bottom: 6 })
-    .borderRadius(10)
-    .backgroundColor(COLOR_PANEL_2)
-    .border({ width: 1, color: this.fontFamily === family ? COLOR_EMBER : COLOR_PANEL_BORDER })
-    // M07 selected-face: fast border-color settle ahead of the filament.
+    .borderRadius(8)
+    .backgroundColor(this.chrome.panelBg2)
+    .border({
+      width: 1,
+      color: this.fontFamily === family ? this.chrome.textPrimary : this.chrome.panelBorder
+    })
+    // M07 selected-face: fast border-color settle ahead of the underline.
     .animation({ duration: DUR_FAST, curve: CURVE_SHARP })
     .clip(true)
     .layoutWeight(1)
+    .focusable(this.drawerShown)
+    .hoverEffect(HoverEffect.Highlight)
     .onClick(() => {
       this.selectFontFamily(family);
     })
@@ -3370,37 +4340,231 @@ struct Index {
     });
   }
 
-  private sendAccessoryKey(key: string): void {
-    let value = '';
-    switch (key) {
-      case '←':
-        value = '\u001b[D';
-        break;
-      case '↑':
-        value = '\u001b[A';
-        break;
-      case '↓':
-        value = '\u001b[B';
-        break;
-      case '→':
-        value = '\u001b[C';
-        break;
-      case 'PgUp':
-        value = '\u001b[5~';
-        break;
-      case 'PgDn':
-        value = '\u001b[6~';
-        break;
-      default:
-        break;
-    }
-    if (value.length > 0) {
-      this.activeSession().controller.write(value);
-    }
+  private terminalBackgroundOpacity(): number {
+    return this.backgroundImagePath.length > 0 ? this.backgroundOpacity : 1;
   }
 
   private surfaceBackdropColor(): string {
-    return this.backgroundImagePath.length > 0 ? '#00000000' : COLOR_APP_BG;
+    return this.backgroundImagePath.length > 0 ? '#00000000' : this.chrome.appBg;
+  }
+
+  // ── Cross-window tab management ───────────────────────────────────────────
+  // Every path parks the live handle, removes the source tab, and waits for the
+  // source XComponent's real unbind callback. Only then may a target mount the
+  // surface or a programmatic system drag begin ("lift = unload").
+  private handoffPlaceholder(): TerminalSessionHandle | null {
+    const placeholder: TerminalSessionHandle | null = this.sessions.length === 1 &&
+      this.sessions[0].statusMode === 'demo' &&
+      !this.sessions[0].connected &&
+      !this.sessions[0].attached &&
+      this.sessions[0].customName.length === 0
+      ? this.sessions[0] : null;
+    return placeholder;
+  }
+
+  private restoreReleasedSession(handle: TerminalSessionHandle, originIndex: number): void {
+    this.systemDragStarting = false;
+    const placeholder: TerminalSessionHandle | null = this.handoffPlaceholder();
+    this.adoptSession(handle, Math.min(originIndex, this.sessions.length));
+    if (placeholder) {
+      this.closeSession(placeholder.id);
+    }
+  }
+
+  private recoverParkedSession(token: string, originIndex: number): void {
+    const handle = sessionRegistry.claim(token);
+    if (!handle) {
+      return;
+    }
+    this.restoreReleasedSession(handle, originIndex);
+  }
+
+  private tearOffParkedSession(token: string, originIndex: number,
+    displayX: number = -1, displayY: number = -1): void {
+    if (!this.context) {
+      this.recoverParkedSession(token, originIndex);
+      return;
+    }
+    const want: Want = {
+      bundleName: this.context.abilityInfo.bundleName,
+      abilityName: this.context.abilityInfo.name,
+      parameters: { 'emberHandoffToken': token }
+    };
+    if (displayX >= 0 && displayY >= 0) {
+      this.context.startAbility(want, {
+        windowLeft: Math.max(0, Math.round(displayX - TORN_WINDOW_WIDTH_PX / 2)),
+        windowTop: Math.max(0, Math.round(displayY - WINDOW_CHROME_HEIGHT)),
+        windowWidth: TORN_WINDOW_WIDTH_PX,
+        windowHeight: TORN_WINDOW_HEIGHT_PX
+      }).catch((err: Object): void => {
+        console.error('[EmberHandoff] positioned startAbility failed: ' + JSON.stringify(err));
+        this.recoverParkedSession(token, originIndex);
+      });
+      return;
+    }
+    console.info('[EmberHandoff] launching sibling window');
+    this.context.startAbility(want).catch((err: Object): void => {
+      console.error('[EmberHandoff] split startAbility failed: ' + JSON.stringify(err));
+      this.recoverParkedSession(token, originIndex);
+    });
+  }
+
+  @Builder
+  private buildTabDragPreview(title: string) {
+    Row({ space: 7 }) {
+      Row()
+        .width(6)
+        .height(6)
+        .borderRadius(3)
+        .backgroundColor(this.chrome.dotOn)
+      Text(title)
+        .fontSize(12.5)
+        .fontColor(this.chrome.textPrimary)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width(190)
+    .height(34)
+    .padding({ left: 14, right: 14 })
+    .borderRadius(17)
+    .backgroundColor(this.chrome.capBg)
+    .border({ width: 1, color: this.chrome.capBorder })
+  }
+
+  private startSystemTabDrag(token: string, released: ReleasedSession, pointerId: number): void {
+    const record = new unifiedDataChannel.UnifiedRecord(TAB_HANDOFF_UDMF_TYPE, token);
+    const data = new unifiedDataChannel.UnifiedData(record);
+    const dragInfo: dragController.DragInfo = {
+      pointerId: Math.max(0, Math.min(9, Math.round(pointerId))),
+      data: data,
+      extraParams: TAB_HANDOFF_UDMF_TYPE
+    };
+    void this.getUIContext().getDragController().executeDrag(
+      () => { this.buildTabDragPreview(released.handle.title); }, dragInfo)
+      .then((result: dragController.DragEventParam): void => {
+        this.systemDragStarting = false;
+        const dragResult: DragResult = result.event.getResult();
+        if (dragResult === DragResult.DRAG_SUCCESSFUL) {
+          return;
+        }
+        if (dragResult === DragResult.DRAG_FAILED) {
+          this.tearOffParkedSession(token, released.originIndex,
+            result.event.getDisplayX(), result.event.getDisplayY());
+          return;
+        }
+        this.recoverParkedSession(token, released.originIndex);
+      })
+      .catch((err: Object): void => {
+        console.error('[EmberHandoff] executeDrag failed: ' + JSON.stringify(err));
+        this.recoverParkedSession(token, released.originIndex);
+      });
+  }
+
+  private pickUpSessionForSystemDrag(sessionId: number, pointerId: number): void {
+    if (this.systemDragStarting) {
+      return;
+    }
+    this.systemDragStarting = true;
+    this.resetTabDragState();
+    const token: string = sessionRegistry.generateToken();
+    const continueDrag = (released: ReleasedSession): void => {
+      this.startSystemTabDrag(token, released, pointerId);
+    };
+    const released = this.releaseSessionForHandoff(sessionId, continueDrag);
+    if (!released) {
+      this.systemDragStarting = false;
+      return;
+    }
+    sessionRegistry.park(token, released.handle, (expired: TerminalSessionHandle): void => {
+      this.restoreReleasedSession(expired, released.originIndex);
+    });
+    this.continueReleasedSession(released, continueDrag);
+  }
+
+  private handleTabStripDrop(event: DragEvent): void {
+    try {
+      const records: Array<unifiedDataChannel.UnifiedRecord> = event.getData().getRecords();
+      let token: string = '';
+      for (const record of records) {
+        if (record.getType() !== TAB_HANDOFF_UDMF_TYPE) {
+          continue;
+        }
+        const value = record.getValue();
+        if (typeof value === 'string') {
+          token = value;
+          break;
+        }
+      }
+      if (token.length === 0) {
+        return;
+      }
+      const handle = sessionRegistry.claim(token);
+      if (!handle) {
+        return;
+      }
+      const advance: number = Math.max(1, this.tabAdvance());
+      const insertIndex: number = Math.max(0, Math.min(this.sessions.length,
+        Math.floor((Math.max(0, event.getX()) + advance / 2) / advance)));
+      // A window whose only real tab was lifted receives an automatic blank tab
+      // while its surface unloads. Replacing that placeholder on a local drop is
+      // the same cleanup used by cancel/expiry recovery.
+      const placeholder: TerminalSessionHandle | null = this.handoffPlaceholder();
+      this.adoptSession(handle, insertIndex);
+      if (placeholder) {
+        this.closeSession(placeholder.id);
+      }
+      event.dragBehavior = DragBehavior.MOVE;
+      event.setResult(DragResult.DRAG_SUCCESSFUL);
+    } catch (err) {
+      console.error('[EmberHandoff] drop decode failed: ' + JSON.stringify(err));
+    }
+  }
+
+  // Context-menu path: split this tab into a new window (no drop geometry).
+  private splitSessionToNewWindow(sessionId: number): void {
+    const token: string = sessionRegistry.generateToken();
+    const continueSplit = (released: ReleasedSession): void => {
+      this.tearOffParkedSession(token, released.originIndex);
+    };
+    const released = this.releaseSessionForHandoff(sessionId, continueSplit);
+    if (!released) {
+      return;
+    }
+    sessionRegistry.park(token, released.handle, (expired: TerminalSessionHandle): void => {
+      this.restoreReleasedSession(expired, released.originIndex);
+    });
+    console.info(`[EmberHandoff] split id=${sessionId} to new window`);
+    this.continueReleasedSession(released, continueSplit);
+  }
+
+  private moveSessionToWindow(sessionId: number, stamp: number): void {
+    const wasOnlyTab: boolean = this.sessions.length === 1 &&
+      this.sessions[0].id === sessionId;
+    const token: string = sessionRegistry.generateToken();
+    const continueMove = (released: ReleasedSession): void => {
+      const handle = sessionRegistry.claim(token);
+      if (!handle) {
+        return;
+      }
+      console.info(`[EmberHandoff] move id=${sessionId} -> window ${stamp}`);
+      if (!sessionRegistry.deliverTo(stamp, handle)) {
+        this.restoreReleasedSession(handle, released.originIndex);
+        return;
+      }
+      if (wasOnlyTab && this.context) {
+        this.context.terminateSelf().catch((err: Object): void => {
+          console.error('[EmberHandoff] terminateSelf failed: ' + JSON.stringify(err));
+        });
+      }
+    };
+    const released = this.releaseSessionForHandoff(sessionId, continueMove);
+    if (!released) {
+      return;
+    }
+    sessionRegistry.park(token, released.handle, (expired: TerminalSessionHandle): void => {
+      this.restoreReleasedSession(expired, released.originIndex);
+    });
+    this.continueReleasedSession(released, continueMove);
   }
 
   private customFontLabel(): string {
@@ -3436,8 +4600,15 @@ struct Index {
       const settings = await this.appearanceStore.load(this.context);
       this.fontSize = settings.fontSize;
       this.fontFamily = this.normalizeFontFamily(settings.fontFamily);
-      this.themeName = settings.themeName;
+      const shared: SharedThemeConfig | undefined = sharedThemeConfigReady
+        ? AppStorage.get<SharedThemeConfig>(SHARED_THEME_CONFIG_KEY) : undefined;
+      this.darkThemeName = shared?.darkThemeName ?? settings.darkThemeName;
+      this.lightThemeName = shared?.lightThemeName ?? settings.lightThemeName;
+      this.colorModeOverride = shared?.colorModeOverride ?? settings.colorModeOverride;
+      this.themeEditSlot = this.resolvedDark() ? 'dark' : 'light';
+      this.syncThemeOptionSelection();
       this.customFontPath = settings.customFontPath;
+      this.registerCustomFontPreview();
       this.backgroundImagePath = settings.backgroundImagePath;
       this.backgroundOpacity = settings.backgroundOpacity;
       this.backgroundBlur = settings.backgroundBlur;
@@ -3458,7 +4629,7 @@ struct Index {
       this.draftSshPort = conn.sshPort;
       this.draftUser = conn.user;
       for (const session of this.sessions) {
-        session.controller.setTheme(this.themeName);
+        session.controller.setTheme(this.effectiveThemeName());
         session.controller.updateConfig({
           fontSize: this.fontSize,
           fontFamily: this.fontFamily,
@@ -3468,6 +4639,7 @@ struct Index {
       }
       this.applyBackgroundConfig();
       this.applyCustomFont();
+      this.applyEffectiveTheme();
     } catch (err) {
       console.error('Failed to load appearance settings: ' + JSON.stringify(err));
     } finally {
@@ -3482,7 +4654,9 @@ struct Index {
     const snapshot: AppearanceSettings = {
       fontSize: this.fontSize,
       fontFamily: this.fontFamily,
-      themeName: this.themeName,
+      darkThemeName: this.darkThemeName,
+      lightThemeName: this.lightThemeName,
+      colorModeOverride: this.colorModeOverride,
       customFontPath: this.customFontPath,
       backgroundImagePath: this.backgroundImagePath,
       backgroundOpacity: this.backgroundOpacity,
@@ -3497,7 +4671,7 @@ struct Index {
   }
 
   private applyBackgroundConfig(): void {
-    const effectiveOpacity = this.backgroundImagePath.length > 0 ? this.backgroundOpacity : 1;
+    const effectiveOpacity = this.terminalBackgroundOpacity();
     for (const session of this.sessions) {
       session.controller.updateConfig({ bgOpacity: effectiveOpacity });
     }
@@ -3552,6 +4726,7 @@ struct Index {
       const previousPath = this.customFontPath;
       this.customFontPath = destPath;
       this.fontFamily = FONT_FAMILY_CUSTOM;
+      this.registerCustomFontPreview();
       this.applyCustomFont();
       this.applyFontFamilyConfig();
       this.persistAppearance();

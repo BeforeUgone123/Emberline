@@ -1,0 +1,1633 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emberline · 纸间 Inkfolio 方向预览</title>
+  <style>
+    :root {
+      --paper: #F2EFE7;
+      --rail: #EAE6DB;
+      --panel: #FBFAF5;
+      --raised: #E4DFD2;
+      --ink: #1C1A15;
+      --terminal-ink: #23211B;
+      --muted: #6E675A;
+      --faint: #918A7C;
+      --hairline: #D8D2C2;
+      --vermilion: #B23B2E;
+      --success: #3E7C4F;
+      --demo-bg: #DCE3E4;
+      --demo-ink: #314044;
+      --demo-line: #9BAAAC;
+      --sans: "HarmonyOS Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+      --ease-decel: cubic-bezier(.2, 0, 0, 1);
+      --ease-standard: cubic-bezier(.4, 0, .2, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible {
+      outline: 2px solid var(--ink);
+      outline-offset: 2px;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    ::selection {
+      color: var(--ink);
+      background: #D9CBB8;
+    }
+
+    .app {
+      position: relative;
+      display: grid;
+      grid-template-rows: 48px minmax(0, 1fr) 34px;
+      width: 100%;
+      height: 100vh;
+      height: 100svh;
+      min-width: 0;
+      background: var(--paper);
+    }
+
+    /* 48px custom window rail */
+    .rail {
+      position: relative;
+      z-index: 30;
+      display: flex;
+      align-items: stretch;
+      min-width: 0;
+      height: 48px;
+      background: var(--rail);
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .tab-scroll {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      flex: 1 1 auto;
+      height: 100%;
+      padding: 4px 6px 3px 8px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;
+      overscroll-behavior-inline: contain;
+    }
+
+    .tab-scroll::-webkit-scrollbar {
+      display: none;
+    }
+
+    .tab {
+      position: relative;
+      display: grid;
+      grid-template-columns: 14px minmax(0, 1fr);
+      grid-template-rows: 18px 13px;
+      column-gap: 6px;
+      flex: 0 0 168px;
+      max-width: 196px;
+      height: 40px;
+      margin: 0;
+      padding: 4px 9px 3px 10px;
+      overflow: hidden;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      background: transparent;
+      text-align: left;
+      cursor: default;
+      transition: background-color 120ms var(--ease-standard), color 120ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .tab:hover {
+      background: #E5E0D4;
+    }
+
+    .tab:active {
+      background: #DDD7C9;
+      transform: translateY(1px);
+    }
+
+    .tab.is-active {
+      background: var(--paper);
+      border-color: var(--hairline);
+    }
+
+    .state-mark {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      width: 14px;
+      height: 14px;
+      flex: 0 0 14px;
+    }
+
+    .seal {
+      display: block;
+      width: 8px;
+      height: 8px;
+      border: 1px solid var(--vermilion);
+      border-radius: 2px;
+      background: var(--vermilion);
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .tab .state-mark {
+      grid-column: 1;
+      grid-row: 1;
+      align-self: center;
+    }
+
+    .tab-title {
+      position: relative;
+      display: inline-block;
+      grid-column: 2;
+      grid-row: 1;
+      align-self: center;
+      width: max-content;
+      max-width: 100%;
+      overflow: hidden;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 560;
+      line-height: 16px;
+      letter-spacing: -.01em;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab.is-active .tab-title::after {
+      content: "";
+      position: absolute;
+      right: 0;
+      bottom: -1px;
+      left: 0;
+      height: 1.5px;
+      border-radius: 1px;
+      background: var(--vermilion);
+    }
+
+    .tab-status {
+      grid-column: 2;
+      grid-row: 2;
+      align-self: end;
+      overflow: hidden;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      line-height: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab[data-state="failed"] .seal,
+    .state-mark[data-state="failed"] .seal {
+      background: transparent;
+    }
+
+    .tab[data-state="failed"] .tab-status,
+    .connection-state-card[data-state="failed"] .connection-state-copy strong {
+      color: var(--vermilion);
+    }
+
+    .tab[data-state="unread-complete"] .state-mark::after,
+    .state-mark[data-state="unread-complete"]::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      right: 1px;
+      width: 3px;
+      height: 3px;
+      border-radius: 50%;
+      background: var(--vermilion);
+    }
+
+    .tab[data-state="unread-complete"] .tab-title {
+      font-weight: 720;
+    }
+
+    .tab[data-state="connecting"] .seal,
+    .state-mark[data-state="connecting"] .seal {
+      animation: seal-pulse 2.4s ease-in-out infinite;
+    }
+
+    .seal.stamp-drop {
+      animation: stamp-drop 180ms var(--ease-decel) both !important;
+    }
+
+    @keyframes seal-pulse {
+      0%, 100% { opacity: .35; }
+      50% { opacity: 1; }
+    }
+
+    @keyframes stamp-drop {
+      from {
+        opacity: 0;
+        transform: translateY(-1px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .rail-actions {
+      position: relative;
+      display: flex;
+      align-items: center;
+      flex: 0 0 auto;
+      height: 48px;
+      padding: 0 8px 0 4px;
+      background: var(--rail);
+    }
+
+    .product-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      padding: 0;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      cursor: default;
+      transition: background-color 120ms var(--ease-standard), color 120ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .icon-button:hover,
+    .icon-button[aria-expanded="true"] {
+      color: var(--ink);
+      background: var(--raised);
+    }
+
+    .icon-button:active {
+      background: #D8D1C1;
+      transform: translateY(1px);
+    }
+
+    .icon-button svg {
+      width: 17px;
+      height: 17px;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.6;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .window-divider {
+      width: 1px;
+      height: 20px;
+      margin: 0 10px;
+      background: var(--hairline);
+    }
+
+    .window-controls {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      height: 40px;
+      padding: 0 7px;
+    }
+
+    .window-dot {
+      width: 9px;
+      height: 9px;
+      border: 1px solid #AAA293;
+      border-radius: 50%;
+      background: transparent;
+    }
+
+    .overflow-menu {
+      position: absolute;
+      top: 44px;
+      right: 72px;
+      z-index: 50;
+      width: 174px;
+      padding: 5px;
+      border: 1px solid var(--hairline);
+      border-radius: 5px;
+      background: var(--panel);
+      box-shadow: 0 10px 22px rgba(52, 47, 37, .09);
+    }
+
+    .overflow-menu button {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      height: 34px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 3px;
+      background: transparent;
+      color: var(--ink);
+      font-size: 12px;
+      text-align: left;
+      cursor: default;
+      transition: background-color 100ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .overflow-menu button:hover {
+      background: var(--raised);
+    }
+
+    .overflow-menu button:active {
+      background: #D8D1C1;
+      transform: translateY(1px);
+    }
+
+    .overflow-menu .menu-rule {
+      height: 1px;
+      margin: 4px 7px;
+      background: var(--hairline);
+    }
+
+    /* Paper-light terminal canvas. Content switches with no CSS transition. */
+    .terminal-canvas {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--paper);
+    }
+
+    .terminal-canvas::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 30px;
+      width: 1px;
+      background: #E2DCCF;
+      pointer-events: none;
+    }
+
+    .terminal-output {
+      position: absolute;
+      inset: 0;
+      margin: 0;
+      padding: 28px 42px 48px;
+      overflow: auto;
+      color: var(--terminal-ink);
+      background: transparent;
+      font-family: var(--mono);
+      font-size: 13.25px;
+      font-variant-ligatures: none;
+      font-weight: 430;
+      line-height: 1.62;
+      tab-size: 2;
+      white-space: pre;
+      scrollbar-color: #BFB7A7 transparent;
+      transition: none;
+    }
+
+    .term-dim { color: #817A6D; }
+    .term-faint { color: #9A9284; }
+    .term-prompt { color: #3F6A4B; font-weight: 650; }
+    .term-path { color: #536D79; }
+    .term-branch { color: #725F78; }
+    .ansi-green { color: #4F7358; }
+    .ansi-yellow { color: #886A3F; }
+    .ansi-blue { color: #506D7C; }
+    .ansi-magenta { color: #745F75; }
+    .ansi-cyan { color: #4F7471; }
+    .ansi-red { color: #9E5045; }
+    .term-strong { color: var(--ink); font-weight: 720; }
+    .tmux-line {
+      color: var(--ink);
+      background: var(--raised);
+    }
+
+    /* 352px overlay inspector; terminal geometry never changes. */
+    .inspector {
+      position: absolute;
+      top: 48px;
+      right: 0;
+      bottom: 34px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      width: 352px;
+      max-width: 100vw;
+      overflow: hidden;
+      border-left: 1px solid var(--hairline);
+      background: var(--panel);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(14px);
+      transition: opacity 220ms var(--ease-decel), transform 220ms var(--ease-decel);
+    }
+
+    .inspector.is-open {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+    }
+
+    .inspector-segments {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 4px;
+      flex: 0 0 48px;
+      height: 48px;
+      padding: 6px 10px 5px;
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .segment-button {
+      height: 36px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12.5px;
+      cursor: default;
+      transition: background-color 120ms var(--ease-standard), color 120ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .segment-button:hover {
+      color: var(--ink);
+      background: #F0ECE2;
+    }
+
+    .segment-button[aria-selected="true"] {
+      color: var(--ink);
+      background: var(--raised);
+      font-weight: 620;
+    }
+
+    .segment-button:active {
+      transform: translateY(1px);
+    }
+
+    .inspector-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .inspector-page {
+      width: 100%;
+      height: 100%;
+      padding: 4px 18px 24px;
+      overflow-y: auto;
+      scrollbar-color: #C7C0B1 transparent;
+    }
+
+    .group-title {
+      margin: 0;
+      padding: 18px 0 8px;
+      border-bottom: 1px solid var(--hairline);
+      color: var(--muted);
+      font-size: 10.5px;
+      font-weight: 640;
+      letter-spacing: .08em;
+    }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 52px;
+      border-bottom: 1px solid #E5E0D5;
+    }
+
+    .setting-label {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      gap: 2px;
+    }
+
+    .setting-label strong {
+      color: var(--ink);
+      font-size: 12.5px;
+      font-weight: 540;
+    }
+
+    .setting-label small {
+      overflow: hidden;
+      color: var(--faint);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      line-height: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .setting-readout {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .mini-segment {
+      display: inline-flex;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--hairline);
+      border-radius: 4px;
+      background: var(--paper);
+    }
+
+    .mini-segment button {
+      height: 28px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 2px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 10.5px;
+      cursor: default;
+      transition: background-color 100ms var(--ease-standard), color 100ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .mini-segment button:hover,
+    .mini-segment button.is-selected {
+      color: var(--ink);
+      background: var(--raised);
+    }
+
+    .mini-segment button:active {
+      transform: translateY(1px);
+    }
+
+    .switch {
+      position: relative;
+      width: 38px;
+      height: 20px;
+      flex: 0 0 38px;
+      padding: 0;
+      border: 1px solid #A9A191;
+      border-radius: 10px;
+      background: var(--paper);
+      cursor: default;
+      transition: background-color 120ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .switch::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--muted);
+      transform: translateX(0);
+      transition: background-color 120ms var(--ease-standard), transform 120ms var(--ease-decel);
+    }
+
+    .switch[aria-checked="true"] {
+      background: var(--ink);
+    }
+
+    .switch[aria-checked="true"]::after {
+      background: var(--panel);
+      transform: translateX(18px);
+    }
+
+    .switch:active {
+      transform: translateY(1px);
+    }
+
+    .stepper {
+      display: inline-flex;
+      align-items: center;
+      height: 32px;
+      border: 1px solid var(--hairline);
+      border-radius: 4px;
+      background: var(--paper);
+    }
+
+    .stepper button {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 14px;
+      cursor: default;
+      transition: background-color 100ms var(--ease-standard), color 100ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .stepper button:hover {
+      color: var(--ink);
+      background: var(--raised);
+    }
+
+    .stepper button:active {
+      transform: translateY(1px);
+    }
+
+    .stepper output {
+      min-width: 36px;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-align: center;
+    }
+
+    .paper-select,
+    .field-input {
+      height: 32px;
+      border: 1px solid var(--hairline);
+      border-radius: 4px;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+
+    .paper-select {
+      width: 132px;
+      padding: 0 8px;
+    }
+
+    .field-input {
+      width: 160px;
+      padding: 0 9px;
+    }
+
+    .paper-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid var(--hairline);
+      border-radius: 4px;
+      background: var(--paper);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+
+    .paper-swatch {
+      width: 12px;
+      height: 12px;
+      border: 1px solid #BDB5A5;
+      border-radius: 2px;
+      background: var(--paper);
+    }
+
+    .connection-state-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px;
+      border: 1px solid var(--hairline);
+      border-radius: 5px;
+      background: var(--paper);
+    }
+
+    .connection-state-card .state-mark {
+      margin-top: 1px;
+    }
+
+    .connection-state-copy {
+      display: flex;
+      flex: 1 1 auto;
+      flex-direction: column;
+      min-width: 0;
+      gap: 3px;
+    }
+
+    .connection-state-copy strong {
+      color: var(--success);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      font-weight: 660;
+    }
+
+    .connection-state-copy span {
+      overflow: hidden;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 9.5px;
+      line-height: 14px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .recovery-row {
+      margin-top: 8px;
+      padding: 10px 11px;
+      border-left: 2px solid var(--vermilion);
+      background: #F4E9E4;
+    }
+
+    .recovery-copy {
+      margin: 0 0 8px;
+      color: #7B4038;
+      font-size: 11px;
+      line-height: 16px;
+    }
+
+    .inline-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .text-action,
+    .secondary-button {
+      height: 30px;
+      padding: 0 10px;
+      border: 1px solid #BDB5A5;
+      border-radius: 3px;
+      background: transparent;
+      color: var(--ink);
+      font-size: 11px;
+      cursor: default;
+      transition: background-color 100ms var(--ease-standard), opacity 100ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .text-action:hover,
+    .secondary-button:hover {
+      background: var(--raised);
+    }
+
+    .text-action:active,
+    .secondary-button:active {
+      transform: translateY(1px);
+    }
+
+    .failure-details {
+      margin: 9px 0 0;
+      padding: 8px 9px;
+      border: 1px solid #D9C7BD;
+      border-radius: 3px;
+      background: var(--panel);
+      color: #76584D;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      line-height: 15px;
+      white-space: pre-wrap;
+    }
+
+    .primary-button {
+      width: 100%;
+      height: 38px;
+      margin-top: 16px;
+      padding: 0 14px;
+      border: 0;
+      border-radius: 4px;
+      background: var(--vermilion);
+      color: #FFF8F0;
+      font-size: 12.5px;
+      font-weight: 650;
+      cursor: default;
+      transition: opacity 100ms var(--ease-standard), transform 90ms var(--ease-standard), background-color 100ms var(--ease-standard);
+    }
+
+    .primary-button:hover {
+      background: #9F3328;
+    }
+
+    .primary-button:active {
+      opacity: .84;
+      transform: translateY(1px);
+    }
+
+    .primary-button:disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
+    .connection-note {
+      margin: 9px 0 0;
+      color: var(--faint);
+      font-size: 10px;
+      line-height: 15px;
+    }
+
+    /* Clearly separated, non-product preview controller. */
+    .demo-bar {
+      position: relative;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      height: 34px;
+      padding: 0 10px;
+      overflow-x: auto;
+      border-top: 1px solid var(--demo-line);
+      background: var(--demo-bg);
+      color: var(--demo-ink);
+      scrollbar-width: none;
+      white-space: nowrap;
+    }
+
+    .demo-bar::-webkit-scrollbar {
+      display: none;
+    }
+
+    .demo-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      flex: 0 0 auto;
+      font-size: 10.5px;
+      font-weight: 680;
+      letter-spacing: .02em;
+    }
+
+    .demo-label::before {
+      content: "预览";
+      display: inline-flex;
+      align-items: center;
+      height: 20px;
+      padding: 0 6px;
+      border: 1px solid #6D8084;
+      border-radius: 3px;
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 700;
+    }
+
+    .demo-rule {
+      width: 1px;
+      height: 18px;
+      flex: 0 0 1px;
+      background: var(--demo-line);
+    }
+
+    .demo-button {
+      flex: 0 0 auto;
+      height: 24px;
+      padding: 0 9px;
+      border: 1px solid #7E9296;
+      border-radius: 3px;
+      background: #EDF2F2;
+      color: var(--demo-ink);
+      font-size: 10.5px;
+      cursor: default;
+      transition: background-color 100ms var(--ease-standard), transform 90ms var(--ease-standard);
+    }
+
+    .demo-button:hover {
+      background: #F7FAFA;
+    }
+
+    .demo-button:active {
+      background: #CFDADB;
+      transform: translateY(1px);
+    }
+
+    .demo-readout {
+      min-width: 0;
+      margin-left: auto;
+      overflow: hidden;
+      color: #52656A;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 1100px) {
+      .tab {
+        flex-basis: 158px;
+      }
+
+      .terminal-output {
+        padding-right: 24px;
+        padding-left: 28px;
+        font-size: 12px;
+      }
+
+      .terminal-canvas::before {
+        left: 18px;
+      }
+
+      .demo-label {
+        font-size: 10px;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .inspector {
+        width: min(352px, 100vw);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .inspector,
+      .tab,
+      .icon-button,
+      .segment-button,
+      .mini-segment button,
+      .switch,
+      .switch::after,
+      .stepper button,
+      .text-action,
+      .secondary-button,
+      .primary-button,
+      .demo-button,
+      .overflow-menu button {
+        transition-duration: 0ms;
+      }
+
+      .tab[data-state="connecting"] .seal,
+      .state-mark[data-state="connecting"] .seal {
+        animation: none;
+        opacity: .62;
+      }
+
+      .seal.stamp-drop {
+        animation: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app inspector-open" id="app">
+    <header class="rail" aria-label="Emberline 标签与窗口操作">
+      <nav class="tab-scroll" role="tablist" aria-label="终端标签页">
+        <button class="tab is-active" id="tab-fusion" type="button" role="tab" aria-selected="true" aria-controls="terminal-output" data-tab="fusion" data-state="connected">
+          <span class="state-mark" aria-hidden="true"><span class="seal"></span></span>
+          <span class="tab-title">fusion-vm</span>
+          <span class="tab-status">已连接 · 18 ms</span>
+        </button>
+        <button class="tab" id="tab-build" type="button" role="tab" aria-selected="false" aria-controls="terminal-output" data-tab="build" data-state="connecting" tabindex="-1">
+          <span class="state-mark" aria-hidden="true"><span class="seal"></span></span>
+          <span class="tab-title">build 构建</span>
+          <span class="tab-status">正在连接 · 第 2 次</span>
+        </button>
+        <button class="tab" id="tab-logs" type="button" role="tab" aria-selected="false" aria-controls="terminal-output" data-tab="logs" data-state="failed" tabindex="-1">
+          <span class="state-mark" aria-hidden="true"><span class="seal"></span></span>
+          <span class="tab-title">logs 日志</span>
+          <span class="tab-status">失败 · 握手超时</span>
+        </button>
+        <button class="tab" id="tab-ssh" type="button" role="tab" aria-selected="false" aria-controls="terminal-output" data-tab="ssh" data-state="unread-complete" tabindex="-1">
+          <span class="state-mark" aria-hidden="true"><span class="seal"></span></span>
+          <span class="tab-title">ssh 备用</span>
+          <span class="tab-status">完成 · 未读</span>
+        </button>
+      </nav>
+
+      <div class="rail-actions">
+        <div class="product-actions" aria-label="终端操作">
+          <button class="icon-button" id="connection-action" type="button" aria-label="连接" aria-expanded="false" title="连接">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9.2 14.8 14.8 9.2"></path>
+              <path d="M7.4 17.7 5.9 19.2a3.4 3.4 0 0 1-4.8-4.8l3.7-3.7a3.4 3.4 0 0 1 4.8 0"></path>
+              <path d="m16.6 6.3 1.5-1.5a3.4 3.4 0 0 1 4.8 4.8l-3.7 3.7a3.4 3.4 0 0 1-4.8 0"></path>
+            </svg>
+          </button>
+          <button class="icon-button" id="settings-action" type="button" aria-label="设置" aria-expanded="true" aria-controls="inspector" title="设置">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.2 13.2a7.7 7.7 0 0 0 0-2.4l2-1.5-2-3.5-2.4 1a8.7 8.7 0 0 0-2.1-1.2L14.4 3h-4.1L10 5.6c-.8.3-1.5.7-2.1 1.2l-2.4-1-2 3.5 2 1.5a7.7 7.7 0 0 0 0 2.4l-2 1.5 2 3.5 2.4-1c.6.5 1.3.9 2.1 1.2l.3 2.6h4.1l.3-2.6c.8-.3 1.5-.7 2.1-1.2l2.4 1 2-3.5-2-1.5Z"></path>
+            </svg>
+          </button>
+          <button class="icon-button" id="more-action" type="button" aria-label="溢出菜单" aria-haspopup="menu" aria-expanded="false" title="更多">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="5" cy="12" r="1.2" fill="currentColor" stroke="none"></circle>
+              <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"></circle>
+              <circle cx="19" cy="12" r="1.2" fill="currentColor" stroke="none"></circle>
+            </svg>
+          </button>
+        </div>
+        <span class="window-divider" aria-hidden="true"></span>
+        <div class="window-controls" aria-label="系统窗口控件占位">
+          <span class="window-dot" title="最小化占位"></span>
+          <span class="window-dot" title="最大化占位"></span>
+          <span class="window-dot" title="关闭占位"></span>
+        </div>
+
+        <div class="overflow-menu" id="overflow-menu" role="menu" aria-label="更多操作" hidden>
+          <button type="button" role="menuitem" data-menu-label="新建窗口">新建窗口</button>
+          <button type="button" role="menuitem" data-menu-label="帮助与诊断">帮助与诊断</button>
+          <div class="menu-rule" aria-hidden="true"></div>
+          <button type="button" role="menuitem" data-menu-label="关于 Emberline">关于 Emberline</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="terminal-canvas" aria-label="终端画布">
+      <pre class="terminal-output" id="terminal-output" role="tabpanel" aria-labelledby="tab-fusion" tabindex="0"></pre>
+    </main>
+
+    <aside class="inspector is-open" id="inspector" aria-label="检查器" aria-hidden="false">
+      <div class="inspector-segments" role="tablist" aria-label="检查器目的地">
+        <button class="segment-button" type="button" role="tab" aria-selected="true" data-pane="terminal">终端</button>
+        <button class="segment-button" type="button" role="tab" aria-selected="false" data-pane="appearance">外观</button>
+        <button class="segment-button" type="button" role="tab" aria-selected="false" data-pane="connection">连接</button>
+      </div>
+
+      <div class="inspector-body">
+        <section class="inspector-page" data-page="terminal" aria-label="终端设置">
+          <h2 class="group-title">光标</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>光标样式</strong>
+              <small>终端输入位置</small>
+            </div>
+            <div class="mini-segment" aria-label="选择光标样式">
+              <button class="is-selected" type="button">竖线</button>
+              <button type="button">方块</button>
+              <button type="button">下划线</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>光标闪烁</strong>
+              <small>仅输入聚焦时</small>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="光标闪烁" aria-checked="true"></button>
+          </div>
+
+          <h2 class="group-title">字体</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>终端字号</strong>
+              <small>物理键盘显示密度</small>
+            </div>
+            <div class="stepper" aria-label="调整终端字号">
+              <button type="button" data-font-step="-1" aria-label="减小字号">−</button>
+              <output id="font-size-readout">13</output>
+              <button type="button" data-font-step="1" aria-label="增大字号">+</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>字体家族</strong>
+              <small>终端等宽字体</small>
+            </div>
+            <span class="setting-readout">JetBrains Mono</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>行距</strong>
+              <small>终端正文节奏</small>
+            </div>
+            <span class="setting-readout">1.50</span>
+          </div>
+
+          <h2 class="group-title">交互</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>复制选中内容</strong>
+              <small>松开选择后写入剪贴板</small>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="复制选中内容" aria-checked="false"></button>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>粘贴前确认</strong>
+              <small>多行命令显示确认提示</small>
+            </div>
+            <button class="switch" type="button" role="switch" aria-label="粘贴前确认" aria-checked="true"></button>
+          </div>
+        </section>
+
+        <section class="inspector-page" data-page="appearance" aria-label="外观设置" hidden>
+          <h2 class="group-title">纸面</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>终端主题</strong>
+              <small>浅色纸化 ANSI</small>
+            </div>
+            <select class="paper-select" aria-label="终端主题">
+              <option>纸间浅色</option>
+              <option>米宣低对比</option>
+              <option>暖灰校样</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>纸面基底</strong>
+              <small>终端与应用底色</small>
+            </div>
+            <span class="paper-chip"><span class="paper-swatch" aria-hidden="true"></span>#F2EFE7</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>ANSI 饱和度</strong>
+              <small>长时间阅读更安静</small>
+            </div>
+            <div class="mini-segment" aria-label="ANSI 饱和度">
+              <button class="is-selected" type="button">低</button>
+              <button type="button">中</button>
+            </div>
+          </div>
+
+          <h2 class="group-title">层级</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>检查器材质</strong>
+              <small>覆盖终端，不改变网格</small>
+            </div>
+            <span class="setting-readout">米白纸</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>面板阴影</strong>
+              <small>纸面色差与发丝线分层</small>
+            </div>
+            <span class="setting-readout">关闭</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>发丝线</strong>
+              <small>边界与分组基线</small>
+            </div>
+            <span class="setting-readout">1 px</span>
+          </div>
+        </section>
+
+        <section class="inspector-page" data-page="connection" aria-label="连接设置" hidden>
+          <div class="connection-state-card" id="connection-state-card" data-state="connected">
+            <span class="state-mark" id="connection-state-mark" data-state="connected" aria-hidden="true"><span class="seal"></span></span>
+            <div class="connection-state-copy">
+              <strong id="connection-state-title">已连接</strong>
+              <span id="connection-state-detail">延迟 18 ms · 会话保持中</span>
+            </div>
+          </div>
+
+          <div class="recovery-row" id="recovery-row" hidden>
+            <p class="recovery-copy">Fusion Agent 握手超时，终端会话尚未建立。</p>
+            <div class="inline-actions">
+              <button class="text-action" id="retry-action" type="button">重试</button>
+              <button class="text-action" id="details-action" type="button" aria-expanded="false">详情</button>
+            </div>
+            <pre class="failure-details" id="failure-details" hidden>连接阶段：WebSocket 握手
+端点：172.16.100.2:8765/ws
+错误：等待响应超过 8 秒</pre>
+          </div>
+
+          <h2 class="group-title">Fusion Agent</h2>
+          <label class="setting-row">
+            <span class="setting-label">
+              <strong>主机</strong>
+              <small>融合开发引擎虚拟机</small>
+            </span>
+            <input class="field-input" type="text" value="172.16.100.2" aria-label="主机">
+          </label>
+          <label class="setting-row">
+            <span class="setting-label">
+              <strong>端口</strong>
+              <small>WebSocket PTY</small>
+            </span>
+            <input class="field-input" type="text" value="8765" inputmode="numeric" aria-label="端口">
+          </label>
+          <label class="setting-row">
+            <span class="setting-label">
+              <strong>访问令牌</strong>
+              <small>仅保存在本机</small>
+            </span>
+            <input class="field-input" type="password" value="harmonyterm" aria-label="访问令牌">
+          </label>
+
+          <button class="primary-button" id="connect-agent-action" type="button">重新连接 Agent</button>
+          <p class="connection-note">连接成功后保持远端 tmux；关闭标签只断开本地视图，不终止远端任务。</p>
+
+          <h2 class="group-title">备用路径</h2>
+          <div class="setting-row">
+            <div class="setting-label">
+              <strong>SSH 备用</strong>
+              <small>主连接不可用时手动启用</small>
+            </div>
+            <button class="secondary-button" type="button">配置</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <footer class="demo-bar" aria-label="预览演示控制条">
+      <span class="demo-label">仅预览演示用 · 非产品界面</span>
+      <span class="demo-rule" aria-hidden="true"></span>
+      <button class="demo-button" id="cycle-state" type="button">① 循环连接状态</button>
+      <button class="demo-button" id="set-connecting" type="button">② 切到连接中</button>
+      <button class="demo-button" id="set-failed" type="button">③ 切到失败</button>
+      <span class="demo-readout" id="demo-readout">当前演示：fusion-vm · 已连接</span>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      const terminalContent = {
+        fusion: [
+          '<span class="term-dim">Emberline / Fusion Engine VM · tmux: emberline:0</span>',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(feature/inkfolio)</span> $ git status --short',
+          '<span class="ansi-yellow"> M</span> entry/src/main/ets/pages/Index.ets',
+          '<span class="ansi-green">??</span> docs/frontend-brainstorm/2026-07-21-emberline-redesign/',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(feature/inkfolio)</span> $ ./hvigorw assembleHap --mode module -p product=default',
+          '<span class="term-dim">> hvigor</span> 读取工程配置…',
+          '<span class="ansi-blue">[entry]</span> default@PreBuild                  <span class="ansi-green">完成</span>  38 ms',
+          '<span class="ansi-blue">[entry]</span> default@CompileArkTS             <span class="ansi-green">完成</span>  1.42 s',
+          '<span class="ansi-blue">[entry]</span> default@LinkNativeLibrary        <span class="ansi-green">完成</span>  214 ms',
+          '<span class="ansi-blue">[entry]</span> default@PackageHap               <span class="ansi-green">完成</span>  306 ms',
+          '',
+          '<span class="term-strong">构建完成</span> · 输出 entry-default-unsigned.hap · 总用时 2.18 s',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(feature/inkfolio)</span> $ tmux list-panes -F "#{pane_index} #{pane_current_command}"',
+          '0 codex',
+          '1 hvigorw',
+          '2 journalctl',
+          '',
+          '<span class="tmux-line">[emberline] 0:codex*  1:build-  2:logs-                           17:42 21-07-2026</span>',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(feature/inkfolio)</span> $ <span class="term-strong">▌</span>'
+        ].join('\n'),
+        build: [
+          '<span class="term-dim">Emberline / build 构建 · 正在恢复 Agent 会话</span>',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(main)</span> $ pnpm run check:structure',
+          '',
+          '<span class="ansi-blue">检查</span> rail-height.mjs                     <span class="ansi-green">通过</span>',
+          '<span class="ansi-blue">检查</span> terminal-first-viewport.mjs          <span class="ansi-green">通过</span>',
+          '<span class="ansi-blue">检查</span> inspector-overlay-contract.mjs       <span class="ansi-green">通过</span>',
+          '<span class="ansi-blue">检查</span> no-layout-animation.mjs              <span class="ansi-green">通过</span>',
+          '<span class="ansi-blue">检查</span> cjk-no-scale.mjs                     <span class="ansi-green">通过</span>',
+          '<span class="ansi-blue">检查</span> session-state-semantics.mjs           <span class="ansi-green">通过</span>',
+          '',
+          '<span class="ansi-yellow">等待</span> Fusion Agent 重新附着 PTY…',
+          '<span class="term-faint">尝试 2 / 5 · 下一次退避 2 秒 · 远端 tmux 不受影响</span>',
+          '',
+          '$ printf "终端内容切换保持 0ms 硬切，检查器只覆盖不重排\\n"',
+          '终端内容切换保持 0ms 硬切，检查器只覆盖不重排',
+          '',
+          '<span class="tmux-line">[emberline] 0:codex-  1:build*  2:logs-                           17:42 21-07-2026</span>'
+        ].join('\n'),
+        logs: [
+          '<span class="term-dim">Emberline / logs 日志 · Fusion Agent 连接诊断</span>',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~</span> $ journalctl --user -u wand-agent -n 12 --no-pager',
+          '<span class="term-faint">7月 21 17:39:52 fusion-vm wand-agent[2184]:</span> 监听 ws://172.16.100.2:8765/ws',
+          '<span class="term-faint">7月 21 17:40:01 fusion-vm wand-agent[2184]:</span> 客户端已连接 session=ember-7',
+          '<span class="term-faint">7月 21 17:40:01 fusion-vm wand-agent[2184]:</span> PTY 已附着 TERM=xterm-256color',
+          '<span class="term-faint">7月 21 17:41:44 fusion-vm wand-agent[2184]:</span> 客户端断开 code=1006',
+          '',
+          '<span class="ansi-red">连接失败</span> WebSocket 握手超时',
+          '<span class="ansi-red">端点</span>     ws://172.16.100.2:8765/ws',
+          '<span class="ansi-red">阶段</span>     等待 HTTP 101 Switching Protocols',
+          '<span class="ansi-red">耗时</span>     8.00 s',
+          '',
+          '<span class="ansi-yellow">建议</span>  检查虚拟机桥接网络与 wand-agent 服务；远端 tmux 任务不会被终止。',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~</span> $ systemctl --user status wand-agent --no-pager',
+          '● wand-agent.service - WebSocket PTY for Emberline',
+          '   Active: <span class="ansi-green">active (running)</span>',
+          '',
+          '<span class="tmux-line">[emberline] 0:codex-  1:build-  2:logs*                           17:42 21-07-2026</span>'
+        ].join('\n'),
+        ssh: [
+          '<span class="term-dim">Emberline / ssh 备用 · 后台任务已完成</span>',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(release)</span> $ rsync -az --info=progress2 entry-default-unsigned.hap edge-tablet:/data/local/tmp/',
+          '      8,764,416 100%   32.61MB/s    0:00:00 (xfr#1, to-chk=0/1)',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(release)</span> $ ssh edge-tablet hdc install -r /data/local/tmp/entry-default-unsigned.hap',
+          '[Info] install bundle successfully.',
+          '',
+          '<span class="ansi-green">部署完成</span> · com.preview.fusionterm.debug',
+          '设备：MatePad Edge 预览机',
+          '耗时：4.8 秒',
+          '',
+          '<span class="ansi-cyan">任务提醒</span> 后台构建与安装已完成，等待查看。',
+          '<span class="term-faint">此条完成事件通过 OSC 9 标记为未读，不中断当前终端输入。</span>',
+          '',
+          '<span class="term-prompt">dev@fusion-vm</span>:<span class="term-path">~/workspace/emberline</span> <span class="term-branch">(release)</span> $ git tag --points-at HEAD',
+          'preview-2026.07.21',
+          '',
+          '<span class="tmux-line">[emberline] 0:codex-  1:build-  2:deploy*                         17:42 21-07-2026</span>'
+        ].join('\n')
+      };
+
+      const stateMeta = {
+        connected: {
+          tab: '已连接 · 18 ms',
+          title: '已连接',
+          detail: '延迟 18 ms · 会话保持中'
+        },
+        connecting: {
+          tab: '正在连接 · 第 2 次',
+          title: '正在连接',
+          detail: '正在协商 WebSocket 与 PTY'
+        },
+        failed: {
+          tab: '失败 · 握手超时',
+          title: '连接失败',
+          detail: '握手超时 · 172.16.100.2:8765'
+        },
+        'unread-complete': {
+          tab: '完成 · 未读',
+          title: '任务已完成',
+          detail: '连接保持 · 有一条未读完成信息'
+        }
+      };
+
+      const tabs = Array.from(document.querySelectorAll('.tab'));
+      const models = new Map(tabs.map((tab) => [tab.dataset.tab, {
+        id: tab.dataset.tab,
+        title: tab.querySelector('.tab-title').textContent,
+        state: tab.dataset.state
+      }]));
+
+      const app = document.getElementById('app');
+      const terminal = document.getElementById('terminal-output');
+      const inspector = document.getElementById('inspector');
+      const settingsAction = document.getElementById('settings-action');
+      const connectionAction = document.getElementById('connection-action');
+      const moreAction = document.getElementById('more-action');
+      const overflowMenu = document.getElementById('overflow-menu');
+      const connectionCard = document.getElementById('connection-state-card');
+      const connectionMark = document.getElementById('connection-state-mark');
+      const connectionTitle = document.getElementById('connection-state-title');
+      const connectionDetail = document.getElementById('connection-state-detail');
+      const recoveryRow = document.getElementById('recovery-row');
+      const detailsAction = document.getElementById('details-action');
+      const failureDetails = document.getElementById('failure-details');
+      const connectAgentAction = document.getElementById('connect-agent-action');
+      const demoReadout = document.getElementById('demo-readout');
+      const fontSizeReadout = document.getElementById('font-size-readout');
+
+      let activeId = 'fusion';
+      let inspectorOpen = true;
+      let inspectorPane = 'terminal';
+      let cycleCursor = 0;
+      let stateMutation = 0;
+      let recoveryTimer = 0;
+      let fontSize = 13;
+      const cycleSequence = ['connecting', 'connected', 'unread-complete', 'failed', 'connected'];
+
+      function currentModel() {
+        return models.get(activeId);
+      }
+
+      function renderTerminal() {
+        terminal.innerHTML = terminalContent[activeId];
+        terminal.setAttribute('aria-labelledby', `tab-${activeId}`);
+        terminal.scrollTop = 0;
+        terminal.scrollLeft = 0;
+      }
+
+      function renderTabs() {
+        tabs.forEach((tab) => {
+          const model = models.get(tab.dataset.tab);
+          const active = model.id === activeId;
+          tab.dataset.state = model.state;
+          tab.classList.toggle('is-active', active);
+          tab.setAttribute('aria-selected', String(active));
+          tab.tabIndex = active ? 0 : -1;
+          tab.querySelector('.tab-status').textContent = stateMeta[model.state].tab;
+          tab.setAttribute('aria-label', `${model.title}，${stateMeta[model.state].title}${active ? '，当前标签' : ''}`);
+        });
+      }
+
+      function updateDemoReadout(message = '') {
+        const model = currentModel();
+        const suffix = message ? ` · ${message}` : '';
+        demoReadout.textContent = `当前演示：${model.title} · ${stateMeta[model.state].title}${suffix}`;
+      }
+
+      function syncConnectionPanel() {
+        const model = currentModel();
+        const meta = stateMeta[model.state];
+        connectionCard.dataset.state = model.state;
+        connectionMark.dataset.state = model.state;
+        connectionTitle.textContent = meta.title;
+        connectionDetail.textContent = meta.detail;
+        recoveryRow.hidden = model.state !== 'failed';
+        if (model.state !== 'failed') {
+          failureDetails.hidden = true;
+          detailsAction.setAttribute('aria-expanded', 'false');
+        }
+        connectAgentAction.disabled = model.state === 'connecting';
+        connectAgentAction.textContent = model.state === 'connecting' ? '正在连接…' : '重新连接 Agent';
+      }
+
+      function playStampDrop() {
+        const activeSeal = document.querySelector(`.tab[data-tab="${activeId}"] .seal`);
+        const seals = [activeSeal, connectionMark.querySelector('.seal')].filter(Boolean);
+        seals.forEach((seal) => {
+          seal.classList.remove('stamp-drop');
+          void seal.offsetWidth;
+          seal.classList.add('stamp-drop');
+          seal.addEventListener('animationend', () => seal.classList.remove('stamp-drop'), { once: true });
+        });
+      }
+
+      function setState(nextState) {
+        const model = currentModel();
+        const previous = model.state;
+        stateMutation += 1;
+        if (recoveryTimer) {
+          window.clearTimeout(recoveryTimer);
+          recoveryTimer = 0;
+        }
+        model.state = nextState;
+        renderTabs();
+        syncConnectionPanel();
+        updateDemoReadout();
+        if (nextState === 'connected' && previous !== 'connected') {
+          playStampDrop();
+        }
+      }
+
+      function activateTab(id, focus = false) {
+        activeId = id;
+        cycleCursor = 0;
+        renderTabs();
+        renderTerminal();
+        syncConnectionPanel();
+        updateDemoReadout();
+        if (focus) {
+          document.querySelector(`.tab[data-tab="${id}"]`).focus();
+        }
+      }
+
+      function setInspector(open) {
+        inspectorOpen = open;
+        inspector.classList.toggle('is-open', open);
+        inspector.setAttribute('aria-hidden', String(!open));
+        settingsAction.setAttribute('aria-expanded', String(open));
+        connectionAction.setAttribute('aria-expanded', String(open && inspectorPane === 'connection'));
+        app.classList.toggle('inspector-open', open);
+      }
+
+      function setInspectorPane(pane) {
+        inspectorPane = pane;
+        document.querySelectorAll('.segment-button').forEach((button) => {
+          button.setAttribute('aria-selected', String(button.dataset.pane === pane));
+        });
+        document.querySelectorAll('.inspector-page').forEach((page) => {
+          page.hidden = page.dataset.page !== pane;
+        });
+        connectionAction.setAttribute('aria-expanded', String(inspectorOpen && pane === 'connection'));
+      }
+
+      function beginRecovery() {
+        const recoveryId = activeId;
+        setState('connecting');
+        const recoveryMutation = stateMutation;
+        recoveryTimer = window.setTimeout(() => {
+          recoveryTimer = 0;
+          const model = models.get(recoveryId);
+          if (activeId === recoveryId && stateMutation === recoveryMutation && model.state === 'connecting') {
+            setState('connected');
+            updateDemoReadout('落印完成');
+          }
+        }, 760);
+      }
+
+      function setOverflow(open) {
+        overflowMenu.hidden = !open;
+        moreAction.setAttribute('aria-expanded', String(open));
+      }
+
+      tabs.forEach((tab, index) => {
+        tab.addEventListener('click', () => activateTab(tab.dataset.tab));
+        tab.addEventListener('keydown', (event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+          event.preventDefault();
+          const step = event.key === 'ArrowRight' ? 1 : -1;
+          const nextIndex = (index + step + tabs.length) % tabs.length;
+          activateTab(tabs[nextIndex].dataset.tab, true);
+        });
+      });
+
+      document.querySelectorAll('.segment-button').forEach((button) => {
+        button.addEventListener('click', () => setInspectorPane(button.dataset.pane));
+      });
+
+      document.querySelectorAll('.mini-segment').forEach((group) => {
+        group.querySelectorAll('button').forEach((button) => {
+          button.addEventListener('click', () => {
+            group.querySelectorAll('button').forEach((item) => item.classList.toggle('is-selected', item === button));
+          });
+        });
+      });
+
+      document.querySelectorAll('.switch').forEach((toggle) => {
+        toggle.addEventListener('click', () => {
+          toggle.setAttribute('aria-checked', String(toggle.getAttribute('aria-checked') !== 'true'));
+        });
+      });
+
+      document.querySelectorAll('[data-font-step]').forEach((button) => {
+        button.addEventListener('click', () => {
+          fontSize = Math.max(10, Math.min(26, fontSize + Number(button.dataset.fontStep)));
+          fontSizeReadout.textContent = String(fontSize);
+        });
+      });
+
+      settingsAction.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setOverflow(false);
+        if (inspectorOpen) {
+          setInspector(false);
+        } else {
+          setInspectorPane('terminal');
+          setInspector(true);
+        }
+      });
+
+      connectionAction.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setOverflow(false);
+        setInspectorPane('connection');
+        setInspector(true);
+      });
+
+      moreAction.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setOverflow(overflowMenu.hidden);
+      });
+
+      overflowMenu.addEventListener('click', (event) => event.stopPropagation());
+      overflowMenu.querySelectorAll('[data-menu-label]').forEach((item) => {
+        item.addEventListener('click', () => {
+          setOverflow(false);
+          updateDemoReadout(`菜单示意：${item.dataset.menuLabel}`);
+        });
+      });
+
+      document.addEventListener('click', () => setOverflow(false));
+      document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!overflowMenu.hidden) {
+          setOverflow(false);
+        } else if (inspectorOpen) {
+          setInspector(false);
+        }
+      });
+
+      document.getElementById('cycle-state').addEventListener('click', () => {
+        const next = cycleSequence[cycleCursor];
+        cycleCursor = (cycleCursor + 1) % cycleSequence.length;
+        setState(next);
+      });
+
+      document.getElementById('set-connecting').addEventListener('click', () => setState('connecting'));
+      document.getElementById('set-failed').addEventListener('click', () => setState('failed'));
+      document.getElementById('retry-action').addEventListener('click', beginRecovery);
+      connectAgentAction.addEventListener('click', beginRecovery);
+
+      detailsAction.addEventListener('click', () => {
+        const open = failureDetails.hidden;
+        failureDetails.hidden = !open;
+        detailsAction.setAttribute('aria-expanded', String(open));
+      });
+
+      renderTabs();
+      renderTerminal();
+      syncConnectionPanel();
+      updateDemoReadout();
+    })();
+  </script>
+</body>
+</html>

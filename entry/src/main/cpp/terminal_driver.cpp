@@ -958,4 +958,3 @@ extern "C" __attribute__((constructor)) void RegisterFusionTerminalDriverModule(
 {
     napi_module_register(&g_fusionTerminalDriverModule);
 }
-

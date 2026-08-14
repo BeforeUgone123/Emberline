@@ -15,7 +15,7 @@ assert.match(agentDriver, /const safeError = error \|\| '';/);
 assert.match(agentDriver, /error: safeError/);
 assert.doesNotMatch(agentDriver, /'Agent error', err\.message\)/);
 assert.match(agentDriver, /const errorText = err && err\.message \? err\.message : '连接失败';/);
-assert.match(agentDriver, /this\.emitStatus\(false, 'Agent 错误', errorText\);/);
+assert.match(agentDriver, /this\.handleUnexpectedSocketFailure\(ownSocket, 'Agent 错误', errorText\);/);
 
 assert.match(nativeDriver, /const safeMode = mode \|\| 'local';/);
 assert.match(nativeDriver, /const safeLabel = label \|\| '';/);

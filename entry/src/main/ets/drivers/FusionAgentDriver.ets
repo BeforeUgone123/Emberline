@@ -38,6 +38,9 @@ interface PendingRelay {
 // Client-side deadline slightly above the agent's own 30s scp timeout so the
 // agent's error message wins the race when the transfer itself is slow.
 const RELAY_REPLY_TIMEOUT_MS = 35000;
+// Stock wand-agent accepts JSON `ping` control messages. Keep a small margin
+// below hardened-agent 30s read deadlines so an idle terminal stays attached.
+const AGENT_HEARTBEAT_INTERVAL_MS = 25000;
 
 export class FusionAgentDriver {
   private controller: TerminalController | null = null;
@@ -55,9 +58,17 @@ export class FusionAgentDriver {
   // every deliberate teardown (closeConnection), so manual disconnect, tab
   // close, and a clean shell exit never trigger retries.
   private autoReconnect: boolean = false;
+  // Last state pushed through emitStatus, replayed verbatim when a new
+  // listener attaches (tab moved across windows must not repaint a live
+  // connection as idle -- that fake edge made adopting windows treat a live
+  // socket as dead).
+  private lastEmittedConnected: boolean = false;
+  private lastEmittedLabel: string = 'Agent 待机';
+  private lastEmittedError: string = '';
   private lastEndpoint: FusionAgentEndpoint | null = null;
   private reconnectAttempt: number = 0;
   private reconnectTimer: number = -1;
+  private heartbeatTimer: number = -1;
   // PTY output arrives in arbitrary WebSocket frame chunks, so a multi-byte
   // UTF-8 sequence can be split across frames; the incomplete tail is kept
   // here until the next frame arrives.
@@ -161,7 +172,9 @@ export class FusionAgentDriver {
 
   setStatusListener(listener: FusionAgentStatusListener | null): void {
     this.statusListener = listener;
-    this.emitStatus(false, 'Agent 待机', '');
+    // Replay the CURRENT truth to the new listener instead of hardcoded idle.
+    this.emitStatus(this.lastEmittedConnected, this.lastEmittedLabel,
+      this.lastEmittedError);
   }
 
   connect(endpoint: FusionAgentEndpoint): void {
@@ -173,6 +186,7 @@ export class FusionAgentDriver {
   }
 
   private openSocket(endpoint: FusionAgentEndpoint): void {
+    this.stopHeartbeat();
     if (this.socket) {
       this.closeSocket(this.socket);
       this.socket = null;
@@ -201,7 +215,8 @@ export class FusionAgentDriver {
     });
 
     try {
-      this.socket = webSocket.createWebSocket();
+      const ownSocket = webSocket.createWebSocket();
+      this.socket = ownSocket;
       this.registerSocketHandlers();
       this.emitStatus(false, `正在连接 ${endpointLabel}`, '');
       // The hardened wand-agent fork prefers Authorization: Bearer; the token
@@ -210,16 +225,40 @@ export class FusionAgentDriver {
         const options: webSocket.WebSocketRequestOptions = {
           header: { 'Authorization': `Bearer ${endpoint.token}` }
         };
-        this.socket.connect(url, options);
+        ownSocket.connect(url, options)
+          .then((connected: boolean) => {
+            if (!connected) {
+              this.handleUnexpectedSocketFailure(ownSocket, 'Agent 连接失败', '连接请求未成功');
+            }
+          })
+          .catch((err: Error) => {
+            this.handleUnexpectedSocketFailure(ownSocket, 'Agent 连接失败',
+              err && err.message ? err.message : '连接失败');
+          });
       } else {
-        this.socket.connect(url);
+        ownSocket.connect(url)
+          .then((connected: boolean) => {
+            if (!connected) {
+              this.handleUnexpectedSocketFailure(ownSocket, 'Agent 连接失败', '连接请求未成功');
+            }
+          })
+          .catch((err: Error) => {
+            this.handleUnexpectedSocketFailure(ownSocket, 'Agent 连接失败',
+              err && err.message ? err.message : '连接失败');
+          });
       }
     } catch (err) {
+      const failedSocket = this.socket;
+      if (failedSocket) {
+        this.handleUnexpectedSocketFailure(failedSocket, 'Agent 连接失败', JSON.stringify(err));
+        return;
+      }
       this.connected = false;
       this.ready = false;
       this.supportsTerminateControl = false;
       this.socket = null;
       this.emitStatus(false, 'Agent 连接失败', JSON.stringify(err));
+      this.maybeScheduleReconnect();
     }
   }
 
@@ -231,6 +270,7 @@ export class FusionAgentDriver {
     this.autoReconnect = false;
     this.cancelReconnectTimer();
     this.stopTerminateCloseTimer();
+    this.stopHeartbeat();
     const socketToClose = this.socket;
     if (terminateRemote) {
       this.sendRemoteTerminationRequest();
@@ -287,6 +327,46 @@ export class FusionAgentDriver {
     this.reconnectTimer = -1;
   }
 
+  private startHeartbeat(ownSocket: webSocket.WebSocket): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.socket !== ownSocket || !this.connected) {
+        this.stopHeartbeat();
+        return;
+      }
+      this.sendSocketPayload(stringifyFusionAgentMessage(createPingMessage(Date.now())));
+    }, AGENT_HEARTBEAT_INTERVAL_MS) as number;
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer < 0) {
+      return;
+    }
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = -1;
+  }
+
+  private handleUnexpectedSocketFailure(ownSocket: webSocket.WebSocket, label: string, error: string): void {
+    if (this.socket !== ownSocket) {
+      return;
+    }
+
+    // Null first so close/error events raised by closeSocket cannot run the
+    // failure transition twice or mutate a newer connection generation.
+    this.socket = null;
+    this.stopHeartbeat();
+    this.connected = false;
+    this.ready = false;
+    this.supportsTerminateControl = false;
+    this.pendingUtf8Tail = [];
+    this.rejectAllPendingRelays('Agent 连接已断开');
+    this.closeSocket(ownSocket);
+    this.emitStatus(false, label, error);
+    // Initial handshakes must retry too; the old wasConnected gate stranded a
+    // session forever when the first connection failed during screen resume.
+    this.maybeScheduleReconnect();
+  }
+
   private maybeScheduleReconnect(): void {
     if (!this.autoReconnect || !this.lastEndpoint || this.reconnectTimer >= 0) {
       return;
@@ -317,7 +397,7 @@ export class FusionAgentDriver {
     this.sendSocketPayload(stringifyFusionAgentMessage(createForkMessage(cwd || this.currentCwd)));
   }
 
-  // Ask the agent to scp a shared-folder file to a tailnet host. Resolves with
+  // Ask the agent to scp a shared-folder file to a remote host. Resolves with
   // the remote path on success; rejects on validation/scp failure, reply
   // timeout, or connection teardown while the request is in flight.
   uploadRelay(src: string, target: string, dir: string): Promise<string> {
@@ -389,6 +469,7 @@ export class FusionAgentDriver {
       this.connected = true;
       this.ready = true;
       this.reconnectAttempt = 0;
+      this.startHeartbeat(ownSocket);
       this.emitStatus(true, this.currentEndpointLabel, '');
       this.requestCurrentDirectory();
     });
@@ -401,34 +482,12 @@ export class FusionAgentDriver {
     });
 
     ownSocket.on('close', () => {
-      if (this.socket !== ownSocket) {
-        return;
-      }
-      const wasConnected = this.connected;
-      this.connected = false;
-      this.ready = false;
-      this.pendingUtf8Tail = [];
-      if (wasConnected || this.reconnectAttempt > 0) {
-        this.maybeScheduleReconnect();
-        if (this.reconnectTimer < 0 && wasConnected) {
-          this.emitStatus(false, 'Agent 已断开', '');
-        }
-      }
+      this.handleUnexpectedSocketFailure(ownSocket, 'Agent 已断开', '');
     });
 
     ownSocket.on('error', (err: Error) => {
-      if (this.socket !== ownSocket) {
-        return;
-      }
-      const wasConnected = this.connected;
-      this.connected = false;
-      this.ready = false;
-      this.pendingUtf8Tail = [];
       const errorText = err && err.message ? err.message : '连接失败';
-      this.emitStatus(false, 'Agent 错误', errorText);
-      if (wasConnected || this.reconnectAttempt > 0) {
-        this.maybeScheduleReconnect();
-      }
+      this.handleUnexpectedSocketFailure(ownSocket, 'Agent 错误', errorText);
     });
   }
 
@@ -486,6 +545,9 @@ export class FusionAgentDriver {
   }
 
   private emitStatus(connected: boolean, label: string, error: string): void {
+    this.lastEmittedConnected = connected;
+    this.lastEmittedLabel = label || '';
+    this.lastEmittedError = error || '';
     if (!this.statusListener) {
       return;
     }
@@ -503,16 +565,24 @@ export class FusionAgentDriver {
   }
 
   private sendSocketPayload(payload: string | ArrayBuffer): void {
-    if (!this.socket) {
+    const ownSocket = this.socket;
+    if (!ownSocket) {
       return;
     }
 
     try {
-      this.socket.send(payload);
+      ownSocket.send(payload)
+        .then((sent: boolean) => {
+          if (!sent) {
+            this.handleUnexpectedSocketFailure(ownSocket, 'Agent 发送失败', '发送请求未成功');
+          }
+        })
+        .catch((err: Error) => {
+          this.handleUnexpectedSocketFailure(ownSocket, 'Agent 发送失败',
+            err && err.message ? err.message : '发送失败');
+        });
     } catch (err) {
-      this.connected = false;
-      this.ready = false;
-      this.emitStatus(false, 'Agent 发送失败', JSON.stringify(err));
+      this.handleUnexpectedSocketFailure(ownSocket, 'Agent 发送失败', JSON.stringify(err));
     }
   }
 

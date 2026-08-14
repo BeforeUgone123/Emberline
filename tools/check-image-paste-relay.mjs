@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 // Image-paste 'relay' mode: a pasted image staged in the shared folder is
-// scp-relayed by wand-agent to a configured tailnet host, and the REMOTE path
+// scp-relayed by wand-agent to a configured remote host, and the REMOTE path
 // is pasted. This check pins the whole client-side chain: protocol message,
 // driver round-trip bookkeeping, session config fields, and the Index wiring.
 

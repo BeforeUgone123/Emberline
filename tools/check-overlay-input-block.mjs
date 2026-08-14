@@ -42,6 +42,12 @@ assert.match(napi, /bool m_inputBlocked = false;/, 'native needs the overlay inp
 const setInputBlocked = extractFunction(napi, 'void SetInputBlocked(bool blocked)');
 assert.match(
   setInputBlocked,
+  /ResetInterruptedInputState\(\);[\s\S]*?m_inputBlocked = blocked;/,
+  'blocking and resumed input must reset every interrupted pointer and axis sequence'
+);
+const resetInterruptedInput = extractFunction(napi, 'void ResetInterruptedInputState()');
+assert.match(
+  resetInterruptedInput,
   /m_physShiftDown = false;[\s\S]*?m_axisScrollRemainderY = 0\.0;[\s\S]*?m_axisVelocityY = 0\.0f;/,
   'blocking input must park held-Shift and the trackpad accumulator so nothing sticks'
 );

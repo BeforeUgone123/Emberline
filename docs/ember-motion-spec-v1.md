@@ -1,5 +1,34 @@
 # Emberline 动效规范 v1
 
+> 2026-07-18:本文保留为第一版动效研究与编号来源,不是待办清单。当前实现
+> 以根 `AGENTS.md` 的动效不做清单、Direction A
+> `docs/frontend-brainstorm/2026-07-18-harmonyos-ui-ux-optimization/design-brief.md`
+> 和源码为准。
+> M13(屏幕快捷键条)、全屏 dim scrim、抽屉推挤终端、主题暗幕、布局尺寸补间
+> 已被明确否决;看到下文旧方案不得重新实现。所有现有动效仍待真机长 tmux
+> 输出与后台功耗验证。
+
+> **2026-07-28 废止声明 —— 本规范的签名系统已整体失效,勿照做。**
+>
+> 设计方向改为「不要强调色,尽量贴近 ghostty」,随之:
+> - **唯一强调色「余烬铜」#D08F53 废止**。现在整个 chrome 由当前主题推导
+>   (`theme/ChromeTheme.ets`):顶栏 = 终端背景色,文字/描边/面板 = 前景色的
+>   不同透明度阶梯;唯一的非中性色是失败态借用主题自己的 ANSI red。
+>   因此第 12 行的「气质基线」与裁决原则⑤(强调色只出现在灯丝与主按钮)作废。
+> - **灯丝(filament)整体废止**。`filamentColor` 与四个 life-signs epoch 已从
+>   `TerminalSession.ets` 删除,连接态改为中性状态点(实心/呼吸/空心/失败红)。
+>   §2「灯丝生命体征系统」、§3.1、M01–M05 全部作废;§3.2「选中态灯丝」所描述的
+>   五处选中指示也已不复存在。
+> - **遗留死代码**:`theme/EmberMotion.ets` 里 `DUR_IGNITE_FLASH` /
+>   `DUR_IGNITE_SETTLE` / `DUR_EXTINGUISH_HOLD` / `DUR_EXTINGUISH_COOL` 四个
+>   「灯丝签名专用」常量已无任何引用,同文件第 17 行仍写着「强调色动效只出现在
+>   灯丝与主按钮」的注释也已过时,待清理。
+>
+> **仍然有效**:时长档(DUR_INSTANT/FAST/STANDARD/AMBIENT)、曲线定义、裁决原则
+> ①②③④、「含 CJK 文字组件禁 transform scale」、「任何循环动画必须状态门控、
+> 离态即收尾」、以及「不做」清单(粒子/smooth-caret/cursor trail/页面级转场)。
+> 当前实现的动效语汇以源码与 `AGENTS.md` 为准。
+
 > 适用:HarmonyOS 原生终端模拟器 Emberline / MatePad Edge(2in1,120Hz,键盘+触控板+触屏)
 > 气质基线:近黑三层(#07090C/#0D1117/#1C232E)、唯一强调色「余烬铜」#D08F53、签名隐喻=灯丝(亮/半亮/灰烬)。
 > **裁决五原则**:①每个动效必须传达一个状态(连接/断开/连接中/失败/完成/选中/切换),答不出即砍;②高频路径宁快勿花;③终端渲染层(XComponent/reflow)动效从严,默认瞬切;④含 CJK 文字组件禁 `transform scale`,一律 `opacity + translateY`;⑤强调色动效只出现在灯丝与主按钮。
@@ -152,7 +181,7 @@ this.getUIContext().animateTo({ duration: DUR_STANDARD, curve: CURVE_DECEL },
 
 **性能论证**:必须走 ArkUI 声明式属性动画(RenderService 合成线程),**绝不用 `setInterval`/`requestAnimationFrame` 逐帧驱动**(会占 UI/JS 线程抢终端输入)。2px 节点 opacity 循环在 GPU 上≈免费,`FRAME_60` 进一步省电。与 XComponent 分属两层,不碰终端渲染。
 
-> 熄灭(2.1 表第三态)与失败(第四态)复用同一 epoch/keyframe 基建,详设见第 3 节方案表 M03/M04——非对称编排是关键:熄灭首段 120ms 先 hold 住余温、再 700ms 慢慢冷透(色相 ember→过渡橙 #C56B3A→ash),读作「刚刚还活着、现在慢慢凉了」;失败做 2–3 下**无辉光**的顿挫闪烁后落灰,与呼吸的「平滑+有辉光+循环」刻意拉开,不看文字也能分「在连」与「连不上」。
+> 熄灭(2.1 表第三态)与失败(第四态)复用同一 epoch/keyframe 基建,详设见第 3 节方案表 M03/M04——非对称编排是关键:熄灭首段 120ms 先 hold 住余温、再 700ms 慢慢冷透(色相 ember→过渡橙 #C56B3A→ash),读作「此前还活着、现在慢慢凉了」;失败做 2–3 下**无辉光**的顿挫闪烁后落灰,与呼吸的「平滑+有辉光+循环」刻意拉开,不看文字也能分「在连」与「连不上」。
 
 ---
 

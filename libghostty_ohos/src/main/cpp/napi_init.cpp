@@ -12,6 +12,7 @@
 #include <rawfile/raw_file_manager.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -74,6 +75,15 @@ std::unordered_map<InputMethod_TextEditorProxy*, TerminalHost*> g_imeProxyHosts;
 std::mutex g_processImeHostMutex;
 TerminalHost* g_processImeHost = nullptr;
 
+// Raw theme assets are immutable for the lifetime of the loaded HAR. Parsing
+// the same file once per terminal tab made a theme click perform repeated
+// synchronous file I/O on the ArkTS caller thread, so share parsed values and
+// the sorted catalogue across hosts.
+std::mutex g_themeCacheMutex;
+std::unordered_map<std::string, TerminalTheme> g_themeCache;
+std::vector<std::string> g_themeListCache;
+bool g_themeListCacheReady = false;
+
 TerminalHost* FindImeHost(InputMethod_TextEditorProxy* proxy)
 {
     std::lock_guard<std::mutex> lock(g_imeProxyHostsMutex);
@@ -110,12 +120,20 @@ constexpr uint64_t LONG_PRESS_MS = 500;
 constexpr uint64_t MULTI_CLICK_MS = 400;
 constexpr float MOVE_THRESHOLD = 20.0f;
 constexpr auto CURSOR_BLINK_TICK = std::chrono::milliseconds(250);
+constexpr auto IME_RENDER_REPORT_INTERVAL = std::chrono::milliseconds(50);
 // Inertial (fling) scrolling for touch swipes. Velocity is px/s of touch
 // travel; the render thread animates it with exponential decay.
 constexpr float FLING_START_MIN_VELOCITY = 240.0f;
 constexpr float FLING_STOP_VELOCITY = 40.0f;
 constexpr float FLING_MAX_VELOCITY = 9000.0f;
 constexpr float FLING_DECAY_PER_SECOND = 2.4f;
+// Mouse-tracking TUIs consume discrete wheel events and may map each event to
+// several content rows. Reusing the local pixel-scroll tail multiplies the
+// apparent travel in tmux, so keep only a short release tail for that mode.
+constexpr float TRACKED_WHEEL_FLING_VELOCITY_SCALE = 0.20f;
+constexpr float TRACKED_WHEEL_FLING_STOP_VELOCITY = 120.0f;
+constexpr float TRACKED_WHEEL_FLING_DECAY_PER_SECOND = 9.0f;
+static constexpr size_t kMaxOsc9SequenceBytes = 4096;
 static constexpr size_t kMaxOsc52SequenceBytes = 16 * 1024 * 1024;
 // Animation cadence for the fling. The decay itself is time-based
 // [v *= exp(-k*dt) with dt = real elapsed steady_clock time] and the stop
@@ -917,7 +935,9 @@ public:
         {
             std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
             m_surfaceReady = false;
+            m_xComponentFocused.store(false, std::memory_order_relaxed);
             m_imeVisible = false;
+            ResetInterruptedInputState();
         }
         {
             std::lock_guard<std::mutex> lock(m_renderMutex);
@@ -928,9 +948,11 @@ public:
     void OnSurfaceDestroyed() {
         StopRenderLoop();
         DetachImeLocked();
+        ResetInterruptedInputState();
 
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         m_surfaceReady = false;
+        m_xComponentFocused.store(false, std::memory_order_relaxed);
         m_surfaceFrameOriginKnown = false;
         m_surfaceScreenOriginKnown = false;
         m_windowScreenOriginKnown = false;
@@ -945,14 +967,17 @@ public:
     void OnFocusEvent()
     {
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        m_xComponentFocused.store(true, std::memory_order_relaxed);
         ShowImeLocked(IME_REQUEST_REASON_OTHER);
-        NotifyImeStateLocked();
+        NotifyImeStateLocked(true);
     }
 
     void OnBlurEvent()
     {
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
+        m_xComponentFocused.store(false, std::memory_order_relaxed);
         m_imeVisible = false;
+        ResetInterruptedInputState();
     }
 
     bool DispatchKeyEvent(OH_NativeXComponent* component) {
@@ -1209,7 +1234,7 @@ public:
                                             touchEvent.x, touchEvent.y, false, cellWidth, cellHeight);
                         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
-                        NotifyImeStateLocked();
+                        NotifyImeStateLocked(true);
                     } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP &&
                                moveDistance >= MOVE_THRESHOLD) {
                         StartFling(m_touchVelocityY, true, touchEvent.x, touchEvent.y);
@@ -1239,7 +1264,7 @@ public:
                     } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP && moveDistance < MOVE_THRESHOLD) {
                         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                         ShowImeLocked(IME_REQUEST_REASON_TOUCH);
-                        NotifyImeStateLocked();
+                        NotifyImeStateLocked(true);
                         QueueLinkActivationAtPoint(touchEvent.x, touchEvent.y, cellWidth, cellHeight);
                     } else if (touchEvent.type == OH_NATIVEXCOMPONENT_UP && moveDistance >= MOVE_THRESHOLD) {
                         touchFlingStarted = StartFling(m_touchVelocityY, false, touchEvent.x, touchEvent.y);
@@ -1339,7 +1364,7 @@ public:
                 } else if (m_isMousePressed && mouseEvent.button == OH_NATIVEXCOMPONENT_LEFT_BUTTON) {
                     std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
                     ShowImeLocked(IME_REQUEST_REASON_MOUSE);
-                    NotifyImeStateLocked();
+                    NotifyImeStateLocked(true);
                     const bool sameCell = row == m_mousePressRow && col == m_mousePressCol;
                     const bool selectionWasClearedByClick = m_mouseHadSelectionOnPress && !m_mousePressOnSelection;
                     if (sameCell) {
@@ -1599,20 +1624,38 @@ public:
     {
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
         ShowImeLocked(IME_REQUEST_REASON_OTHER);
-        NotifyImeStateLocked();
+        NotifyImeStateLocked(true);
+    }
+
+    // Pointer streams can lose their UP/CANCEL event when the surface is hidden,
+    // blurred, or covered by an ArkUI overlay. In particular, a stale
+    // m_isMousePressed makes DispatchTouchEvent reject every later finger event
+    // as a synthesized duplicate, which disables both scrolling and tap-to-IME.
+    void ResetInterruptedInputState()
+    {
+        m_isTouching = false;
+        m_isSelecting = false;
+        m_touchMouseDragActive = false;
+        m_touchScrollRemainderY = 0.0f;
+        m_touchWheelRemainderY = 0.0f;
+        m_touchVelocityY = 0.0f;
+        ResetLocalMouseTrackingState();
+        StopSelectionAutoScroll();
+        m_physShiftDown = false;
+        m_axisScrollRemainderY = 0.0;
+        m_axisVelocityY = 0.0f;
     }
 
     // Flipped by the ETS `active` prop (false while the settings drawer or the
-    // tab editor is open). Parks the trackpad accumulator and the held-Shift
-    // bypass so nothing sticks across the blocked window.
+    // tab editor is open). Clear every in-flight pointer/axis sequence because
+    // its terminal event may land on the overlay instead of this XComponent.
     void SetInputBlocked(bool blocked)
     {
+        // A lock/unlock or overlay transition can interrupt both pointer and
+        // trackpad-axis streams. Reset on the foreground edge as well as the
+        // background edge so stale state never survives into resumed input.
+        ResetInterruptedInputState();
         m_inputBlocked = blocked;
-        if (blocked) {
-            m_physShiftDown = false;
-            m_axisScrollRemainderY = 0.0;
-            m_axisVelocityY = 0.0f;
-        }
     }
 
     void SetImeActive(bool active)
@@ -1641,30 +1684,50 @@ public:
         }
     }
 
-    // OSC 9 desktop notifications (iTerm2 protocol): AI CLIs (claude code,
-    // codex with iterm2 notify channels) and scripts emit ESC ] 9 ; body BEL
-    // to say "task finished, look at me". ConEmu progress reports
+    // OSC 9 desktop notifications: Codex TUI with notification_method="osc9"
+    // and other task runners emit ESC ] 9 ; body BEL to say "task finished,
+    // look at me". PTY/WebSocket reads may split the sequence anywhere, so
+    // incomplete data is carried into the next chunk. ConEmu progress reports
     // (ESC ] 9 ; 4 ; ...) share the prefix and are skipped.
     void CaptureOsc9Notifications(const std::string& data) {
         const std::string osc9Prefix = "\x1b]9;";
+        std::lock_guard<std::mutex> parserLock(m_osc9Mutex);
+        if (m_pendingOsc9Sequence.empty() && data.find('\x1b') == std::string::npos) {
+            return;
+        }
+        std::string joinedData;
+        const std::string* scanData = &data;
+        if (!m_pendingOsc9Sequence.empty()) {
+            joinedData = std::move(m_pendingOsc9Sequence);
+            joinedData += data;
+            m_pendingOsc9Sequence.clear();
+            scanData = &joinedData;
+        }
+
         size_t searchPos = 0;
         while (true) {
-            const size_t start = data.find(osc9Prefix, searchPos);
+            const size_t start = scanData->find(osc9Prefix, searchPos);
             if (start == std::string::npos) {
+                RememberOsc9PrefixTailLocked(*scanData);
                 return;
             }
             const size_t payloadStart = start + osc9Prefix.size();
-            size_t end = data.find('\x07', payloadStart);
+            size_t end = scanData->find('\x07', payloadStart);
             size_t terminatorLen = 1;
-            const size_t st = data.find("\x1b\\", payloadStart);
+            const size_t st = scanData->find("\x1b\\", payloadStart);
             if (st != std::string::npos && (end == std::string::npos || st < end)) {
                 end = st;
                 terminatorLen = 2;
             }
             if (end == std::string::npos) {
+                m_pendingOsc9Sequence = scanData->substr(start);
+                if (m_pendingOsc9Sequence.size() > kMaxOsc9SequenceBytes) {
+                    OH_LOG_WARN(LOG_APP, "Dropping oversized incomplete OSC 9 notification");
+                    m_pendingOsc9Sequence.clear();
+                }
                 return;
             }
-            std::string payload = data.substr(payloadStart, end - payloadStart);
+            std::string payload = scanData->substr(payloadStart, end - payloadStart);
             searchPos = end + terminatorLen;
             if (payload.rfind("4;", 0) == 0) {
                 continue;
@@ -1672,9 +1735,22 @@ public:
             if (payload.size() > 300) {
                 payload.resize(300);
             }
-            std::lock_guard<std::mutex> lock(m_notificationMutex);
+            std::lock_guard<std::mutex> notificationLock(m_notificationMutex);
             if (m_pendingNotifications.size() < 8) {
                 m_pendingNotifications.push_back(std::move(payload));
+            }
+        }
+    }
+
+    void RememberOsc9PrefixTailLocked(const std::string& data) {
+        const std::string osc9Prefix = "\x1b]9;";
+        m_pendingOsc9Sequence.clear();
+        const size_t maxTail = std::min(osc9Prefix.size() - 1, data.size());
+        for (size_t len = maxTail; len > 0; --len) {
+            const size_t index = data.size() - len;
+            if (osc9Prefix.compare(0, len, data, index, len) == 0) {
+                m_pendingOsc9Sequence = data.substr(index);
+                return;
             }
         }
     }
@@ -1684,39 +1760,42 @@ public:
     void CaptureOsc52ClipboardRequests(const std::string& data) {
         const std::string osc52Prefix = "\x1b]52;";
         std::lock_guard<std::mutex> lock(m_osc52Mutex);
-        std::string scanData;
+        if (m_pendingOsc52Sequence.empty() && data.find('\x1b') == std::string::npos) {
+            return;
+        }
+        std::string joinedData;
+        const std::string* scanData = &data;
         if (!m_pendingOsc52Sequence.empty()) {
-            scanData = std::move(m_pendingOsc52Sequence);
-            scanData += data;
+            joinedData = std::move(m_pendingOsc52Sequence);
+            joinedData += data;
             m_pendingOsc52Sequence.clear();
-        } else {
-            scanData = data;
+            scanData = &joinedData;
         }
 
         size_t searchPos = 0;
         while (true) {
-            const size_t start = scanData.find(osc52Prefix, searchPos);
+            const size_t start = scanData->find(osc52Prefix, searchPos);
             if (start == std::string::npos) {
-                RememberOsc52PrefixTail(scanData);
+                RememberOsc52PrefixTail(*scanData);
                 return;
             }
             const size_t payloadStart = start + osc52Prefix.size();
-            size_t end = scanData.find('\x07', payloadStart);
+            size_t end = scanData->find('\x07', payloadStart);
             size_t terminatorLen = 1;
-            const size_t st = scanData.find("\x1b\\", payloadStart);
+            const size_t st = scanData->find("\x1b\\", payloadStart);
             if (st != std::string::npos && (end == std::string::npos || st < end)) {
                 end = st;
                 terminatorLen = 2;
             }
             if (end == std::string::npos) {
-                m_pendingOsc52Sequence = scanData.substr(start);
+                m_pendingOsc52Sequence = scanData->substr(start);
                 if (m_pendingOsc52Sequence.size() > kMaxOsc52SequenceBytes) {
                     OH_LOG_WARN(LOG_APP, "Dropping oversized incomplete OSC 52 clipboard sequence");
                     m_pendingOsc52Sequence.clear();
                 }
                 return;
             }
-            const std::string payload = scanData.substr(payloadStart, end - payloadStart);
+            const std::string payload = scanData->substr(payloadStart, end - payloadStart);
             HandleOsc52Payload(payload);
             searchPos = end + terminatorLen;
         }
@@ -2026,27 +2105,47 @@ public:
         // Mutates renderer colors/repaint flags: keep it off the render
         // thread's back as well (cheap, called rarely).
         std::lock_guard<std::recursive_mutex> surfaceLock(m_surfaceMutex);
-        if (!m_resourceManager || !m_terminal) {
+        if (!m_terminal) {
             return false;
         }
-
-        std::string themePath = "themes/";
-        themePath += themeName;
-        RawFile* file = OH_ResourceManager_OpenRawFile(m_resourceManager, themePath.c_str());
-        if (!file) {
-            OH_LOG_ERROR(LOG_APP, "Failed to open theme file: %s", themePath.c_str());
-            return false;
-        }
-
-        const size_t len = OH_ResourceManager_GetRawFileSize(file);
-        std::vector<char> data(len);
-        OH_ResourceManager_ReadRawFile(file, data.data(), len);
-        OH_ResourceManager_CloseRawFile(file);
 
         TerminalTheme theme;
-        theme.name = themeName;
-        if (!ThemeParser::parseThemeFile(data.data(), len, theme)) {
-            return false;
+        bool cached = false;
+        {
+            std::lock_guard<std::mutex> cacheLock(g_themeCacheMutex);
+            const auto cachedTheme = g_themeCache.find(themeName);
+            if (cachedTheme != g_themeCache.end()) {
+                theme = cachedTheme->second;
+                cached = true;
+            }
+        }
+
+        if (!cached) {
+            if (!m_resourceManager) {
+                return false;
+            }
+            std::string themePath = "themes/";
+            themePath += themeName;
+            RawFile* file = OH_ResourceManager_OpenRawFile(m_resourceManager, themePath.c_str());
+            if (!file) {
+                OH_LOG_ERROR(LOG_APP, "Failed to open theme file: %s", themePath.c_str());
+                return false;
+            }
+
+            const size_t len = OH_ResourceManager_GetRawFileSize(file);
+            std::vector<char> data(len);
+            OH_ResourceManager_ReadRawFile(file, data.data(), len);
+            OH_ResourceManager_CloseRawFile(file);
+
+            TerminalTheme parsedTheme;
+            parsedTheme.name = themeName;
+            if (!ThemeParser::parseThemeFile(data.data(), len, parsedTheme)) {
+                return false;
+            }
+
+            std::lock_guard<std::mutex> cacheLock(g_themeCacheMutex);
+            const auto inserted = g_themeCache.emplace(themeName, parsedTheme);
+            theme = inserted.first->second;
         }
 
         m_terminal->setTheme(theme);
@@ -2077,6 +2176,13 @@ public:
     }
 
     std::vector<std::string> GetThemeList() const {
+        {
+            std::lock_guard<std::mutex> cacheLock(g_themeCacheMutex);
+            if (g_themeListCacheReady) {
+                return g_themeListCache;
+            }
+        }
+
         std::vector<std::string> themes;
         if (!m_resourceManager) {
             return themes;
@@ -2097,7 +2203,14 @@ public:
         }
         OH_ResourceManager_CloseRawDir(themeDir);
         std::sort(themes.begin(), themes.end());
-        return themes;
+        {
+            std::lock_guard<std::mutex> cacheLock(g_themeCacheMutex);
+            if (!g_themeListCacheReady) {
+                g_themeListCache = themes;
+                g_themeListCacheReady = true;
+            }
+            return g_themeListCache;
+        }
     }
 
     void SetConfig(int fontSize, int scrollbackLines, uint32_t bgColor, uint32_t fgColor, int cursorStyle,
@@ -2150,12 +2263,24 @@ public:
         return m_rendererError;
     }
 
-    bool CanAcceptImeCallbacks() const
+    bool CanConfigureIme() const
     {
         return m_imeActive.load(std::memory_order_relaxed);
     }
 
+    bool CanAcceptImeCallbacks() const
+    {
+        return CanConfigureIme() &&
+            m_xComponentFocused.load(std::memory_order_relaxed);
+    }
+
 private:
+    static TerminalHost* FindConfigurableImeHost(InputMethod_TextEditorProxy* proxy)
+    {
+        TerminalHost* host = FindImeHost(proxy);
+        return host != nullptr && host->CanConfigureIme() ? host : nullptr;
+    }
+
     static TerminalHost* FindActiveImeHost(InputMethod_TextEditorProxy* proxy)
     {
         TerminalHost* host = FindImeHost(proxy);
@@ -2164,7 +2289,7 @@ private:
 
     static void HandleImeGetTextConfig(InputMethod_TextEditorProxy* proxy, InputMethod_TextConfig* config)
     {
-        if (TerminalHost* host = FindActiveImeHost(proxy)) {
+        if (TerminalHost* host = FindConfigurableImeHost(proxy)) {
             host->FillImeTextConfig(config);
         }
     }
@@ -2341,8 +2466,14 @@ private:
                         } else {
                             flingSmoothPx = m_flingVelocityY * dt;
                         }
-                        m_flingVelocityY *= std::exp(-FLING_DECAY_PER_SECOND * dt);
-                        if (std::abs(m_flingVelocityY) < FLING_STOP_VELOCITY) {
+                        const float decayPerSecond = m_flingAsWheel
+                            ? TRACKED_WHEEL_FLING_DECAY_PER_SECOND
+                            : FLING_DECAY_PER_SECOND;
+                        const float stopVelocity = m_flingAsWheel
+                            ? TRACKED_WHEEL_FLING_STOP_VELOCITY
+                            : FLING_STOP_VELOCITY;
+                        m_flingVelocityY *= std::exp(-decayPerSecond * dt);
+                        if (std::abs(m_flingVelocityY) < stopVelocity) {
                             m_flingActive = false;
                             flingJustStopped = true;
                         }
@@ -2772,14 +2903,17 @@ private:
             return false;
         }
         const float clamped = std::clamp(velocityY, -FLING_MAX_VELOCITY, FLING_MAX_VELOCITY);
-        if (std::abs(clamped) < FLING_START_MIN_VELOCITY) {
+        const float adjusted = asWheel
+            ? clamped * TRACKED_WHEEL_FLING_VELOCITY_SCALE
+            : clamped;
+        if (std::abs(adjusted) < FLING_START_MIN_VELOCITY) {
             return false;
         }
         {
             std::lock_guard<std::mutex> lock(m_renderMutex);
             m_flingActive = true;
             m_flingAsWheel = asWheel;
-            m_flingVelocityY = clamped;
+            m_flingVelocityY = adjusted;
             m_flingRemainderY = 0.0f;
             m_flingPointerX = pointerX;
             m_flingPointerY = pointerY;
@@ -3063,17 +3197,38 @@ private:
         // that walk the proxy's function table on an IPC thread. Destroying it
         // was the UAF behind the OS_IPC SIGSEGV crash after IME_ERR_DETACHED.
         // The proxy stays registered and AttachImeLocked reuses it.
+        m_wantsIme = false;
         m_imeVisible = false;
         m_imePreviewActive = false;
         InvalidateImeReportCacheLocked();
     }
 
+    bool HandleImeProxyErrorLocked(InputMethod_ErrorCode rc, const char* operation)
+    {
+        if (rc == IME_ERR_OK) {
+            return false;
+        }
+
+        OH_LOG_WARN(LOG_APP, "IME %{public}s failed: %{public}d", operation, static_cast<int>(rc));
+        // Once an IME IPC fails, letting printable keys keep falling through to
+        // the service creates a permanent letter-only dead zone: digits still
+        // use the native encoder while letters are silently delegated here.
+        m_wantsIme = false;
+        m_imeVisible = false;
+        m_imePreviewActive = false;
+        if (rc == IME_ERR_DETACHED) {
+            ResetImeSessionLocked();
+        }
+        return true;
+    }
+
     void ShowImeLocked(InputMethod_RequestKeyboardReason reason)
     {
-        m_wantsIme = true;
         if (!m_imeActive.load(std::memory_order_relaxed)) {
+            m_wantsIme = false;
             return;
         }
+        m_wantsIme = true;
         // A show request means the keyboard is (re)appearing; drop the throttle
         // cache so the next NotifyImeStateLocked re-anchors the caret rect even
         // if the geometry happens to match the previously reported values.
@@ -3081,6 +3236,7 @@ private:
         ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr) {
             if (!AttachImeLocked(true, reason)) {
+                m_wantsIme = false;
                 return;
             }
             return;
@@ -3089,6 +3245,7 @@ private:
         InputMethod_AttachOptions* options =
             OH_AttachOptions_CreateWithRequestKeyboardReason(true, reason);
         if (options == nullptr) {
+            m_wantsIme = false;
             return;
         }
         const InputMethod_ErrorCode rc = OH_InputMethodProxy_ShowTextInput(m_imeInputMethodProxy, options);
@@ -3098,16 +3255,21 @@ private:
         } else if (rc == IME_ERR_DETACHED) {
             ResetImeSessionLocked();
             if (!AttachImeLocked(true, reason)) {
+                m_wantsIme = false;
                 return;
             }
+            m_wantsIme = true;
             m_imeVisible = true;
         } else {
             OH_LOG_WARN(LOG_APP, "Failed to show IME: %{public}d", static_cast<int>(rc));
+            m_wantsIme = false;
+            m_imeVisible = false;
         }
     }
 
     void HideImeLocked()
     {
+        m_wantsIme = false;
         ForgetStaleImeProxyLocked();
         if (m_imeInputMethodProxy == nullptr || !m_imeVisible) {
             return;
@@ -3174,7 +3336,10 @@ private:
         std::lock_guard<std::recursive_mutex> lock(m_surfaceMutex);
         m_imeVisible = keyboardStatus == IME_KEYBOARD_STATUS_SHOW;
         if (!m_imeVisible) {
+            m_wantsIme = false;
             m_imePreviewActive = false;
+        } else {
+            m_wantsIme = true;
         }
     }
 
@@ -3310,62 +3475,69 @@ private:
 
     void CaptureImeSurroundingText(std::u16string& text, int32_t& cursorIndex) const
     {
-        text.clear();
-        cursorIndex = 0;
-        if (m_terminal == nullptr) {
-            return;
-        }
-
-        std::string screen = m_terminal->getScreenContent();
-        std::vector<std::string> lines;
-        size_t start = 0;
-        while (start <= screen.size()) {
-            size_t end = screen.find('\n', start);
-            if (end == std::string::npos) {
-                lines.push_back(screen.substr(start));
-                break;
-            }
-            lines.push_back(screen.substr(start, end - start));
-            start = end + 1;
-        }
-
-        int row = 0;
-        int col = 0;
-        m_terminal->getCursorPosition(row, col);
-        if (lines.empty()) {
-            return;
-        }
-
-        const size_t lineIndex = static_cast<size_t>(std::clamp(row, 0, static_cast<int>(lines.size() - 1)));
-        text = Utf8ToUtf16(lines[lineIndex]);
-        cursorIndex = std::clamp(col, 0, static_cast<int32_t>(text.size()));
+        std::lock_guard<std::mutex> lock(m_imeSnapshotMutex);
+        text = m_cachedImeSurrounding;
+        cursorIndex = m_cachedImeCursor;
     }
 
-    void NotifyImeStateLocked()
+    void RefreshImeSurroundingText(std::u16string& text, int32_t& cursorIndex)
     {
-        ForgetStaleImeProxyLocked();
-        if (m_imeInputMethodProxy == nullptr || m_terminal == nullptr || !m_surfaceReady) {
+        text.clear();
+        cursorIndex = 0;
+        std::string line;
+        int cursorColumn = 0;
+        if (m_terminal != nullptr) {
+            m_terminal->getImeSnapshot(line, cursorColumn);
+            text = Utf8ToUtf16(line);
+            cursorIndex = std::clamp(cursorColumn, 0, static_cast<int32_t>(text.size()));
+        }
+
+        std::lock_guard<std::mutex> lock(m_imeSnapshotMutex);
+        m_cachedImeSurrounding = text;
+        m_cachedImeCursor = cursorIndex;
+    }
+
+    void NotifyImeStateLocked(bool force = false)
+    {
+        if (!m_imeActive.load(std::memory_order_relaxed) ||
+            !m_xComponentFocused.load(std::memory_order_relaxed) ||
+            !m_wantsIme ||
+            m_terminal == nullptr || !m_surfaceReady) {
             return;
         }
+        ForgetStaleImeProxyLocked();
+        if (m_imeInputMethodProxy == nullptr) {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && m_lastImeReportAt.time_since_epoch().count() != 0 &&
+            now - m_lastImeReportAt < IME_RENDER_REPORT_INTERVAL) {
+            return;
+        }
+        m_lastImeReportAt = now;
 
         std::u16string surrounding;
         int32_t cursorIndex = 0;
-        CaptureImeSurroundingText(surrounding, cursorIndex);
-        // Throttle the selection binder IPC: the render loop calls this every
-        // frame while the keyboard is up. Only push when the surrounding text or
-        // caret index actually changed (or the cache was invalidated by a
-        // show/attach/session-reset that needs a fresh push).
+        RefreshImeSurroundingText(surrounding, cursorIndex);
+        // The render loop may request this for every output frame. The early
+        // focus/rate gates above bound terminal snapshots; the value cache below
+        // separately avoids Binder IPC when the line and caret did not change.
         const bool selectionChanged =
             !m_lastImeSelectionValid ||
             m_lastImeSurroundingCursor != cursorIndex ||
             m_lastImeSurrounding != surrounding;
         if (selectionChanged) {
-            OH_InputMethodProxy_NotifySelectionChange(
-                m_imeInputMethodProxy,
-                surrounding.empty() ? nullptr : surrounding.data(),
-                surrounding.size(),
-                cursorIndex,
-                cursorIndex);
+            const InputMethod_ErrorCode selectionRc =
+                OH_InputMethodProxy_NotifySelectionChange(
+                    m_imeInputMethodProxy,
+                    surrounding.empty() ? nullptr : surrounding.data(),
+                    surrounding.size(),
+                    cursorIndex,
+                    cursorIndex);
+            if (HandleImeProxyErrorLocked(selectionRc, "selection")) {
+                return;
+            }
             m_lastImeSelectionValid = true;
             m_lastImeSurrounding = surrounding;
             m_lastImeSurroundingCursor = cursorIndex;
@@ -3520,8 +3692,12 @@ private:
                 InputMethod_CursorInfo* cursorInfo =
                     OH_CursorInfo_Create(left, top, sentWidth, sentHeight);
                 if (cursorInfo != nullptr) {
-                    OH_InputMethodProxy_NotifyCursorUpdate(m_imeInputMethodProxy, cursorInfo);
+                    const InputMethod_ErrorCode cursorRc =
+                        OH_InputMethodProxy_NotifyCursorUpdate(m_imeInputMethodProxy, cursorInfo);
                     OH_CursorInfo_Destroy(cursorInfo);
+                    if (HandleImeProxyErrorLocked(cursorRc, "cursor")) {
+                        return;
+                    }
                 }
                 m_lastImeCursorRectValid = true;
                 m_lastImeCursorLeft = left;
@@ -3538,6 +3714,7 @@ private:
     // state so the keyboard re-anchors to the caret immediately.
     void InvalidateImeReportCacheLocked()
     {
+        m_lastImeReportAt = {};
         m_lastImeSelectionValid = false;
         m_lastImeSurroundingCursor = -1;
         m_lastImeSurrounding.clear();
@@ -3637,8 +3814,10 @@ private:
     std::atomic<double> m_smoothScrollPendingPx { 0.0 };
     std::atomic<bool> m_smoothSnapRequested { false };
     double m_smoothScrollFracPx = 0.0;
+    std::mutex m_osc9Mutex;
     std::mutex m_notificationMutex;
     std::vector<std::string> m_pendingNotifications;
+    std::string m_pendingOsc9Sequence;
     uint64_t m_lastAxisSampleMs = 0;
     // Swipe velocity tracker (touch thread only).
     float m_touchVelocityY = 0.0f;
@@ -3680,14 +3859,18 @@ private:
     double m_lastLoggedSentTop = 0.0;
     bool m_lastLoggedFallbackToLastBase = false;
     bool m_lastLoggedSurfaceLooksWindowLocal = false;
-    // IME IPC throttle cache: last values actually pushed to the input-method
-    // service, so unchanged frames skip the NotifySelectionChange /
-    // NotifyCursorUpdate binder round-trips (software keyboard in place otherwise
-    // fires 2 cross-process IPCs every rendered frame). Invalidated on
-    // show/attach/session hand-off via InvalidateImeReportCacheLocked().
+    // IME render-report throttle plus the last values pushed to the input-method
+    // service. Together they bound terminal snapshots and skip unchanged Binder
+    // updates; focus/show/session hand-off invalidates both layers.
+    std::chrono::steady_clock::time_point m_lastImeReportAt {};
     bool m_lastImeSelectionValid = false;
     std::u16string m_lastImeSurrounding;
     int32_t m_lastImeSurroundingCursor = -1;
+    // Binder callbacks only read this cursor-row mirror. The render/report path
+    // refreshes it without holding the lock across outgoing IME notifications.
+    mutable std::mutex m_imeSnapshotMutex;
+    std::u16string m_cachedImeSurrounding;
+    int32_t m_cachedImeCursor = 0;
     bool m_lastImeCursorRectValid = false;
     double m_lastImeCursorLeft = 0.0;
     double m_lastImeCursorTop = 0.0;
@@ -3706,6 +3889,7 @@ private:
     InputMethod_TextEditorProxy* m_imeTextEditorProxy = nullptr;
     InputMethod_InputMethodProxy* m_imeInputMethodProxy = nullptr;
     std::atomic<bool> m_imeActive { true };
+    std::atomic<bool> m_xComponentFocused { false };
     bool m_imeVisible = false;
     bool m_wantsIme = false;
     bool m_imePreviewActive = false;

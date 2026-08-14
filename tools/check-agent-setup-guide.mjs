@@ -1,59 +1,72 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-// The wand-agent deploy walkthrough must exist in BOTH surfaces from one
-// shared builder: a one-shot first-launch overlay (persisted OnboardingStore
-// flag) and the always-reachable drawer help pane. Guarded so the tutorial
-// never silently drops out of either place or forks into two copies.
+// The wand-agent deploy walkthrough must open once on first launch and remain
+// explicitly reachable from the overflow menu afterward.
 
 const index = await readFile('entry/src/main/ets/pages/Index.ets', 'utf8');
-const store = await readFile('entry/src/main/ets/settings/OnboardingStore.ets', 'utf8');
 
-// (1) Persisted one-shot flag with its own store (clearing other settings must
-// never re-trigger onboarding).
-assert.match(store, /const STORE_NAME: string = 'fusionterm_onboarding';/, 'onboarding needs its own preferences store');
-assert.match(store, /get\('agentGuideSeen', false\)/, 'store must read the agentGuideSeen flag');
-assert.match(store, /put\('agentGuideSeen', true\);\s*await this\.prefs\.flush\(\);/s, 'markSeen must persist and flush');
-
-// (2) Index wiring: load on launch, open once, dismiss persists.
+// (1) A persisted, one-shot popup opens over the already-mounted terminal.
 assert.match(index, /@State private agentGuideOpen: boolean = false;/, 'guide overlay needs a visibility @State');
-assert.match(index, /private onboardingStore: OnboardingStore = new OnboardingStore\(\);/, 'Index must own an OnboardingStore');
-assert.match(index, /void this\.loadOnboarding\(\);/, 'aboutToAppear must check the first-launch flag');
+assert.match(index, /import \{ OnboardingStore \} from '\.\.\/settings\/OnboardingStore';/);
+assert.match(index, /private onboardingStore: OnboardingStore = new OnboardingStore\(\);/);
+assert.match(index, /aboutToAppear\(\): void \{[\s\S]*?this\.addSession\(\);[\s\S]*?void this\.loadOnboarding\(\);/);
+assert.match(index, /private async loadOnboarding\(\): Promise<void> \{[\s\S]*?this\.onboardingStore\.claimAgentGuide\(context\)[\s\S]*?this\.agentGuideMode = 'onboarding';[\s\S]*?this\.agentGuideOpen = true;/);
+
+const onboarding = await readFile('entry/src/main/ets/settings/OnboardingStore.ets', 'utf8');
+assert.match(onboarding, /let agentGuideClaimedInProcess: boolean = false;/, 'only one window may claim the popup');
+assert.match(onboarding, /async claimAgentGuide\(context: common\.UIAbilityContext\): Promise<boolean>/);
+assert.match(onboarding, /const AGENT_GUIDE_SEEN_KEY: string = 'wandAgentSetupSeenV2';/, 'the new setup prompt needs a versioned persistence key');
+assert.match(onboarding, /this\.prefs\.put\(AGENT_GUIDE_SEEN_KEY, true\)/, 'first-launch display must persist');
+
+// (2) The top-bar overflow is the permanent entry point.
 assert.match(
   index,
-  /const seen = await this\.onboardingStore\.load\(this\.context\);\s*if \(!seen\) \{\s*this\.agentGuideOpen = true;\s*\}/s,
-  'the guide must auto-open only while the flag is unset'
-);
-assert.match(
-  index,
-  /private dismissAgentGuide\(\): void \{\s*this\.agentGuideOpen = false;\s*this\.onboardingStore\.markSeen\(\)/s,
-  'dismissing the guide must persist the seen flag'
+  /MenuItem\(\{ content: '帮助与诊断' \}\)[\s\S]*?this\.agentGuideOpen = true;/,
+  'the overflow menu must open help and diagnostics'
 );
 assert.match(
   index,
   /if \(this\.agentGuideOpen\) \{\s*this\.buildAgentGuideScrim\(\);\s*this\.buildAgentGuidePanel\(\);\s*\}/s,
   'the guide overlay must be mounted in the root stack'
 );
+assert.match(index, /private dismissAgentGuide\(\): void \{\s*this\.agentGuideOpen = false;\s*this\.focusActiveTerminalSoon\(\);/s);
 
-// (3) One shared walkthrough builder, embedded in BOTH the overlay and the
-// help pane.
+// (3) One walkthrough builder, embedded in the explicit help surface.
 const panelUses = index.match(/this\.buildAgentGuideContent\(\)/g) ?? [];
-assert.ok(panelUses.length >= 2, 'the walkthrough builder must be embedded in both the overlay and the help pane');
-assert.match(index, /this\.buildGroupTitle\('部署 wand-agent\(Agent 会话\)'\)/u, 'help pane needs the deploy group');
+assert.equal(panelUses.length, 2, 'the same walkthrough builder must serve onboarding and Help');
+assert.match(index, /this\.buildGroupTitle\('部署 wand-agent\(Agent 会话\)'\)/u, 'help surface needs the deploy group');
+assert.match(index, /private buildAgentGuidePanel\(\)[\s\S]*?this\.buildHelpPane\(\)/, 'the explicit panel must host the full help surface');
+assert.match(index, /this\.agentGuideMode === 'onboarding'[\s\S]*?this\.buildAgentGuideContent\(\)[\s\S]*?this\.buildHelpPane\(\)/, 'first launch must open directly on the deploy walkthrough');
+assert.match(index, /Button\('打开连接设置'\)[\s\S]*?this\.dismissAgentGuide\(\);[\s\S]*?this\.openDrawer\('conn'\);/, 'onboarding must lead directly to connection settings');
 
-// (4) The walkthrough itself stays complete: install (both ways), run,
-// systemd, app-side connect, copyable commands.
-assert.match(index, /git clone https:\/\/github\.com\/beforeugone520\/wand-agent\.git/, 'guide must include the source build clone');
-assert.match(index, /install -m 755 wand-agent \/usr\/local\/bin\//, 'guide must include the binary install step');
-assert.match(index, /wand-agent --host 172\.16\.100\.2 --token/, 'guide must include the trial-run command');
+// (4) The walkthrough itself stays complete: npm/pnpm/curl one-line setup,
+// Go auto-provisioning, systemd diagnostics, app-side connect, copyable commands.
+assert.match(index, /pnpm add -g github:beforeugone520\/wand-agent && wand-agent service install/, 'guide must include pnpm one-line setup');
+assert.match(index, /npm install -g github:beforeugone520\/wand-agent && wand-agent service install/, 'guide must include npm one-line setup');
+assert.match(index, /curl -fsSL https:\/\/raw\.githubusercontent\.com\/beforeugone520\/Emberline\/main\/tools\/install-wand-agent\.sh/, 'guide must include curl one-line setup');
+assert.match(index, /Go 缺失或版本过旧时会自动下载带 SHA-256 校验的工具链/u, 'guide must explain automatic verified Go provisioning');
+assert.match(index, /systemctl status wand-agent --no-pager/, 'guide must include a service status check');
+assert.match(index, /const AGENT_GUIDE_UPDATE_COMMAND: string =/, 'guide must keep the update recipe in one shared constant');
+assert.match(index, /pnpm add -g github:beforeugone520\/wand-agent/, 'update recipe must refresh the pnpm package');
+assert.match(index, /wand-agent setup --force/, 'update recipe must rebuild from the refreshed source');
+assert.match(index, /wand-agent selftest/, 'update recipe must validate the refreshed package before deployment');
+assert.match(index, /\/usr\/local\/lib\/wand-agent\/wand-agent/, 'update recipe must replace the stable service binary');
+assert.match(index, /systemctl restart wand-agent/, 'update recipe must restart the already-running unit');
+assert.match(index, /重启会断开所有 Agent WebSocket/u, 'guide must warn that updating terminates direct PTYs');
 assert.match(index, /const AGENT_GUIDE_SERVICE_UNIT: string =/, 'guide must ship the systemd unit');
 assert.match(index, /WantedBy=multi-user\.target/, 'systemd unit must be complete');
-assert.match(index, /systemctl daemon-reload && systemctl enable --now wand-agent/, 'guide must include the enable step');
 assert.match(index, /ws:\/\/172\.16\.100\.2:8765\/ws/, 'guide must include the app-side endpoint');
 assert.match(
   index,
   /private buildGuideCommand\(cmd: string\) \{[\s\S]*?\.copyOption\(CopyOptions\.LocalDevice\)/,
   'command blocks must be long-press copyable'
 );
+
+const bootstrap = await readFile('tools/install-wand-agent.sh', 'utf8');
+assert.match(bootstrap, /^#!\/bin\/sh\nset -eu/m, 'curl bootstrap must fail closed under POSIX sh');
+assert.match(bootstrap, /Node\.js 16 or newer is required/, 'bootstrap must enforce the package runtime floor');
+assert.match(bootstrap, /api\.github\.com\/repos\/\$\{WAND_AGENT_REPOSITORY\}\/tarball\/\$\{WAND_AGENT_REF\}/, 'bootstrap must download the selected agent source');
+assert.match(bootstrap, /node "\$source_dir\/bin\/wand-agent\.js" service install "\$@"/, 'bootstrap must delegate Go, build and service ownership to the agent CLI');
 
 console.log('check-agent-setup-guide: OK');

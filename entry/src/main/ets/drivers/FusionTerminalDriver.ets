@@ -149,9 +149,17 @@ export class FusionTerminalDriver {
     }
   }
 
+  private lastEmittedConnected: boolean = false;
+  private lastEmittedMode: string = '';
+  private lastEmittedLabel: string = '待机';
+  private lastEmittedError: string = '';
+
   setStatusListener(listener: DriverStatusListener | null): void {
     this.statusListener = listener;
-    this.emitStatus(false, this.mode, '待机', '');
+    // Replay the CURRENT truth (see FusionAgentDriver.setStatusListener).
+    this.emitStatus(this.lastEmittedConnected,
+      this.lastEmittedMode.length > 0 ? this.lastEmittedMode : this.mode,
+      this.lastEmittedLabel, this.lastEmittedError);
   }
 
   startLocal(): void {
@@ -305,6 +313,10 @@ export class FusionTerminalDriver {
   }
 
   private emitStatus(connected: boolean, mode: string, label: string, error: string): void {
+    this.lastEmittedConnected = connected;
+    this.lastEmittedMode = mode || '';
+    this.lastEmittedLabel = label || '';
+    this.lastEmittedError = error || '';
     if (!this.statusListener) {
       return;
     }
